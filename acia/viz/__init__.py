@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import logging
+import numbers
 from collections import deque
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import cv2
+
+# --- Matplotlib / Plotly imports are optional until plotting is called ---
+import matplotlib as mpl
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import moviepy.editor as mpy
 import networkx as nx
@@ -16,6 +22,7 @@ import numpy as np
 import pint
 import plotly.graph_objects as go
 from matplotlib import font_manager
+from matplotlib.cm import ScalarMappable
 from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
@@ -1044,7 +1051,8 @@ def render_tracking_mask(
 ###########################################
 
 
-def compute_lineage_y(G, time_feature="t"):
+# ========== LAYOUT ==========
+def compute_lineage_y(G: nx.DiGraph, time_feature: str = "t") -> dict[Any, float]:
     """
     Assign a y-position to each node using a tidy tree layout.
 
@@ -1061,12 +1069,12 @@ def compute_lineage_y(G, time_feature="t"):
         Mapping from node to y-coordinate (float).
     """
     roots = [n for n in G.nodes if G.in_degree(n) == 0]
-    assigned_y = {}
+    assigned_y: dict[Any, float] = {}
     next_y = [0]
 
     def assign_y_iterative():
         # Assign unique y-coordinates to all tips, then propagate up for inner nodes.
-        stack = []
+        stack: list = []
         visited = set()
         # Start with roots (nodes with no parents), sorted by time
         for root in sorted(roots, key=lambda n: G.nodes[n][time_feature]):
@@ -1104,35 +1112,14 @@ def compute_lineage_y(G, time_feature="t"):
 
 
 def extract_lineage_plotdata(
-    G, assigned_y, time_feature="t", label_name=None, orientation="horizontal"
-):
+    G: nx.DiGraph,
+    assigned_y: dict[Any, float],
+    time_feature: str = "t",
+    label_name: str | None = None,
+    orientation: str = "horizontal",
+) -> dict[str, Any]:
     """
     Collect all node and edge positions and hover info for plotting.
-
-    Parameters
-    ----------
-    G : nx.DiGraph
-        The lineage graph.
-    assigned_y : dict
-        Node-to-y mapping (from compute_lineage_y).
-    time_feature : str
-        The node attribute that encodes time.
-    label_name : str or None
-        Which node attribute to use for the label (default: node name).
-    orientation : str
-        'horizontal' or 'vertical' for layout.
-
-    Returns
-    -------
-    data : dict
-        Contains:
-            - xs, ys: node x and y positions
-            - node_ids: node names
-            - node_labels: text for labels
-            - hover_texts: HTML hover text for Plotly
-            - edge_xs, edge_ys: positions for edges
-            - births_x, births_y: positions for birth nodes
-            - ends_x, ends_y: positions for end nodes
     """
     xs, ys, node_ids, node_labels, hover_texts = [], [], [], [], []
     for n in G.nodes:
@@ -1141,16 +1128,16 @@ def extract_lineage_plotdata(
         xs.append(t if orientation == "horizontal" else y)
         ys.append(y if orientation == "horizontal" else t)
         node_ids.append(n)
-        # Node label for drawing
-        if label_name is None:
-            label = str(n)
-        else:
-            label = str(G.nodes[n][label_name]) if label_name in G.nodes[n] else str(n)
+        # label
+        label = (
+            str(G.nodes[n][label_name])
+            if (label_name and label_name in G.nodes[n])
+            else str(n)
+        )
         node_labels.append(label)
-        # Build a pseudo-table hover (as HTML using <br> for newlines)
+        # hover HTML
         features = G.nodes[n]
         if features:
-            # For "aligned" look: pad keys to equal length
             maxk = max((len(str(k)) for k in features), default=1)
             fmt = lambda k, v, maxk: f"{str(k).ljust(maxk)} : {v}<br>"
             feat_lines = "".join(fmt(k, v, maxk) for k, v in features.items())
@@ -1159,7 +1146,7 @@ def extract_lineage_plotdata(
             hover_html = f"<b>Node:</b> {n}"
         hover_texts.append(hover_html)
 
-    # Edges: a list of (x0,x1), (y0,y1) for each edge
+    # edges
     edge_xs, edge_ys = [], []
     for n in G.nodes:
         t0 = G.nodes[n][time_feature]
@@ -1174,27 +1161,18 @@ def extract_lineage_plotdata(
                 edge_xs.append([y0, y1])
                 edge_ys.append([t0, t1])
 
-    # Find birth and end nodes
+    # births & ends
     births_x, births_y, ends_x, ends_y = [], [], [], []
     for n in G.nodes:
         t = G.nodes[n][time_feature]
         y = assigned_y[n]
         if G.in_degree(n) == 0:
-            # New/birth nodes (no parents)
-            if orientation == "horizontal":
-                births_x.append(t)
-                births_y.append(y)
-            else:
-                births_x.append(y)
-                births_y.append(t)
+            births_x.append(t if orientation == "horizontal" else y)
+            births_y.append(y if orientation == "horizontal" else t)
         if G.out_degree(n) == 0:
-            # End nodes (no children)
-            if orientation == "horizontal":
-                ends_x.append(t)
-                ends_y.append(y)
-            else:
-                ends_x.append(y)
-                ends_y.append(t)
+            ends_x.append(t if orientation == "horizontal" else y)
+            ends_y.append(y if orientation == "horizontal" else t)
+
     return dict(
         xs=xs,
         ys=ys,
@@ -1210,70 +1188,73 @@ def extract_lineage_plotdata(
     )
 
 
+# ========== COLOR HELPERS ==========
+def _value_getter(
+    G: nx.DiGraph,
+    node_ids: Iterable[Any],
+    node_color_by: str | dict[Any, Any] | Callable[[Any], Any] | None,
+) -> list[Any] | None:
+    """Return list of values per node for coloring."""
+    if node_color_by is None:
+        return None
+    vals: list[Any] = []
+    if isinstance(node_color_by, str):
+        for n in node_ids:
+            vals.append(G.nodes[n].get(node_color_by, None))
+    elif callable(node_color_by):
+        for n in node_ids:
+            vals.append(node_color_by(n))
+    elif isinstance(node_color_by, dict):
+        for n in node_ids:
+            vals.append(node_color_by.get(n, None))
+    else:
+        # Series-like (has .get)
+        try:
+            for n in node_ids:
+                vals.append(node_color_by.get(n, None))  # type: ignore[attr-defined]
+        except Exception as e:
+            raise TypeError(
+                "node_color_by must be a str, dict/Series-like, or callable(node)->value"
+            ) from e
+    return vals
+
+
+def _is_numeric_series(vals: Iterable[Any]) -> bool:
+    any_val = next((v for v in vals if v is not None), None)
+    return isinstance(any_val, numbers.Real) and not isinstance(any_val, bool)
+
+
+# ========== MATPLOTLIB PLOT ==========
 def plot_cell_lineage(
-    G,
-    time_feature="t",
-    orientation="horizontal",
-    show_label=True,
-    label_name=None,
-    node_marker="o",
-    node_ms=6,
-    line_color="blue",
-    line_lw=2,
-    mark_births=False,
-    birth_color="red",
-    birth_marker=None,
-    birth_ms=12,
-    mark_ends=False,
-    end_color="orange",
-    end_marker="s",
-    end_ms=10,
-    ax=None,
-    interactive_tooltip=False,
+    G: nx.DiGraph,
+    time_feature: str = "t",
+    orientation: str = "horizontal",
+    show_label: bool = True,
+    label_name: str | None = None,
+    node_marker: str = "o",
+    node_ms: int = 6,
+    line_color: str = "blue",
+    line_lw: int | float = 2,
+    mark_births: bool = False,
+    birth_color: str = "red",
+    birth_marker: str | None = None,
+    birth_ms: int = 12,
+    mark_ends: bool = False,
+    end_color: str = "orange",
+    end_marker: str = "s",
+    end_ms: int = 10,
+    ax: plt.Axes | None = None,
+    interactive_tooltip: bool = False,
+    # --- coloring controls ---
+    node_color_by: str | dict[Any, Any] | Callable[[Any], Any] | None = None,
+    node_cmap: str = "viridis",
+    node_na_color: str = "#bbbbbb",
+    show_colorbar: bool = True,
+    show_legend: bool = True,
+    colorbar_title: str | None = None,  # NEW: colorbar label (numeric coloring only)
 ):
     """
     Draw a cell lineage tree as a static matplotlib plot.
-
-    Parameters
-    ----------
-    G : nx.DiGraph
-        The lineage graph.
-    time_feature : str
-        Node attribute for x-axis (typically time).
-    orientation : str
-        'horizontal' (time on x) or 'vertical' (time on y).
-    show_label : bool
-        Show node labels on the plot.
-    label_name : str or None
-        Node attribute to use for label (default: node name).
-    node_marker : str
-        Marker style for all nodes.
-    node_ms : int
-        Marker size for all nodes.
-    line_color : str
-        Color for edges and nodes.
-    line_lw : int or float
-        Edge line width.
-    mark_births : bool
-        Mark new tracks with a special marker/color.
-    birth_color : str
-        Color for birth marker.
-    birth_marker : str
-        Marker for birth nodes.
-    birth_ms : int
-        Size for birth marker.
-    mark_ends : bool
-        Mark track ends with a special marker/color.
-    end_color : str
-        Color for end marker.
-    end_marker : str
-        Marker for end nodes.
-    end_ms : int
-        Size for end marker.
-    ax : plt.Axes or None
-        If given, draw into this axes.
-    interactive_tooltip : bool
-        If True and mplcursors is installed, enables interactive node tooltips.
     """
     assigned_y = compute_lineage_y(G, time_feature)
     data = extract_lineage_plotdata(
@@ -1285,19 +1266,84 @@ def plot_cell_lineage(
     else:
         fig = None
 
-    # Draw edges
+    # edges
     for x, y in zip(data["edge_xs"], data["edge_ys"]):
         ax.plot(x, y, "-", color=line_color, lw=line_lw)
 
-    # Draw nodes
+    # coloring
+    colors = None
+    if node_color_by is not None:
+        vals = _value_getter(G, data["node_ids"], node_color_by)
+        if _is_numeric_series(vals):
+            vmin = min(v for v in vals if v is not None)
+            vmax = max(v for v in vals if v is not None)
+            if vmin == vmax:  # avoid zero-range
+                vmin, vmax = vmin - 0.5, vmax + 0.5
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+            cmap = mpl.colormaps.get_cmap(node_cmap)
+            colors = [
+                cmap(norm(v)) if v is not None else mcolors.to_rgba(node_na_color)
+                for v in vals
+            ]
+
+            if show_colorbar:
+                sm = ScalarMappable(norm=norm, cmap=cmap)
+                sm.set_array([])
+                cb = plt.colorbar(sm, ax=ax, pad=0.01)
+                title = (
+                    colorbar_title
+                    if colorbar_title
+                    else (
+                        str(node_color_by)
+                        if isinstance(node_color_by, str)
+                        else "value"
+                    )
+                )
+                cb.set_label(title)
+        else:
+            # categorical → discrete palette
+            uniq = list(dict.fromkeys(v for v in vals if v is not None))
+            if len(uniq) == 0:
+                colors = [node_na_color] * len(vals)
+            else:
+                base = mpl.colormaps.get_cmap(node_cmap).resampled(max(len(uniq), 3))
+                lut = {u: base(i / max(len(uniq) - 1, 1)) for i, u in enumerate(uniq)}
+                colors = [lut.get(v, mcolors.to_rgba(node_na_color)) for v in vals]
+            if show_legend and len(uniq) > 0:
+                # legend proxies
+                handles, labels = [], []
+                for u in uniq:
+                    proxy = plt.Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        linestyle="none",
+                        markerfacecolor=lut[u],
+                        markeredgecolor="none",
+                        markersize=max(6, node_ms),
+                    )
+                    handles.append(proxy)
+                    labels.append(str(u))
+                legend_title = (
+                    str(node_color_by) if isinstance(node_color_by, str) else "category"
+                )
+                ax.legend(handles, labels, title=legend_title, loc="best", frameon=True)
+
+    # nodes
     main_nodes = ax.scatter(
-        data["xs"], data["ys"], marker=node_marker, color=line_color, s=node_ms**2
+        data["xs"],
+        data["ys"],
+        marker=node_marker,
+        color=(colors if colors is not None else line_color),
+        s=node_ms**2,
+        zorder=3,
     )
+
     if show_label:
         for x, y, label in zip(data["xs"], data["ys"], data["node_labels"]):
             ax.text(x, y + 0.12, label, fontsize=7, ha="center", va="bottom")
 
-    # Draw markers for births and ends
+    # births / ends
     if mark_births and data["births_x"]:
         marker = (
             birth_marker
@@ -1326,7 +1372,7 @@ def plot_cell_lineage(
             edgecolor="k",
         )
 
-    # Axis formatting
+    # axes
     if orientation == "horizontal":
         ax.set_xlabel("Time")
         ax.set_ylabel("Lineage")
@@ -1338,11 +1384,11 @@ def plot_cell_lineage(
     ax.set_aspect("auto")
     plt.tight_layout()
 
-    # Optional: interactive tooltips using mplcursors
+    # optional tooltips
     if interactive_tooltip:
         try:
             # pylint: disable=import-outside-toplevel
-            import mplcursors
+            import mplcursors  # type: ignore
 
             cursor = mplcursors.cursor(main_nodes, hover=True)
             cursor.connect(
@@ -1358,87 +1404,50 @@ def plot_cell_lineage(
             )
         except ImportError:
             print("mplcursors not installed; install for interactive node tooltips.")
-
     return fig
 
 
+# ========== PLOTLY PLOT ==========
 def plotly_cell_lineage(
-    G,
-    time_feature="t",
-    orientation="horizontal",
-    show_label=True,
-    label_name=None,
-    node_marker="circle",
-    node_ms=10,
-    line_color="blue",
-    line_width=2,
-    mark_births=False,
-    birth_color="red",
-    birth_marker=None,
-    birth_ms=16,
-    mark_ends=False,
-    end_color="orange",
-    end_marker="square",
-    end_ms=14,
-    figure_title="Cell Lineage",
-    fig_height=500,
-    fig_width=1000,
+    G: nx.DiGraph,
+    time_feature: str = "t",
+    orientation: str = "horizontal",
+    show_label: bool = True,
+    label_name: str | None = None,
+    node_marker: str = "circle",
+    node_ms: int = 10,
+    line_color: str = "blue",
+    line_width: int | float = 2,
+    mark_births: bool = False,
+    birth_color: str = "red",
+    birth_marker: str | None = None,
+    birth_ms: int = 16,
+    mark_ends: bool = False,
+    end_color: str = "orange",
+    end_marker: str = "square",
+    end_ms: int = 14,
+    figure_title: str = "Cell Lineage",
+    fig_height: int = 500,
+    fig_width: int = 1000,
+    # --- coloring controls ---
+    node_color_by: str | dict[Any, Any] | Callable[[Any], Any] | None = None,
+    node_colorscale: str = "Viridis",  # for numeric
+    node_na_color: str = "lightgray",
+    show_colorbar: bool = True,
+    show_legend: bool = True,
+    colorbar_title: str | None = None,  # NEW: numeric colorbar title
 ):
     """
     Plot a cell lineage tree as an interactive Plotly chart.
     Node hover shows all features as a readable (monospace) "pseudo-table".
-
-    Parameters
-    ----------
-    G : nx.DiGraph
-        The lineage graph.
-    time_feature : str
-        Node attribute for x-axis (typically time).
-    orientation : str
-        'horizontal' (time on x) or 'vertical' (time on y).
-    show_label : bool
-        Show node labels on the plot.
-    label_name : str or None
-        Node attribute to use for label (default: node name).
-    node_marker : str
-        Marker style for all nodes.
-    node_ms : int
-        Marker size for all nodes.
-    line_color : str
-        Color for edges and nodes.
-    line_width : int or float
-        Edge line width.
-    mark_births : bool
-        Mark new tracks with a special marker/color.
-    birth_color : str
-        Color for birth marker.
-    birth_marker : str
-        Marker for birth nodes.
-    birth_ms : int
-        Size for birth marker.
-    mark_ends : bool
-        Mark track ends with a special marker/color.
-    end_color : str
-        Color for end marker.
-    end_marker : str
-        Marker for end nodes.
-    end_ms : int
-        Size for end marker.
-    figure_title : str
-        Plot title.
-    fig_height : str
-        Height of the plotly figure.
-    fig_width: int
-        Width of the plotly figure.
     """
     assigned_y = compute_lineage_y(G, time_feature)
     data = extract_lineage_plotdata(
         G, assigned_y, time_feature, label_name, orientation
     )
-
     fig = go.Figure()
 
-    # Draw edges as separate traces for better performance (and control)
+    # edges
     for x, y in zip(data["edge_xs"], data["edge_ys"]):
         fig.add_trace(
             go.Scatter(
@@ -1451,24 +1460,83 @@ def plotly_cell_lineage(
             )
         )
 
-    # Main node markers with pseudo-table hover (HTML with <br>, monospace)
-    fig.add_trace(
-        go.Scatter(
-            x=data["xs"],
-            y=data["ys"],
-            mode="markers+text" if show_label else "markers",
-            marker=dict(
-                symbol=node_marker, color=line_color, size=node_ms, line=dict(width=0)
-            ),
-            text=data["node_labels"] if show_label else None,
-            textposition="top center",
-            hovertemplate="%{customdata}<extra></extra>",
-            customdata=data["hover_texts"],
-            name="Cells",
+    # helper to add node subsets
+    def add_nodes_subset(
+        idx: list[int],
+        name: str | None = None,
+        color: str | list[float] | None = None,
+        colorscale: str | None = None,
+        colorbar: dict | None = None,
+    ):
+        xs = [data["xs"][i] for i in idx]
+        ys = [data["ys"][i] for i in idx]
+        labels = [data["node_labels"][i] for i in idx] if show_label else None
+        hovers = [data["hover_texts"][i] for i in idx]
+        marker_kw = dict(symbol=node_marker, size=node_ms, line=dict(width=0))
+        if color is not None:
+            marker_kw["color"] = color
+        if colorscale is not None:
+            marker_kw["colorscale"] = colorscale
+        if colorbar is not None:
+            marker_kw["colorbar"] = colorbar
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers+text" if show_label else "markers",
+                text=labels,
+                textposition="top center",
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hovers,
+                marker=marker_kw,
+                name=name if name else "Cells",
+                showlegend=(name is not None and show_legend),
+            )
         )
-    )
 
-    # Markers for births and ends
+    # coloring
+    vals = (
+        _value_getter(G, data["node_ids"], node_color_by)
+        if node_color_by is not None
+        else None
+    )
+    if vals is None:
+        add_nodes_subset(list(range(len(data["xs"]))), name="Cells", color=line_color)
+    else:
+        if _is_numeric_series(vals):
+            color = [v if v is not None else None for v in vals]
+            idx_valid = [i for i, v in enumerate(color) if v is not None]
+            idx_na = [i for i, v in enumerate(color) if v is None]
+            add_nodes_subset(
+                idx_valid,
+                name=str(node_color_by) if isinstance(node_color_by, str) else "value",
+                color=[color[i] for i in idx_valid],
+                colorscale=node_colorscale,
+                colorbar=dict(
+                    title=(
+                        colorbar_title
+                        if colorbar_title
+                        else (
+                            str(node_color_by)
+                            if isinstance(node_color_by, str)
+                            else "value"
+                        )
+                    )
+                )
+                if show_colorbar
+                else None,
+            )
+            if idx_na:
+                add_nodes_subset(idx_na, name="NA", color=node_na_color)
+        else:
+            # categorical → one trace per category for legend
+            vals_clean = [v if v is not None else "NA" for v in vals]
+            cats = list(dict.fromkeys(vals_clean))
+            for cat in cats:
+                idx = [i for i, v in enumerate(vals_clean) if v == cat]
+                add_nodes_subset(idx, name=str(cat))  # Plotly cycles colors
+
+    # births / ends
     if mark_births and data["births_x"]:
         marker = (
             birth_marker
@@ -1487,16 +1555,13 @@ def plotly_cell_lineage(
             "x": "x",
             "+": "cross",
         }
-        marker_symbol = marker_map.get(
-            marker, "triangle-right" if orientation == "horizontal" else "triangle-down"
-        )
         fig.add_trace(
             go.Scatter(
                 x=data["births_x"],
                 y=data["births_y"],
                 mode="markers",
                 marker=dict(
-                    symbol=marker_symbol,
+                    symbol=marker_map.get(marker, "triangle-right"),
                     color=birth_color,
                     size=birth_ms,
                     line=dict(width=1, color=birth_color),
@@ -1519,14 +1584,13 @@ def plotly_cell_lineage(
             "^": "triangle-up",
             "v": "triangle-down",
         }
-        marker_symbol = marker_map.get(end_marker, "square")
         fig.add_trace(
             go.Scatter(
                 x=data["ends_x"],
                 y=data["ends_y"],
                 mode="markers",
                 marker=dict(
-                    symbol=marker_symbol,
+                    symbol=marker_map.get(end_marker, "square"),
                     color=end_color,
                     size=end_ms,
                     line=dict(width=1, color=end_color),
@@ -1537,14 +1601,13 @@ def plotly_cell_lineage(
             )
         )
 
-    # Axes and layout
+    # axes & layout
     if orientation == "horizontal":
         fig.update_xaxes(title="Time")
         fig.update_yaxes(title="Lineage")
     else:
         fig.update_xaxes(title="Lineage")
         fig.update_yaxes(title="Time", autorange="reversed")
-
     fig.update_layout(
         title=figure_title, height=fig_height, width=fig_width, plot_bgcolor="white"
     )
