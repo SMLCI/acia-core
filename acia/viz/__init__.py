@@ -933,6 +933,41 @@ def colorize_instance_mask(
     return colored_mask
 
 
+def get_mask(self, height, width, binary_mask=True) -> list[np.array]:
+    """
+    Turn the individual overlays into masks. For every time point we create a mask of all contours.
+
+    returns: List of masks (np.array[bool])
+
+    height: height of the image
+    width: width of the image
+    """
+    if binary_mask:
+        local_mask = np.zeros((height, width), dtype=bool)
+    else:
+        # non-binary
+        local_mask = np.zeros((height, width), dtype=np.uint16)
+
+    # combine all contours in one mask
+    for i, cont in enumerate(self):
+        mask = cont.toMask(height=height, width=width)
+        if not binary_mask:
+            label = i + 1
+            if cont.label is not None:
+                try:
+                    label = int(cont.label)
+                except ValueError:
+                    # could not convert label to integer
+                    pass
+
+            mask = mask.astype(np.uint16) * (label)  # convert into a non-binary mask
+
+        # combine into a single mask
+        local_mask = np.maximum(mask, local_mask)
+
+    return local_mask
+
+
 def render_segmentation_mask(
     source: ImageSequenceSource, overlay: Overlay, alpha=0.8
 ) -> THWCSequenceSource:
@@ -953,12 +988,12 @@ def render_segmentation_mask(
     ):
         im = np.copy(im.raw)
 
-        colored_mask = np.zeros_like(im)
+        height, width = im.shape[:2]
 
-        for cont in ov:
-            # render the masks based on the first contour mask in the frame
-            colored_mask = colorize_instance_mask(cont.mask)
-            break
+        label_mask = get_mask(ov, height, width, False)
+
+        # render the masks based on the first contour mask in the frame
+        colored_mask = colorize_instance_mask(label_mask)
 
         # Alpha blend with original image
         overlay = cv2.addWeighted(
