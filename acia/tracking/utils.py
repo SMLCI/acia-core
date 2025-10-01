@@ -301,3 +301,43 @@ def merge_incosistent_segmentation(
         cont.label = relabel_actions[cont.label]
 
     return new_ov, tracklet_graph
+
+
+def compute_trace(lineage: nx.DiGraph) -> dict:
+    """Computes the trace (cell heritage in a sequence) for every node in the lineage
+
+    Args:
+        lineage (nx.DiGraph): the lineage. Node ids will be concatenated to trace
+
+    Returns:
+        dict: Dictionary that contains the trace (str) for every node (type of lineage node)
+    """
+
+    traces = {}
+
+    for n in nx.dfs_preorder_nodes(lineage):
+        # traverse nodes in dfs
+        parent = list(lineage.predecessors(n))
+        if len(parent) == 0:
+            parent = None
+        elif len(parent) == 1:
+            parent = parent[0]
+        else:
+            raise ValueError("More than one parent! I cannot handle that!")
+
+        # some nodes may not have parents others have. Make sure that the "." is only placed between node ids.
+        if parent is not None:
+            parent_trace = traces.get(parent)
+
+            if len(parent_trace) > 0:
+                parent_trace += "."
+        else:
+            parent_trace = ""
+
+        # make trace: (trace of parent.)(my own value)
+        trace = f"{parent_trace}{n}"
+
+        traces[n] = trace
+
+    # return all traces
+    return traces
