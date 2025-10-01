@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
 import cv2
+import imageio.v2 as iio
 
 # --- Matplotlib / Plotly imports are optional until plotting is called ---
 import matplotlib as mpl
@@ -598,8 +599,8 @@ def render_tracking(
 def render_video(
     image_source: ImageSequenceSource,
     filename: str,
-    framerate: int,
-    codec: str,
+    framerate: int = 10,
+    codec: str = "libx264",
     ffmpeg_params: list[str] = None,
 ) -> None:
     """Render video
@@ -611,9 +612,9 @@ def render_video(
         codec (str): the codec for video encoding
     """
 
-    with VideoExporter2(
-        str(filename), framerate=framerate, codec=codec, ffmpeg_params=ffmpeg_params
-    ) as ve:
+    with iio.get_writer(
+        filename, fps=framerate, codec=codec, ffmpeg_params=ffmpeg_params
+    ) as writer:
         for im in tqdm(image_source, desc="Encoding video..."):
 
             image = im.raw
@@ -628,7 +629,7 @@ def render_video(
                     image.shape,
                 )
 
-            ve.write(image)
+            writer.append_data(image)
 
 
 def render_scalebar(
@@ -1247,6 +1248,7 @@ def plot_cell_lineage(
     interactive_tooltip: bool = False,
     # --- coloring controls ---
     node_color_by: str | dict[Any, Any] | Callable[[Any], Any] | None = None,
+    node_edge_color: str = "none",
     node_cmap: str = "viridis",
     node_na_color: str = "#bbbbbb",
     show_colorbar: bool = True,
@@ -1335,6 +1337,7 @@ def plot_cell_lineage(
         data["ys"],
         marker=node_marker,
         color=(colors if colors is not None else line_color),
+        edgecolors=node_edge_color,
         s=node_ms**2,
         zorder=3,
     )
