@@ -893,5 +893,159 @@ class TestRenderTime(unittest.TestCase):
             np.testing.assert_array_equal(frame.raw.shape, (200, 200, 3))
 
 
+# ============================================================================
+# Tests for render_segmentation_mask
+# ============================================================================
+
+
+class TestRenderSegmentationMask(unittest.TestCase):
+    """Tests for the render_segmentation_mask function"""
+
+    def test_basic_rendering_with_mask_instances(self):
+        """Render segmentation mask on images with mask-based instances"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        # Check that result is a THWCSequenceSource
+        self.assertIsInstance(result, THWCSequenceSource)
+
+        # Verify output has correct number of frames and shape
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_custom_alpha(self):
+        """Render segmentation mask with custom alpha value"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay, alpha=0.5)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_high_alpha(self):
+        """Render segmentation mask with high alpha (more original image)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay, alpha=0.95)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_low_alpha(self):
+        """Render segmentation mask with low alpha (more mask visible)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay, alpha=0.2)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_single_frame(self):
+        """Render segmentation mask on a single frame"""
+        image_source = create_test_image_source(frames=1, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=1, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 1)
+        frame = result.get_frame(0)
+        np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_empty_overlay(self):
+        """Render segmentation mask with overlay containing no instances"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = Overlay([])
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        # Should handle empty overlay gracefully
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_output_dtype_is_uint8(self):
+        """Verify output images are uint8 dtype"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(frame.raw.dtype, np.uint8)
+
+    def test_rendering_with_larger_image(self):
+        """Render segmentation mask on larger images"""
+        image_source = create_test_image_source(frames=3, height=500, width=500)
+        overlay = create_test_overlay_with_instances(
+            frames=3, instances_per_frame=3, height=500, width=500
+        )
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (500, 500, 3))
+
+    def test_rendering_multiple_instances_per_frame(self):
+        """Render segmentation mask with multiple instances per frame"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=5)
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_single_instance_per_frame(self):
+        """Render segmentation mask with a single instance per frame"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=1)
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_output_preserves_image_dimensions(self):
+        """Verify output images preserve the input image dimensions"""
+        heights = [50, 100, 200]
+        widths = [75, 150, 300]
+
+        for height, width in zip(heights, widths):
+            image_source = create_test_image_source(frames=2, height=height, width=width)
+            overlay = create_test_overlay_with_instances(
+                frames=2, instances_per_frame=1, height=height, width=width
+            )
+
+            result = render_segmentation_mask(image_source, overlay)
+
+            frame = result.get_frame(0)
+            self.assertEqual(frame.raw.shape[0], height)
+            self.assertEqual(frame.raw.shape[1], width)
+            self.assertEqual(frame.raw.shape[2], 3)
+
+    def test_output_is_rgb(self):
+        """Verify output images have 3 channels (RGB)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_segmentation_mask(image_source, overlay)
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(len(frame.raw.shape), 3)
+            self.assertEqual(frame.raw.shape[2], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
