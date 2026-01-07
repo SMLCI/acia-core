@@ -1047,5 +1047,310 @@ class TestRenderSegmentationMask(unittest.TestCase):
             self.assertEqual(frame.raw.shape[2], 3)
 
 
+# ============================================================================
+# Tests for render_tracking_mask
+# ============================================================================
+
+
+class TestRenderTrackingMask(unittest.TestCase):
+    """Tests for the render_tracking_mask function"""
+
+    def test_basic_rendering_with_mask_instances(self):
+        """Render tracking mask on images with mask-based instances"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        # Check that result is a THWCSequenceSource
+        self.assertIsInstance(result, THWCSequenceSource)
+
+        # Verify output has correct number of frames and shape
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_consistent_label_colors_across_frames(self):
+        """Verify that same label gets same color across different frames"""
+        # Create a black image source for easier color detection
+        images = np.zeros((3, 100, 100, 3), dtype=np.uint8)
+        image_source = InMemorySequenceSource(images)
+
+        # Create instances where same label appears in multiple frames
+        instances = []
+        for f in range(3):
+            # Instance with label 1 in all frames
+            mask1 = np.zeros((100, 100), dtype=np.uint16)
+            mask1[10:25, 10:25] = 1
+            instances.append(Instance(mask=mask1, frame=f, label=1, id=f"inst_{f}_0"))
+
+            # Instance with label 2 in all frames
+            mask2 = np.zeros((100, 100), dtype=np.uint16)
+            mask2[50:65, 50:65] = 2
+            instances.append(Instance(mask=mask2, frame=f, label=2, id=f"inst_{f}_1"))
+
+        overlay = Overlay(instances)
+
+        result = render_tracking_mask(image_source, overlay, alpha=0.0)  # alpha=0 to see only mask colors
+
+        # Extract colors from label 1 region across all frames
+        label1_colors = []
+        for frame_idx in range(3):
+            frame = result.get_frame(frame_idx).raw
+            # Get color from center of label 1 region
+            color = tuple(frame[17, 17, :])
+            label1_colors.append(color)
+
+        # All frames should have the same color for label 1
+        self.assertEqual(label1_colors[0], label1_colors[1])
+        self.assertEqual(label1_colors[1], label1_colors[2])
+
+        # Extract colors from label 2 region across all frames
+        label2_colors = []
+        for frame_idx in range(3):
+            frame = result.get_frame(frame_idx).raw
+            # Get color from center of label 2 region
+            color = tuple(frame[57, 57, :])
+            label2_colors.append(color)
+
+        # All frames should have the same color for label 2
+        self.assertEqual(label2_colors[0], label2_colors[1])
+        self.assertEqual(label2_colors[1], label2_colors[2])
+
+        # Label 1 and label 2 should have different colors
+        self.assertNotEqual(label1_colors[0], label2_colors[0])
+
+    def test_seed_produces_reproducible_colors(self):
+        """Verify that the same seed produces the same colors"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result1 = render_tracking_mask(image_source, overlay, seed=42)
+        result2 = render_tracking_mask(image_source, overlay, seed=42)
+
+        # Results should be identical with same seed
+        for frame_idx in range(len(result1)):
+            frame1 = result1.get_frame(frame_idx).raw
+            frame2 = result2.get_frame(frame_idx).raw
+            np.testing.assert_array_equal(frame1, frame2)
+
+    def test_different_seeds_produce_different_colors(self):
+        """Verify that different seeds produce different colors"""
+        # Use black background for easier comparison
+        images = np.zeros((3, 100, 100, 3), dtype=np.uint8)
+        image_source = InMemorySequenceSource(images)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result1 = render_tracking_mask(image_source, overlay, seed=42, alpha=0.0)
+        result2 = render_tracking_mask(image_source, overlay, seed=123, alpha=0.0)
+
+        # At least one frame should differ with different seeds
+        any_difference = False
+        for frame_idx in range(len(result1)):
+            frame1 = result1.get_frame(frame_idx).raw
+            frame2 = result2.get_frame(frame_idx).raw
+            if not np.array_equal(frame1, frame2):
+                any_difference = True
+                break
+
+        self.assertTrue(any_difference)
+
+    def test_rendering_with_custom_alpha(self):
+        """Render tracking mask with custom alpha value"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay, alpha=0.5)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_high_alpha(self):
+        """Render tracking mask with high alpha (more original image)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay, alpha=0.95)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_low_alpha(self):
+        """Render tracking mask with low alpha (more mask visible)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay, alpha=0.2)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_show_label_numbers(self):
+        """Render tracking mask with label numbers displayed"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay, show_label_numbers=True)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_single_frame(self):
+        """Render tracking mask on a single frame"""
+        image_source = create_test_image_source(frames=1, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=1, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 1)
+        frame = result.get_frame(0)
+        np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_empty_overlay(self):
+        """Render tracking mask with overlay containing no instances"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = Overlay([])
+
+        result = render_tracking_mask(image_source, overlay)
+
+        # Should handle empty overlay gracefully
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_output_dtype_is_uint8(self):
+        """Verify output images are uint8 dtype"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(frame.raw.dtype, np.uint8)
+
+    def test_rendering_with_larger_image(self):
+        """Render tracking mask on larger images"""
+        image_source = create_test_image_source(frames=3, height=500, width=500)
+        overlay = create_test_overlay_with_instances(
+            frames=3, instances_per_frame=3, height=500, width=500
+        )
+
+        result = render_tracking_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (500, 500, 3))
+
+    def test_rendering_multiple_instances_per_frame(self):
+        """Render tracking mask with multiple instances per frame"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=5)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_single_instance_per_frame(self):
+        """Render tracking mask with a single instance per frame"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=1)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        self.assertIsInstance(result, THWCSequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_output_preserves_image_dimensions(self):
+        """Verify output images preserve the input image dimensions"""
+        heights = [50, 100, 200]
+        widths = [75, 150, 300]
+
+        for height, width in zip(heights, widths):
+            image_source = create_test_image_source(frames=2, height=height, width=width)
+            overlay = create_test_overlay_with_instances(
+                frames=2, instances_per_frame=1, height=height, width=width
+            )
+
+            result = render_tracking_mask(image_source, overlay)
+
+            frame = result.get_frame(0)
+            self.assertEqual(frame.raw.shape[0], height)
+            self.assertEqual(frame.raw.shape[1], width)
+            self.assertEqual(frame.raw.shape[2], 3)
+
+    def test_output_is_rgb(self):
+        """Verify output images have 3 channels (RGB)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_instances(frames=3, instances_per_frame=2)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(len(frame.raw.shape), 3)
+            self.assertEqual(frame.raw.shape[2], 3)
+
+    def test_background_remains_unchanged(self):
+        """Verify background pixels (label 0) remain unchanged"""
+        # Create a known background color
+        background_color = np.array([100, 150, 200], dtype=np.uint8)
+        images = np.full((3, 100, 100, 3), background_color, dtype=np.uint8)
+        image_source = InMemorySequenceSource(images)
+
+        # Create a small instance in the corner
+        instances = []
+        for f in range(3):
+            mask = np.zeros((100, 100), dtype=np.uint16)
+            mask[10:20, 10:20] = 1
+            instances.append(Instance(mask=mask, frame=f, label=1, id=f"inst_{f}_0"))
+
+        overlay = Overlay(instances)
+
+        result = render_tracking_mask(image_source, overlay)
+
+        # Check that background pixels (far from instance) remain unchanged
+        for frame_idx in range(3):
+            frame = result.get_frame(frame_idx).raw
+            # Check a pixel far from the instance
+            np.testing.assert_array_equal(frame[80, 80, :], background_color)
+
+    def test_label_colors_differ_for_different_labels(self):
+        """Verify that different labels get different colors"""
+        # Use black background for easier color detection
+        images = np.zeros((3, 100, 100, 3), dtype=np.uint8)
+        image_source = InMemorySequenceSource(images)
+
+        # Create instances with different labels
+        instances = []
+        for label in range(1, 6):  # 5 different labels
+            mask = np.zeros((100, 100), dtype=np.uint16)
+            y_start = label * 15
+            mask[y_start : y_start + 10, 10:20] = label
+            instances.append(
+                Instance(mask=mask, frame=0, label=label, id=f"inst_0_{label}")
+            )
+
+        overlay = Overlay(instances)
+
+        result = render_tracking_mask(image_source, overlay, alpha=0.0)
+
+        # Collect colors for each label
+        frame = result.get_frame(0).raw
+        colors = set()
+        for label in range(1, 6):
+            y_center = label * 15 + 5
+            color = tuple(frame[y_center, 15, :])
+            colors.add(color)
+
+        # All labels should have different colors (at least most of them)
+        # With random colors, there's a tiny chance of collision, so we check for at least 4 unique
+        self.assertGreaterEqual(len(colors), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
