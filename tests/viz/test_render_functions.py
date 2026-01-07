@@ -347,5 +347,249 @@ class TestRenderTracking(unittest.TestCase):
         self.assertEqual(len(result), 3)
 
 
+# ============================================================================
+# Tests for render_scalebar
+# ============================================================================
+
+
+class TestRenderScalebar(unittest.TestCase):
+    """Tests for the render_scalebar function"""
+
+    def test_basic_rendering_with_integer_position(self):
+        """Render scalebar with integer xy position"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+        )
+
+        # Check that result is an InMemorySequenceSource
+        self.assertIsInstance(result, InMemorySequenceSource)
+
+        # Verify output has correct number of frames and shape
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_relative_float_position(self):
+        """Render scalebar with relative float xy position (0-1 range)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(0.1, 0.9),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_background_color(self):
+        """Render scalebar with background color"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+            background_color=(0, 0, 0),
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_without_text(self):
+        """Render scalebar with show_text=False"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+            show_text=False,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_color(self):
+        """Render scalebar with custom color"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+            color=(255, 0, 0),
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_font_size(self):
+        """Render scalebar with custom font size"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+            font_size=12,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_background_margin(self):
+        """Render scalebar with custom background margin"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+            background_color=(0, 0, 0),
+            background_margin_pixel=10,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_single_frame(self):
+        """Render scalebar on a single frame"""
+        image_source = create_test_image_source(frames=1, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 1)
+        frame = result.get_frame(0)
+        np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_output_dtype_is_uint8(self):
+        """Verify output images are uint8 dtype"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+        )
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(frame.raw.dtype, np.uint8)
+
+    def test_invalid_float_x_position_raises_error(self):
+        """Float x position > 1.0 should raise ValueError"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        with self.assertRaises(ValueError):
+            render_scalebar(
+                image_source,
+                xy_position=(1.5, 0.9),
+                size_of_pixel="0.07 micrometer/pixel",
+                bar_width="5 micrometer",
+                bar_height="0.25 micrometer",
+            )
+
+    def test_invalid_float_y_position_raises_error(self):
+        """Float y position > 1.0 should raise ValueError"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        with self.assertRaises(ValueError):
+            render_scalebar(
+                image_source,
+                xy_position=(0.1, 1.5),
+                size_of_pixel="0.07 micrometer/pixel",
+                bar_width="5 micrometer",
+                bar_height="0.25 micrometer",
+            )
+
+    def test_rendering_with_pint_quantities(self):
+        """Render scalebar using pint Quantity objects directly"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(10, 90),
+            size_of_pixel=0.07 * ureg.micrometer / ureg.pixel,
+            bar_width=5 * ureg.micrometer,
+            bar_height=0.25 * ureg.micrometer,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_larger_image(self):
+        """Render scalebar on larger images"""
+        image_source = create_test_image_source(frames=3, height=500, width=500)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(50, 450),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="10 micrometer",
+            bar_height="0.5 micrometer",
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (500, 500, 3))
+
+    def test_rendering_with_all_options(self):
+        """Render scalebar with all optional parameters specified"""
+        image_source = create_test_image_source(frames=3, height=200, width=200)
+
+        result = render_scalebar(
+            image_source,
+            xy_position=(20, 180),
+            size_of_pixel="0.07 micrometer/pixel",
+            bar_width="5 micrometer",
+            bar_height="0.25 micrometer",
+            color=(255, 255, 0),
+            font_size=18,
+            background_color=(50, 50, 50),
+            background_margin_pixel=5,
+            show_text=True,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (200, 200, 3))
+
+
 if __name__ == "__main__":
     unittest.main()
