@@ -1,7 +1,6 @@
 """ Filters for segmentating overlay objects"""
 
 from functools import partial
-from typing import Tuple
 
 import cv2
 import numpy as np
@@ -15,7 +14,7 @@ from shapely.validation import make_valid
 from acia.base import Overlay
 
 
-def bbox_to_rectangle(bbox: Tuple[float]):
+def bbox_to_rectangle(bbox: tuple[float]):
     minx, miny, maxx, maxy = bbox
     return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
 
@@ -121,7 +120,7 @@ class SizeFilter:
         """
         contour_shapes = [Polygon(cont.coordinates) for cont in overlay.contours]
         result_overlay = Overlay([])
-        for cont, shape in zip(overlay.contours, contour_shapes):
+        for cont, shape in zip(overlay.contours, contour_shapes, strict=False):
             area = shape.area
 
             if min_area < area < max_area:
@@ -167,9 +166,11 @@ class EllipsoidFilter:
             rect_area_error = np.abs(shape.area - min_rect.area) / shape.area
             ellipse_area_error = np.abs(ellr.area - shape.area) / shape.area
 
-            if min_width_height_ratio <= width_height_ratio <= max_width_height_ratio:
-                if ellipse_area_error < rect_area_error:
-                    # if an ellipse can better explain the cell detection than a rectangle
-                    result_overlay.add_contour(cont)
+            if (
+                min_width_height_ratio <= width_height_ratio <= max_width_height_ratio
+                and ellipse_area_error < rect_area_error
+            ):
+                # if an ellipse can better explain the cell detection than a rectangle
+                result_overlay.add_contour(cont)
 
         return result_overlay

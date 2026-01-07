@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -38,10 +39,8 @@ def parse_simple_tracking(file_content: str) -> tuple[Overlay, nx.DiGraph]:
 
         det_id = det["id"]
         # try to convert to integer
-        try:
+        with contextlib.suppress(ValueError):
             det_id = int(det_id)
-        except ValueError:
-            pass
 
         all_detections.append(
             Contour(det["contour"], -1, det["frame"], det_id, det["label"])
@@ -228,7 +227,7 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
     for tracklet_label, tracklet_nodes in tracklets.items():
 
         # add tracklet edges
-        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:]):
+        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:], strict=False):
             track_graph.add_edge(contA.id, contB.id)
 
         for pred_label in tracklet_graph.predecessors(tracklet_label):

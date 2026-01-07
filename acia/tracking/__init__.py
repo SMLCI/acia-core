@@ -118,7 +118,7 @@ def subsample_tracking(
     frame_lookup = {
         old_frame: new_frame
         for new_frame, old_frame in zip(
-            range(len(subsampled_frames)), sorted(subsampled_frames)
+            range(len(subsampled_frames)), sorted(subsampled_frames), strict=False
         )
     }
 
@@ -192,7 +192,7 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
     for tracklet_label, tracklet_nodes in tracklets.items():
 
         # add tracklet edges
-        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:]):
+        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:], strict=False):
             track_graph.add_edge(contA.id, contB.id)
 
         for pred_label in tracklet_graph.predecessors(tracklet_label):

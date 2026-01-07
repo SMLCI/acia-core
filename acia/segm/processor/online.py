@@ -5,7 +5,6 @@ import logging
 import os
 from io import BytesIO
 from itertools import chain, islice
-from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
@@ -85,7 +84,7 @@ class OnlineModel(Processor):
             for detection in content:
                 # label = detection['label']
                 contour_lists = detection["contours"][0]
-                contour = list(zip(contour_lists["x"], contour_lists["y"]))
+                contour = list(zip(contour_lists["x"], contour_lists["y"], strict=False))
                 score = detection["score"]
 
                 contours.append(Contour(contour, score, frame, -1))
@@ -93,7 +92,7 @@ class OnlineModel(Processor):
         return Overlay(contours)
 
     @staticmethod
-    def parseContours(response_body) -> List[Contour]:
+    def parseContours(response_body) -> list[Contour]:
         pass
 
 
@@ -257,7 +256,7 @@ class FlexibleOnlineModel(Processor):
         return contours
 
     @retry(requests.exceptions.ReadTimeout, tries=3)
-    def predict_batch(self, frame_ids: List[int], images: List, params) -> Overlay:
+    def predict_batch(self, frame_ids: list[int], images: list, params) -> Overlay:
         """Predict segmentation for a batch of frames
 
         Args:
@@ -320,5 +319,5 @@ class FlexibleOnlineModel(Processor):
         return contours
 
     @staticmethod
-    def parseContours(response_body) -> List[Contour]:
+    def parseContours(response_body) -> list[Contour]:
         pass

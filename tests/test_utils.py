@@ -31,7 +31,7 @@ class TestMappingLUT(unittest.TestCase):
 
         mapped_image = lut_func(image, dtype=np.uint8)
 
-        for gt, pred in zip(image.flatten(), mapped_image.flatten()):
+        for gt, pred in zip(image.flatten(), mapped_image.flatten(), strict=False):
             self.assertEqual(
                 pred, np.floor(np.clip(gt, 0, 1000) / 1000 * 255).astype(np.uint8)
             )

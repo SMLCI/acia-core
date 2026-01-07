@@ -1,6 +1,5 @@
 """ Utils for OMERO segmenation data"""
 
-from typing import List
 
 import cv2
 import numpy as np
@@ -54,7 +53,7 @@ def getProject(conn: BlitzGateway, projectId: int) -> ProjectWrapper:
     return conn.getObject("Project", projectId)
 
 
-def list_projects(conn: BlitzGateway) -> List[ProjectWrapper]:
+def list_projects(conn: BlitzGateway) -> list[ProjectWrapper]:
     """List projects in the current user group
         Note: only projects in your current group are accessible
 
@@ -67,7 +66,7 @@ def list_projects(conn: BlitzGateway) -> List[ProjectWrapper]:
     return conn.getObjects("Project")
 
 
-def list_image_ids_in_dataset(conn: BlitzGateway, datasetId: int) -> List[int]:
+def list_image_ids_in_dataset(conn: BlitzGateway, datasetId: int) -> list[int]:
     """[summary]
 
     Args:
@@ -82,7 +81,7 @@ def list_image_ids_in_dataset(conn: BlitzGateway, datasetId: int) -> List[int]:
     ]
 
 
-def list_images_in_dataset(conn: BlitzGateway, datasetId: int) -> List[ImageWrapper]:
+def list_images_in_dataset(conn: BlitzGateway, datasetId: int) -> list[ImageWrapper]:
     """List all images in the omero dataset
 
     Args:
@@ -97,11 +96,11 @@ def list_images_in_dataset(conn: BlitzGateway, datasetId: int) -> List[ImageWrap
 
 def list_datasets_in_project(
     conn: BlitzGateway, projectId: int
-) -> List[DatasetWrapper]:
+) -> list[DatasetWrapper]:
     return conn.getObjects("Dataset", opts={"project": projectId})
 
 
-def list_images_in_project(conn: BlitzGateway, projectId: int) -> List[ImageWrapper]:
+def list_images_in_project(conn: BlitzGateway, projectId: int) -> list[ImageWrapper]:
     return [
         image
         for dataset in list_datasets_in_project(conn, projectId=projectId)
@@ -109,7 +108,7 @@ def list_images_in_project(conn: BlitzGateway, projectId: int) -> List[ImageWrap
     ]
 
 
-def list_image_ids_in(omero_id: int, omero_type: str, conn: BlitzGateway) -> List[int]:
+def list_image_ids_in(omero_id: int, omero_type: str, conn: BlitzGateway) -> list[int]:
     """List all image sequences in an omero source (dataset, project or image)
 
     Args:
@@ -253,15 +252,14 @@ class OmeroScaleBar(ScaleBar):
         return image
 
 
-def has_all_tags(object, tag_list: List[str] = None):
+def has_all_tags(object, tag_list: list[str] = None):
     if tag_list is None:
         tag_list = []
 
     tag_list = tag_list.copy()
     for ann in object.listAnnotations():
-        if ann.OMERO_TYPE == omero.model.TagAnnotationI:
-            if ann.getTextValue() in tag_list:
-                del tag_list[tag_list.index(ann.getTextValue())]
+        if omero.model.TagAnnotationI == ann.OMERO_TYPE and ann.getTextValue() in tag_list:
+            del tag_list[tag_list.index(ann.getTextValue())]
 
         if len(tag_list) == 0:
             break

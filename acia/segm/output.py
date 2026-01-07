@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from functools import partial
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -183,7 +184,7 @@ def renderVideo(
 
     with ve:
         for frame, (image, overlay) in enumerate(
-            tqdm.tqdm(zip(imageSource, roiSource))
+            tqdm.tqdm(zip(imageSource, roiSource, strict=False))
         ):
 
             # extract the numpy image

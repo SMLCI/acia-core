@@ -59,7 +59,7 @@ class PyUATTracker(TrackingProcessor):
 
         if mip_method != "GRB":
             warnings.warn(
-                "You are not using Gurobi! Please install gurobi and specify 'GRB' as optimizer for a tremendous speedup!"
+                "You are not using Gurobi! Please install gurobi and specify 'GRB' as optimizer for a tremendous speedup!", stacklevel=2
             )
 
     def __call__(self, images: ImageSequenceSource, segmentation: Overlay):

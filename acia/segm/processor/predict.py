@@ -1,7 +1,6 @@
 """ Helper file to generate contours from masks"""
 
 import logging
-from typing import List
 
 import cv2
 import mmcv
@@ -102,7 +101,7 @@ def postprocess(output_data, model, offset_x=0, offset_y=0, contours=False):
     result = []
 
     for box, label, contour, segm in zip(
-        bboxes, labels, contours, mmcv.concat_list(segm_result)
+        bboxes, labels, contours, mmcv.concat_list(segm_result), strict=False
     ):
         if output_contours and len(contour) == 0:
             # skip this detection
@@ -143,7 +142,7 @@ def tile_touch_filter(detection, image_tile_poly: LineString, threshold=10):
     """
 
     contour = detection["contours"][0]
-    detection_poly = Polygon(zip(contour["x"], contour["y"]))
+    detection_poly = Polygon(zip(contour["x"], contour["y"], strict=False))
 
     distance = detection_poly.distance(image_tile_poly)
 
@@ -313,7 +312,7 @@ def tiled_inference(
     return all_detections
 
 
-def non_max_supression(all_detections: List[Polygon], iou=0.3):
+def non_max_supression(all_detections: list[Polygon], iou=0.3):
     """
     Performing something like non-maximum supression on a list of detections
 
@@ -332,7 +331,7 @@ def non_max_supression(all_detections: List[Polygon], iou=0.3):
         xs = contour["x"]
         ys = contour["y"]
 
-        poly = Polygon(zip(xs, ys))
+        poly = Polygon(zip(xs, ys, strict=False))
 
         if not poly.is_valid:
             logging.warning("Invalid polygon!")
@@ -380,7 +379,7 @@ def non_max_supression(all_detections: List[Polygon], iou=0.3):
         map(
             lambda idet: idet[1],
             filter(
-                lambda idet: not idet[0] in set_remove_indices,
+                lambda idet: idet[0] not in set_remove_indices,
                 enumerate(all_detections),
             ),
         )
@@ -455,7 +454,7 @@ def torch_mask_nms(
     drops = []  # torch.zeros_like(scores, dtype=torch.bool)
 
     # intersection = masks[None] & np.r
-    for i, (mask, score) in enumerate(zip(masks, scores)):
+    for i, (mask, score) in enumerate(zip(masks, scores, strict=False)):
         if not filter_mask[i]:
             continue
 
@@ -510,7 +509,7 @@ def mask_nms(
 
     filter_mask = scores >= score_threshold
     # intersection = masks[None] & np.r
-    for i, (mask, score) in enumerate(zip(masks, scores)):
+    for i, (mask, score) in enumerate(zip(masks, scores, strict=False)):
         if not filter_mask[i]:
             continue
 
