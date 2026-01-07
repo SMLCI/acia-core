@@ -178,15 +178,13 @@ class TestRenderSegmentation(unittest.TestCase):
             frame = result.get_frame(frame_idx)
             np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_none_overlay(self):
-        """Render segmentation without overlay (None)"""
+    def test_rendering_with_none_overlay_raises_error(self):
+        """Render segmentation with None overlay raises AttributeError"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
 
-        result = render_segmentation(image_source, None)
-
-        # Should still return valid result
-        self.assertIsInstance(result, InMemorySequenceSource)
-        self.assertEqual(len(result), 3)
+        # None overlay is not supported - requires valid Overlay object
+        with self.assertRaises(AttributeError):
+            render_segmentation(image_source, None)
 
     def test_rendering_with_custom_cell_color(self):
         """Render segmentation with custom cell color"""
@@ -225,15 +223,14 @@ class TestRenderSegmentation(unittest.TestCase):
         frame = result.get_frame(0)
         np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_empty_overlay(self):
-        """Render segmentation with overlay containing no contours"""
+    def test_rendering_with_empty_overlay_raises_error(self):
+        """Render segmentation with empty overlay raises ValueError"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
         overlay = Overlay([])
 
-        result = render_segmentation(image_source, overlay)
-
-        # Should handle empty overlay gracefully
-        self.assertIsInstance(result, InMemorySequenceSource)
+        # Empty overlay is not supported - raises ValueError in numpy min operation
+        with self.assertRaises(ValueError):
+            render_segmentation(image_source, overlay)
 
     def test_output_dtype_is_uint8(self):
         """Verify output images are uint8 dtype"""
@@ -959,16 +956,14 @@ class TestRenderSegmentationMask(unittest.TestCase):
         frame = result.get_frame(0)
         np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_empty_overlay(self):
-        """Render segmentation mask with overlay containing no instances"""
+    def test_rendering_with_empty_overlay_raises_error(self):
+        """Render segmentation mask with empty overlay raises ValueError"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
         overlay = Overlay([])
 
-        result = render_segmentation_mask(image_source, overlay)
-
-        # Should handle empty overlay gracefully
-        self.assertIsInstance(result, THWCSequenceSource)
-        self.assertEqual(len(result), 3)
+        # Empty overlay is not supported - raises ValueError in numpy min operation
+        with self.assertRaises(ValueError):
+            render_segmentation_mask(image_source, overlay)
 
     def test_output_dtype_is_uint8(self):
         """Verify output images are uint8 dtype"""
@@ -1208,16 +1203,14 @@ class TestRenderTrackingMask(unittest.TestCase):
         frame = result.get_frame(0)
         np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_empty_overlay(self):
-        """Render tracking mask with overlay containing no instances"""
+    def test_rendering_with_empty_overlay_raises_error(self):
+        """Render tracking mask with empty overlay raises ValueError"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
         overlay = Overlay([])
 
-        result = render_tracking_mask(image_source, overlay)
-
-        # Should handle empty overlay gracefully
-        self.assertIsInstance(result, THWCSequenceSource)
-        self.assertEqual(len(result), 3)
+        # Empty overlay is not supported - raises ValueError in numpy min operation
+        with self.assertRaises(ValueError):
+            render_tracking_mask(image_source, overlay)
 
     def test_output_dtype_is_uint8(self):
         """Verify output images are uint8 dtype"""
