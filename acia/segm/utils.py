@@ -75,7 +75,6 @@ def merge_cells_to_colonies(overlay: Overlay, expand=10) -> Overlay:
     for frame_ind, frame_overlay in enumerate(
         tqdm(overlay.timeIterator(), desc="Merging cells to colonies...")
     ):
-
         # get all polygons
         cont_polys = [cont.polygon for cont in frame_overlay]
 

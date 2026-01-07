@@ -1,5 +1,4 @@
-"""Module for general visualization functionality
-"""
+"""Module for general visualization functionality"""
 
 from __future__ import annotations
 
@@ -88,7 +87,6 @@ def draw_scale_bar(
     xstart, ystart = xy_position
 
     for image in image_iterator:
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -188,7 +186,6 @@ def draw_time(
     font = ImageFont.truetype(font_path, font_size)
 
     for frame, image in enumerate(image_iterator):
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -495,7 +492,6 @@ def render_cell_centers(
 
         # Draw overlay
         if frame_overlay:
-
             # compute all centers
             centers = [cont.center for cont in frame_overlay]
 
@@ -539,7 +535,6 @@ def render_tracking(
     for image, frame_overlay in zip(
         tqdm(image_source, desc="Render cell tracking paths..."), overlay.timeIterator(), strict=False
     ):
-
         np_image = np.copy(image.raw)
 
         if len(np_image.shape) == 2:
@@ -617,7 +612,6 @@ def render_video(
         filename, fps=framerate, codec=codec, ffmpeg_params=ffmpeg_params
     ) as writer:
         for im in tqdm(image_source, desc="Encoding video..."):
-
             image = im.raw
 
             if len(image.shape) == 2:
@@ -704,7 +698,6 @@ def render_scalebar(
     images = []
 
     for image in tqdm(image_source, desc="Render scale bar..."):
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -835,7 +828,6 @@ def render_time(
         ystart = int(np.round(image_height * ystart))
 
     for image, timepoint in zip(tqdm(image_source, desc="Render time..."), timepoints, strict=False):
-
         if isinstance(timepoint, pint.Quantity):
             timepoint = timedelta(seconds=float(timepoint.to(ureg.seconds).magnitude))
 

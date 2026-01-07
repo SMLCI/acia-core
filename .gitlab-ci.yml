@@ -1,23 +1,58 @@
-# This file is a template, and might need editing before it works on your project.
-# To contribute improvements to CI/CD templates, please follow the Development guide at:
-# https://docs.gitlab.com/ee/development/cicd/templates.html
-# This specific template is located at:
-# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Python.gitlab-ci.yml
+# GitLab CI/CD configuration for acia
+# Python 3.10+ project with Ruff linting, mypy type checking, and pytest testing
 
-# Official language image. Look for the different tagged releases at:
-# https://hub.docker.com/r/library/python/tags/
 image: python:3.10
 
-# Change pip's cache directory to be inside the project directory since we can
-# only cache local items.
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
 stages:
+  - lint
   - build
   - test
   - deploy
 
+# Lint and format check with Ruff
+lint:
+  stage: lint
+  script:
+    - pip install ruff
+    - ruff check acia tests
+    - ruff format --check acia tests
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# Type checking with mypy
+typecheck:
+  stage: lint
+  script:
+    - pip install mypy
+    - mypy acia --ignore-missing-imports
+  allow_failure: true  # Start permissive, remove once types are added
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# Build wheel for each Python version
+build:
+  image: python:$PY_VERSION
+  parallel:
+    matrix:
+      - PY_VERSION: ['3.10', '3.11', '3.12', '3.13']
+  stage: build
+  tags:
+    - biggpu
+  script:
+    - pip install build twine
+    - python -m build
+    - pip install dist/*.whl
+    - twine check dist/*
+  artifacts:
+    paths:
+      - dist/*.whl
+
+# Test on each Python version
 test:
   image: python:$PY_VERSION
   parallel:
@@ -25,24 +60,21 @@ test:
       - PY_VERSION: ['3.10', '3.11', '3.12', '3.13']
   stage: test
   tags:
-  - biggpu
+    - biggpu
   script:
     # test dependencies
     - pip install pytest pytest-sugar pytest-cov python-dotenv coverage unittest-xml-reporting
     - pip install git+https://github.com/JojoDevel/trackastra.git
     - pip install laptrack
-    # unittest-xml-reporting trackastra laptrack
     - pip install build
     - python -m build
     - pip install dist/*.whl
     # download data for testing
-    - mkdir test_resources
+    - mkdir -p test_resources
     - wget -O test_resources/ctc_format.zip https://fz-juelich.sciebo.de/s/8dEFaTKl26H26wO/download
     - unzip test_resources/ctc_format.zip -d test_resources/ctc_format
-    - ls
     # perform the tests
     - coverage run -m pytest --junitxml=report.xml --cov-report term --cov-report xml --cov=acia tests/
-    - python -m xmlrunner discover ./tests/ -o reports/
   coverage: '/TOTAL.*\s+(\d+%)/'
   artifacts:
     reports:
@@ -51,74 +83,12 @@ test:
         path: coverage.xml
       junit: report.xml
 
-#installation:
-#  image: mambaorg/micromamba:2.0.5-debian12-slim
-#  tags:
-#    - big-ram
-#  stage: build
-#  script:
-#    - micromamba env create -f conda.yaml
-#    - micromamba run -n acia pip install -e .
-#    - micromamba run -n acia python -c "import acia"
-
-build:
-  image: python:$PY_VERSION
-  parallel:
-    matrix:
-      - PY_VERSION: ['3.9', '3.10', '3.11', '3.12', '3.13']
-  stage: build
-  tags:
-  - biggpu
-  script:
-    - pip install build twine
-    - python -m build
-    # an alternative approach is to install and run:
-    - pip install dist/*.whl
-    - twine check dist/*
-  artifacts:
-    paths:
-      - dist/*.whl
-
-.deploy_common:
-  # common config
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-
-
-
-#upload_package:
-#  stage: deploy
-#  # dot pass artifacts from other stages
-#  dependencies: []
-#  cache: []
-#  extends: .deploy_common
-#  script:
-#    - set -e
-#    - pip install twine bump2version
-#    - git config --global user.email "${GITLAB_USER_EMAIL}"
-#    - git config --global user.name "${GITLAB_USER_NAME}"
-#    - git log
-#    # list tags
-#    - git tag
-#    - bump2version patch
-#    - python setup.py sdist bdist_wheel
-#    - ls -all dist/
-#    - TWINE_PASSWORD=${CI_JOB_TOKEN} TWINE_USERNAME=gitlab-ci-token python -m twine upload --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/*
-#    - git remote set-url origin "https://${CI_PUSH_NAME}:${CI_PUSH_TOKEN}@jugit.fz-juelich.de/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}.git"
-#    - git push -o ci.skip --tags origin HEAD:${CI_COMMIT_REF_NAME}
-#    - TWINE_PASSWORD=${PYPI_API_TOKEN} TWINE_USERNAME=__token__ twine upload --repository pypi dist/*
-#  artifacts:
-#    paths:
-#      - dist/
-
-
-
+# Deploy documentation to GitLab Pages
 pages:
   stage: deploy
-  extends: .deploy_common
   script:
     - pip install sphinx sphinx-rtd-theme pint
-    - cd docs ; make html
+    - cd docs && make html
     - mv _build/html/ ../public/
   artifacts:
     paths:

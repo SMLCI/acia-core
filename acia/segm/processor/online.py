@@ -55,7 +55,6 @@ class OnlineModel(Processor):
 
         # iterate over images from image source
         for frame, image in enumerate(tqdm.tqdm(source)):
-
             # convert image into a binary png stream
             byte_io = BytesIO()
             Image.fromarray(image).save(byte_io, "png")

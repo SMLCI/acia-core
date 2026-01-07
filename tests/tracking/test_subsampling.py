@@ -17,7 +17,6 @@ class TestSubsampling(unittest.TestCase):
     def linear_track(
         length, frame_start, id_start=None, successors: list[TrackingSource] = None
     ):
-
         if successors is None:
             successors = []
 

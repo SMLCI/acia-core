@@ -1,4 +1,5 @@
 """Utilities for the visualization"""
+
 from string import Formatter
 
 

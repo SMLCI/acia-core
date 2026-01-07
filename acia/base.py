@@ -1,4 +1,4 @@
-""" All basic functionality for acia """
+"""All basic functionality for acia"""
 
 from __future__ import annotations
 
@@ -186,7 +186,6 @@ class Contour:
         return self._toMask(height=height, width=width)
 
     def draw(self, image, draw=None, outlineColor=(255, 255, 0), fillColor=None):
-
         is_numpy = isinstance(image, np.ndarray)
 
         # Deal with numpy or PIL.Image
@@ -389,7 +388,6 @@ class Overlay:
             for i, cont in enumerate(timeOverlay):
                 mask = cont.toMask(height=height, width=width)
                 if not binary_mask:
-
                     label = i + 1
                     if cont.label is not None:
                         with contextlib.suppress(ValueError):

@@ -1,4 +1,4 @@
-""" Utils for OMERO segmenation data"""
+"""Utils for OMERO segmenation data"""
 
 
 import cv2

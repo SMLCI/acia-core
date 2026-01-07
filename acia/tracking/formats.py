@@ -1,4 +1,4 @@
-""" Module to convert tracking formats """
+"""Module to convert tracking formats"""
 
 from __future__ import annotations
 
@@ -36,7 +36,6 @@ def parse_simple_tracking(file_content: str) -> tuple[Overlay, nx.DiGraph]:
 
     # create contours
     for det in segmentation_data:
-
         det_id = det["id"]
         # try to convert to integer
         with contextlib.suppress(ValueError):
@@ -77,7 +76,6 @@ def gen_simple_tracking(overlay: Overlay, tracking_graph: nx.Graph) -> str:
 
     segmentation_data = []
     for cont in overlay:
-
         coordinates = cont.coordinates
 
         if isinstance(coordinates, np.ndarray):
@@ -159,7 +157,6 @@ def write_ctc_tracking(
     # Write tracklet information
     data = []
     for n in tracklet_graph.nodes:
-
         predecessors = list(tracklet_graph.predecessors(n))
         if len(predecessors) == 0:
             parent_label = 0
@@ -225,7 +222,6 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
         )
 
     for tracklet_label, tracklet_nodes in tracklets.items():
-
         # add tracklet edges
         for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:], strict=False):
             track_graph.add_edge(contA.id, contB.id)
@@ -264,7 +260,6 @@ def tracking_to_graph(data: list[dict]) -> nx.DiGraph:
     # add division links
     for item in data:
         if int(item["parent_id"]) != 0:
-
             # get the time it divides
             # split_frame = int(item["start_frame"]) - 1
 

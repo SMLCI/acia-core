@@ -1,5 +1,4 @@
-"""Utilities for tracking
-"""
+"""Utilities for tracking"""
 
 import logging
 from itertools import product
@@ -137,7 +136,6 @@ def tracklet_to_tracking(ov: Overlay, tracklet_graph: nx.DiGraph) -> nx.DiGraph:
             label_lookup[cont.label] = label_lookup.get(cont.label, []) + [cont]
 
     for label in tracklet_graph.nodes:
-
         # get all the contours with this label
         contours = sorted(label_lookup[label], key=lambda c: c.frame)
 
@@ -194,7 +192,6 @@ def merge_incosistent_segmentation(
     for n in tracklet_graph.nodes:
         # check the join condition
         if cond(n, tracklet_graph):
-
             children = sorted(
                 tracklet_graph.successors(n), key=tracklet_graph.out_degree
             )
@@ -269,12 +266,10 @@ def merge_incosistent_segmentation(
     relabel_actions = {n: n for n in tracklet_graph.nodes}
 
     for a, b in tracklets_to_join:
-
         relabel_actions[b] = relabel_actions[a]
 
     # actually join the tracklets
     for b, a in relabel_actions.items():
-
         # join the two
         b_children = tracklet_graph.successors(b)
 

@@ -1,4 +1,4 @@
-""" Filters for segmentating overlay objects"""
+"""Filters for segmentating overlay objects"""
 
 from functools import partial
 

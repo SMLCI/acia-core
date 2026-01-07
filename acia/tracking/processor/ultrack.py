@@ -1,4 +1,4 @@
-""" Ultrack based tracking """
+"""Ultrack based tracking"""
 
 import networkx as nx
 from ultrack import to_tracks_layer, track, tracks_to_zarr
@@ -25,7 +25,6 @@ class UltrackTracker(TrackingProcessor):
         self.config = config
 
     def __call__(self, images: ImageSequenceSource, segmentation: Overlay):
-
         image = next(iter(images)).raw
         height, width = image.shape[:2]
 

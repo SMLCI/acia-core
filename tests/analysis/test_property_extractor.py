@@ -1,4 +1,4 @@
-""" Testcases for single-cell property extractors """
+"""Testcases for single-cell property extractors"""
 
 import unittest
 from itertools import product

@@ -58,7 +58,6 @@ class LAPTracker(TrackingProcessor):
 
             new_label = np.zeros_like(labels[frame])
             for _, row in frame_df.iterrows():
-
                 label = row["label"]
                 track_id = row["track_id"] + 1
                 mask = labels[frame] == label
@@ -146,7 +145,6 @@ class LAPTracker2(TrackingProcessor):
 
             new_label = np.zeros_like(labels[frame])
             for _, row in frame_df.iterrows():
-
                 label = row["label"]
                 track_id = row["track_id"] + 1
                 mask = labels[frame] == label

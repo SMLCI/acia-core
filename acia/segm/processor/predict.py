@@ -1,4 +1,4 @@
-""" Helper file to generate contours from masks"""
+"""Helper file to generate contours from masks"""
 
 import logging
 
