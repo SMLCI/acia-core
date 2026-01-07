@@ -128,3 +128,4 @@ ENV/
 
 .claude_settings.json
 .worktrees/
+.auto-claudo-status
