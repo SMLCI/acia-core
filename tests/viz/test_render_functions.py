@@ -247,5 +247,105 @@ class TestRenderSegmentation(unittest.TestCase):
             self.assertEqual(frame.raw.dtype, np.uint8)
 
 
+# ============================================================================
+# Tests for render_tracking
+# ============================================================================
+
+
+class TestRenderTracking(unittest.TestCase):
+    """Tests for the render_tracking function"""
+
+    def test_basic_rendering_with_tracking_graph(self):
+        """Render tracking on images with overlay and tracking graph"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_contours(frames=3, contours_per_frame=2)
+        tracking_graph = create_simple_tracking_graph(overlay)
+
+        result = render_tracking(image_source, overlay, tracking_graph)
+
+        # Check that result is an InMemorySequenceSource
+        self.assertIsInstance(result, InMemorySequenceSource)
+
+        # Verify output has correct number of frames and shape
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_grayscale_images(self):
+        """Render tracking on grayscale images (converts to RGB)"""
+        # Create grayscale images (2D)
+        images = np.random.randint(0, 255, size=(3, 100, 100), dtype=np.uint8)
+        image_source = InMemorySequenceSource(images)
+        overlay = create_test_overlay_with_contours(frames=3, contours_per_frame=2)
+        tracking_graph = create_simple_tracking_graph(overlay)
+
+        result = render_tracking(image_source, overlay, tracking_graph)
+
+        # Output should be RGB (3 channels)
+        self.assertIsInstance(result, InMemorySequenceSource)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_single_frame(self):
+        """Render tracking on a single frame"""
+        image_source = create_test_image_source(frames=1, height=100, width=100)
+        overlay = create_test_overlay_with_contours(frames=1, contours_per_frame=2)
+        tracking_graph = create_simple_tracking_graph(overlay)
+
+        result = render_tracking(image_source, overlay, tracking_graph)
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 1)
+        frame = result.get_frame(0)
+        np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_empty_tracking_graph(self):
+        """Render tracking with empty tracking graph"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_contours(frames=3, contours_per_frame=2)
+        tracking_graph = nx.DiGraph()  # Empty graph
+
+        result = render_tracking(image_source, overlay, tracking_graph)
+
+        # Should handle empty graph gracefully
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_output_dtype_is_uint8(self):
+        """Verify output images are uint8 dtype"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_contours(frames=3, contours_per_frame=2)
+        tracking_graph = create_simple_tracking_graph(overlay)
+
+        result = render_tracking(image_source, overlay, tracking_graph)
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(frame.raw.dtype, np.uint8)
+
+    def test_rendering_with_branching_tracks(self):
+        """Render tracking with cell divisions (branching)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        overlay = create_test_overlay_with_contours(frames=3, contours_per_frame=3)
+
+        # Create a tracking graph with branching (cell division)
+        G = nx.DiGraph()
+        for cont in overlay:
+            G.add_node(cont.id, frame=cont.frame, label=cont.label)
+
+        # Cell in frame 0 divides into two cells in frame 1
+        G.add_edge("cell_0_0", "cell_1_0")
+        G.add_edge("cell_0_0", "cell_1_1")  # Division event
+        G.add_edge("cell_1_0", "cell_2_0")
+        G.add_edge("cell_1_1", "cell_2_1")
+
+        result = render_tracking(image_source, overlay, G)
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
