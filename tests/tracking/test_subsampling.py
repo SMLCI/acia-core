@@ -1,7 +1,6 @@
 """Unit test cases for tracking subsampling"""
 
 import unittest
-from typing import List
 
 import networkx as nx
 import numpy as np
@@ -16,9 +15,8 @@ class TestSubsampling(unittest.TestCase):
 
     @staticmethod
     def linear_track(
-        length, frame_start, id_start=None, successors: List[TrackingSource] = None
+        length, frame_start, id_start=None, successors: list[TrackingSource] = None
     ):
-
         if successors is None:
             successors = []
 

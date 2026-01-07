@@ -1,4 +1,4 @@
-""" PyUAT based tracking """
+"""PyUAT based tracking"""
 
 import gzip
 import tempfile
@@ -63,7 +63,6 @@ class PyUATTracker(TrackingProcessor):
             )
 
     def __call__(self, images: ImageSequenceSource, segmentation: Overlay):
-
         print("Extract single-cell information...")
         df, all_detections = extract_single_cell_information(segmentation)
 

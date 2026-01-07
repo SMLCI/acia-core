@@ -81,7 +81,6 @@ class OfflineModel(Processor):
         overlay = Overlay([])
 
         for frame_id, image in tqdm.tqdm(enumerate(source)):
-
             pred_result = prediction(image, self.model, tiling=self.tiling)
 
             if len(pred_result) == 0:
@@ -136,6 +135,7 @@ class PoseModel(Processor):
         Load model from definitions
         """
         from cellpose import models
+
         logging.info("Loading model %s", self.model_name)
         self.model = models.Cellpose(
             gpu=self.use_gpu, model_type=self.model_name, omni=self.omni

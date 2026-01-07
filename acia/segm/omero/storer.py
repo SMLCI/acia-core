@@ -268,12 +268,11 @@ class BlitzConn:
         conn=None,
         readonly=True,
     ):
-
         assert username is not None or conn is not None, "Please provide a username"
         assert password is not None or conn is not None, "Please provide a password"
-        assert (
-            serverUrl is not None or conn is not None
-        ), "Please provide a OMERO server"
+        assert serverUrl is not None or conn is not None, (
+            "Please provide a OMERO server"
+        )
 
         self.username = username
         self.password = password
@@ -494,9 +493,9 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
                 np_range = np.array(self.range)
                 self.range = np_range[np_range < len(self)]
 
-        assert len(self.channels) <= len(
-            self.colorList
-        ), f"you must specify a color for every channel! You have {len(self.channels)} channels ({self.channels}) but only {len(self.colorList)} color(s) ({self.colorList}). Please update your colorList!"
+        assert len(self.channels) <= len(self.colorList), (
+            f"you must specify a color for every channel! You have {len(self.channels)} channels ({self.channels}) but only {len(self.colorList)} color(s) ({self.colorList}). Please update your colorList!"
+        )
 
     def imageName(self) -> str:
         """

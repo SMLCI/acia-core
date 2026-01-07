@@ -1,7 +1,6 @@
-""" Helper file to generate contours from masks"""
+"""Helper file to generate contours from masks"""
 
 import logging
-from typing import List
 
 import cv2
 import mmcv
@@ -313,7 +312,7 @@ def tiled_inference(
     return all_detections
 
 
-def non_max_supression(all_detections: List[Polygon], iou=0.3):
+def non_max_supression(all_detections: list[Polygon], iou=0.3):
     """
     Performing something like non-maximum supression on a list of detections
 
@@ -380,7 +379,7 @@ def non_max_supression(all_detections: List[Polygon], iou=0.3):
         map(
             lambda idet: idet[1],
             filter(
-                lambda idet: not idet[0] in set_remove_indices,
+                lambda idet: idet[0] not in set_remove_indices,
                 enumerate(all_detections),
             ),
         )

@@ -1,4 +1,4 @@
-""" Functionality for single-cell analysis """
+"""Functionality for single-cell analysis"""
 
 from __future__ import annotations
 
@@ -157,7 +157,6 @@ class PerimeterEx(PropertyExtractor):
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         data = []
         for cont in overlay:
-
             # extract the length of the polygon
             perimeter = cont.polygon.length
 
@@ -286,7 +285,6 @@ class LengthWidthEx(PropertyExtractor):
         widths = []
         lengths = []
         for cont in overlay:
-
             pd_box = pairwise_distances(
                 np.array(
                     # bbox approaximation
@@ -425,7 +423,6 @@ class DynamicTimeEx(PropertyExtractor):
             self.timepoints -= self.timepoints[0]
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
-
         # get the number of frames
         df_num_frames = np.unique(df["frame"])
         num_frames = images.size_t
@@ -507,9 +504,9 @@ class FluorescenceEx(PropertyExtractor):
         self.summarize_operator = summarize_operator
         self.parallel = parallel
 
-        assert len(self.channels) == len(
-            self.channel_names
-        ), "Number of channels and number of channel names must comply"
+        assert len(self.channels) == len(self.channel_names), (
+            "Number of channels and number of channel names must comply"
+        )
 
     @staticmethod
     def extract_fluorescence(
@@ -556,9 +553,9 @@ class FluorescenceEx(PropertyExtractor):
         return pd.DataFrame(data).set_index("id")
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
-        assert overlay.numFrames() == len(
-            images
-        ), "Please make sure that the frames in your overlay fit to the frames in your image source"
+        assert overlay.numFrames() == len(images), (
+            "Please make sure that the frames in your overlay fit to the frames in your image source"
+        )
 
         def iterator(timeIterator):
             for i, overlay in enumerate(timeIterator):
@@ -646,9 +643,7 @@ def scale(
     failed_ids = []
 
     for image_id in tqdm(image_ids):
-
         try:
-
             # create the main output folder
             output_parent = output_path / execution_naming(image_id)
             os.makedirs(output_parent, exist_ok=exist_ok)

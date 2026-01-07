@@ -1,6 +1,5 @@
 """Utils for segmentation data handling"""
 
-from typing import Tuple
 
 import numpy as np
 from shapely.geometry import MultiPolygon, Polygon
@@ -11,7 +10,7 @@ from acia.base import Contour, Overlay
 from acia.utils import pairwise_distances
 
 
-def compute_indices(frame: int, size_t: int, size_z: int) -> Tuple[int, int]:
+def compute_indices(frame: int, size_t: int, size_z: int) -> tuple[int, int]:
     """Compute t and z values from a linearized frame number
 
     Args:
@@ -41,7 +40,7 @@ def compute_indices(frame: int, size_t: int, size_z: int) -> Tuple[int, int]:
     return t, z
 
 
-def length_and_area(contour: Contour) -> Tuple[float, float]:
+def length_and_area(contour: Contour) -> tuple[float, float]:
     """Compute length and area of a contour object (in pixel coordinates)
 
     Args:
@@ -76,7 +75,6 @@ def merge_cells_to_colonies(overlay: Overlay, expand=10) -> Overlay:
     for frame_ind, frame_overlay in enumerate(
         tqdm(overlay.timeIterator(), desc="Merging cells to colonies...")
     ):
-
         # get all polygons
         cont_polys = [cont.polygon for cont in frame_overlay]
 
