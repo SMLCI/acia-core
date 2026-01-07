@@ -140,7 +140,7 @@ def tracklet_to_tracking(ov: Overlay, tracklet_graph: nx.DiGraph) -> nx.DiGraph:
         contours = sorted(label_lookup[label], key=lambda c: c.frame)
 
         # add them sequentially
-        for a, b in zip(contours, contours[1:]):
+        for a, b in zip(contours, contours[1:], strict=False):
             tracking_graph.add_edge(a.id, b.id)
 
     for label in tracklet_graph.nodes:
@@ -185,10 +185,7 @@ def merge_incosistent_segmentation(
             graph.nodes[children[0]]["end_frame"]
             - graph.nodes[children[0]]["start_frame"]
         )
-        if dur > num_nodes:
-            return False
-
-        return True
+        return not dur > num_nodes
 
     # collect all the siblsings that should be joined
     to_join = []

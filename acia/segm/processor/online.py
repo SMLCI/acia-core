@@ -83,7 +83,7 @@ class OnlineModel(Processor):
             for detection in content:
                 # label = detection['label']
                 contour_lists = detection["contours"][0]
-                contour = list(zip(contour_lists["x"], contour_lists["y"]))
+                contour = list(zip(contour_lists["x"], contour_lists["y"], strict=False))
                 score = detection["score"]
 
                 contours.append(Contour(contour, score, frame, -1))

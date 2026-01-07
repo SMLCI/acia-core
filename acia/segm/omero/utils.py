@@ -258,9 +258,8 @@ def has_all_tags(object, tag_list: list[str] = None):
 
     tag_list = tag_list.copy()
     for ann in object.listAnnotations():
-        if omero.model.TagAnnotationI == ann.OMERO_TYPE:
-            if ann.getTextValue() in tag_list:
-                del tag_list[tag_list.index(ann.getTextValue())]
+        if omero.model.TagAnnotationI == ann.OMERO_TYPE and ann.getTextValue() in tag_list:
+            del tag_list[tag_list.index(ann.getTextValue())]
 
         if len(tag_list) == 0:
             break

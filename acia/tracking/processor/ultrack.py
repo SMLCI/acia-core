@@ -70,7 +70,7 @@ class UltrackTracker(TrackingProcessor):
             tracking_graph.add_nodes_from([c.id for c in contours])
 
             # add sequential tracks
-            for c1, c2 in zip(contours[:-1], contours[1:]):
+            for c1, c2 in zip(contours[:-1], contours[1:], strict=False):
                 tracking_graph.add_edge(c1.id, c2.id)
 
             # add divisions

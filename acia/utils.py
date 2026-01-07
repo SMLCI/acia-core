@@ -26,7 +26,7 @@ def pairwise_distances(points: np.ndarray):
     if len(points) == 0:
         return distances
 
-    for a, b in zip(points, points[1:]):
+    for a, b in zip(points, points[1:], strict=False):
         distances.append(np.linalg.norm(a - b))
 
     return distances

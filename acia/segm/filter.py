@@ -120,7 +120,7 @@ class SizeFilter:
         """
         contour_shapes = [Polygon(cont.coordinates) for cont in overlay.contours]
         result_overlay = Overlay([])
-        for cont, shape in zip(overlay.contours, contour_shapes):
+        for cont, shape in zip(overlay.contours, contour_shapes, strict=False):
             area = shape.area
 
             if min_area < area < max_area:
@@ -166,9 +166,11 @@ class EllipsoidFilter:
             rect_area_error = np.abs(shape.area - min_rect.area) / shape.area
             ellipse_area_error = np.abs(ellr.area - shape.area) / shape.area
 
-            if min_width_height_ratio <= width_height_ratio <= max_width_height_ratio:
-                if ellipse_area_error < rect_area_error:
-                    # if an ellipse can better explain the cell detection than a rectangle
-                    result_overlay.add_contour(cont)
+            if (
+                min_width_height_ratio <= width_height_ratio <= max_width_height_ratio
+                and ellipse_area_error < rect_area_error
+            ):
+                # if an ellipse can better explain the cell detection than a rectangle
+                result_overlay.add_contour(cont)
 
         return result_overlay

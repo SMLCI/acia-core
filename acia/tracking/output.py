@@ -374,7 +374,7 @@ class CTCTrackingHelper:
                 tracking_graph.add_node(f"{frame}_{id}", frame=frame)
 
             # add trajectory edges
-            for a, b in zip(node_items, node_items[1:]):
+            for a, b in zip(node_items, node_items[1:], strict=False):
                 tracking_graph.add_edge(a, b)
 
             # add edge to parent (0 means no parent)

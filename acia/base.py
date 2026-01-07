@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import multiprocessing
@@ -389,11 +390,8 @@ class Overlay:
                 if not binary_mask:
                     label = i + 1
                     if cont.label is not None:
-                        try:
+                        with contextlib.suppress(ValueError):
                             label = int(cont.label)
-                        except ValueError:
-                            # could not convert label to integer
-                            pass
 
                     mask = mask.astype(np.uint16) * (
                         label
@@ -509,7 +507,7 @@ class ImageRoISource:
         self.roiSource = roiSource
 
     def __iter__(self) -> Iterator[tuple[np.array, Overlay]]:
-        return zip(iter(self.imageSource), iter(self.roiSource))
+        return zip(iter(self.imageSource), iter(self.roiSource), strict=False)
 
     def __len__(self):
         return min(len(self.imageSource), len(self.roiSource))

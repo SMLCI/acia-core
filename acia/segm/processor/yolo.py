@@ -50,7 +50,7 @@ class YOLOSegmenter:
                 continue
 
             # loop over all masks
-            for mask, box in zip(frame_data.masks, frame_data.boxes):
+            for mask, box in zip(frame_data.masks, frame_data.boxes, strict=False):
                 # add one because they start couting at 0 (but zero is background in the mask)
                 cls = int(box.cls.item()) + 1
 

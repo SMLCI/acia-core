@@ -183,7 +183,7 @@ def renderVideo(
 
     with ve:
         for frame, (image, overlay) in enumerate(
-            tqdm.tqdm(zip(imageSource, roiSource))
+            tqdm.tqdm(zip(imageSource, roiSource, strict=False))
         ):
             # extract the numpy image
             if isinstance(image, BaseImage):
