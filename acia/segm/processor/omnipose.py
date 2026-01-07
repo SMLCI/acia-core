@@ -49,7 +49,6 @@ class OmniposeSegmenter(SegmentationProcessor):
 
     @staticmethod
     def __predict(images, model, omnipose_parameters: dict = None, batch_size=20):
-
         if omnipose_parameters is None:
             omnipose_parameters = {}
 
@@ -77,7 +76,6 @@ class OmniposeSegmenter(SegmentationProcessor):
         )
 
         for image_batch in batch(images, n=batch_size):
-
             # Make evaluation (flows and styles are not needed)
             masks, _, _ = model.eval(
                 image_batch,
@@ -107,7 +105,6 @@ class OmniposeSegmenter(SegmentationProcessor):
     def __call__(
         self, images: ImageSequenceSource, omnipose_parameters: dict = None
     ) -> Overlay:
-
         imgs = []
         for image in images:
             raw_image = image.raw

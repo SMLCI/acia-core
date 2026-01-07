@@ -1,4 +1,4 @@
-""" Test acia base functionality"""
+"""Test acia base functionality"""
 
 import unittest
 

@@ -31,7 +31,6 @@ class CellposeSAMSegmenter:
         return masks
 
     def __call__(self, images: ImageSequenceSource, cellpose_params=None) -> Overlay:
-
         # list of images
         imgs = [im.raw for im in images]
 

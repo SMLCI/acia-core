@@ -1,5 +1,4 @@
-""" Functions for different segmentation formats"""
-
+"""Functions for different segmentation formats"""
 
 import json
 from pathlib import Path
@@ -57,7 +56,6 @@ def gen_simple_segmentation(overlay: Overlay) -> str:
 
         # loop over all contours in a frame
         for cont in frame_overlay:
-
             # transform coordinates to list (otherwise not json serializable)
             coordinates = cont.coordinates
             if isinstance(coordinates, np.ndarray):
@@ -140,7 +138,6 @@ def overlay_from_masks(segm_masks: np.ndarray) -> Overlay:
 
     # Iterate all the mask files
     for frame_id, mask in enumerate(segm_masks):
-
         # Find all cell labels (except 0)
         labels = np.unique(mask)[1:]
 

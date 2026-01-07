@@ -41,7 +41,6 @@ class CellTrackingChallengeDatasetGT:
         base_folder.mkdir(exist_ok=True, parents=True)
 
         for i, (image_source, tracking_source) in enumerate(self.sources):
-
             mode = "GT"
 
             image_dir = base_folder / f"{i + offset:02}"
@@ -101,16 +100,14 @@ class CellTrackingDatasetResult:
         self.sources.append(content)
 
     def write(self, base_folder: str | Path = "data", offset=0):
-
         base_folder = Path(base_folder)
 
         base_folder.mkdir(exist_ok=True, parents=True)
 
         for i, (tracking_source, (height, width)) in enumerate(self.sources):
-
             mode = "RES"
 
-            ann_dir = base_folder / f"{i+offset:02}_{mode}"
+            ann_dir = base_folder / f"{i + offset:02}_{mode}"
 
             if ann_dir.exists():
                 shutil.rmtree(ann_dir)
@@ -248,7 +245,7 @@ class CTCTrackingHelper:
                 )
 
             lines.append(
-                f"{i+1} {start_frame} {end_frame} {parent}"
+                f"{i + 1} {start_frame} {end_frame} {parent}"
             )  # life-cycle enumeration starts with one
 
         return lines
@@ -266,9 +263,9 @@ class CTCTrackingHelper:
         contour_life_cycle_lookup = {}
         for i, life_cycle in enumerate(life_cycles):
             for cont_id in life_cycle:
-                contour_life_cycle_lookup[
-                    cont_id
-                ] = i  # life cycle enumeration starts with 1
+                contour_life_cycle_lookup[cont_id] = (
+                    i  # life cycle enumeration starts with 1
+                )
 
         return contour_life_cycle_lookup
 
@@ -329,7 +326,6 @@ class CTCTrackingHelper:
             tqdm(all_polygons, desc="Convert to overlay...")
         ):
             for id, poly in frame_polygons:
-
                 if isinstance(poly, MultiPolygon):
                     # if it comes to parsing problems take the polygon with the largest area
                     polygons = list(poly.geoms)

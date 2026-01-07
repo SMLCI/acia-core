@@ -1,7 +1,6 @@
-""" Filters for segmentating overlay objects"""
+"""Filters for segmentating overlay objects"""
 
 from functools import partial
-from typing import Tuple
 
 import cv2
 import numpy as np
@@ -15,7 +14,7 @@ from shapely.validation import make_valid
 from acia.base import Overlay
 
 
-def bbox_to_rectangle(bbox: Tuple[float]):
+def bbox_to_rectangle(bbox: tuple[float]):
     minx, miny, maxx, maxy = bbox
     return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
 

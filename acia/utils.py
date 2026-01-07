@@ -1,5 +1,4 @@
-"""Global utilities
-"""
+"""Global utilities"""
 
 from __future__ import annotations
 

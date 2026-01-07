@@ -1,5 +1,4 @@
-""" Local segmentation functionality dealing with files from HDD.
-"""
+"""Local segmentation functionality dealing with files from HDD."""
 
 import os
 import os.path as osp
@@ -279,9 +278,9 @@ class LocalSequenceSource(ImageSequenceSource):
                 else:
                     num_image_channels = image.shape[self.channel_index]
 
-                assert (
-                    len(self.luts) == num_image_channels
-                ), f"We need a LUTs function for every channel! We have {num_image_channels} channels but only {len(self.luts)} LUTs!"
+                assert len(self.luts) == num_image_channels, (
+                    f"We need a LUTs function for every channel! We have {num_image_channels} channels but only {len(self.luts)} LUTs!"
+                )
                 # apply luts to image
                 if len(image.shape) == 2:
                     # we only have one channel

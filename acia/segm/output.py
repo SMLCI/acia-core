@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from functools import partial
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -47,7 +48,6 @@ class MMSegmentationDataset(DatasetExporter):
         self.label_converter = label_coverter
 
     def write(self, base_folder: str | Path = "data", mode="train"):
-
         img_path = Path(base_folder).absolute() / "img_dir" / mode
         ann_path = Path(base_folder).absolute() / "ann_dir" / mode
 
@@ -185,7 +185,6 @@ def renderVideo(
         for frame, (image, overlay) in enumerate(
             tqdm.tqdm(zip(imageSource, roiSource))
         ):
-
             # extract the numpy image
             if isinstance(image, BaseImage):
                 image = image.raw

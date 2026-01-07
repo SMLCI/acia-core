@@ -1,4 +1,4 @@
-""" Utils for segmentation testing """
+"""Utils for segmentation testing"""
 
 import unittest
 
@@ -13,7 +13,6 @@ class TestIndexing(unittest.TestCase):
     """Test the linearization of z and t stacks"""
 
     def test_both(self):
-
         setup = dict(size_t=4, size_z=4)
 
         self.assertEqual(compute_indices(0, **setup), (0, 0))

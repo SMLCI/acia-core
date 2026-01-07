@@ -5,7 +5,6 @@ import logging
 import os
 from io import BytesIO
 from itertools import chain, islice
-from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
@@ -56,7 +55,6 @@ class OnlineModel(Processor):
 
         # iterate over images from image source
         for frame, image in enumerate(tqdm.tqdm(source)):
-
             # convert image into a binary png stream
             byte_io = BytesIO()
             Image.fromarray(image).save(byte_io, "png")
@@ -93,7 +91,7 @@ class OnlineModel(Processor):
         return Overlay(contours)
 
     @staticmethod
-    def parseContours(response_body) -> List[Contour]:
+    def parseContours(response_body) -> list[Contour]:
         pass
 
 
@@ -257,7 +255,7 @@ class FlexibleOnlineModel(Processor):
         return contours
 
     @retry(requests.exceptions.ReadTimeout, tries=3)
-    def predict_batch(self, frame_ids: List[int], images: List, params) -> Overlay:
+    def predict_batch(self, frame_ids: list[int], images: list, params) -> Overlay:
         """Predict segmentation for a batch of frames
 
         Args:
@@ -320,5 +318,5 @@ class FlexibleOnlineModel(Processor):
         return contours
 
     @staticmethod
-    def parseContours(response_body) -> List[Contour]:
+    def parseContours(response_body) -> list[Contour]:
         pass

@@ -1,4 +1,4 @@
-""" Trackastra based tracking """
+"""Trackastra based tracking"""
 
 import logging
 import tempfile
@@ -23,7 +23,6 @@ class TrackastraTracker(TrackingProcessor):
     """Processor for Trackastra: https://doi.org/10.48550/arXiv.2405.15700"""
 
     def __init__(self, mode="greedy"):
-
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # Load a pretrained model
@@ -31,7 +30,6 @@ class TrackastraTracker(TrackingProcessor):
         self.mode = mode
 
     def __call__(self, images: ImageSequenceSource, segmentation: Overlay):
-
         image = next(iter(images)).raw
         height, width = image.shape[:2]
 

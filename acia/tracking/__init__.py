@@ -1,5 +1,4 @@
-"""Tracking module contains all tools to work with tracking formats
-"""
+"""Tracking module contains all tools to work with tracking formats"""
 
 from pathlib import Path
 
@@ -136,7 +135,9 @@ def subsample_tracking(
 
     # compute the set of segment ids we have to remove
     subsampled_overlay_ids = {cont.id for cont in subsampled_overlay}
-    nodes_to_remove = set(tracking_graph.nodes).difference(
+    nodes_to_remove = set(
+        tracking_graph.nodes
+    ).difference(
         subsampled_overlay_ids
     )  # [node for node in nx.topological_sort(tracking_graph) if node not in subsampled_overlay_ids]
 
@@ -190,7 +191,6 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
         )
 
     for tracklet_label, tracklet_nodes in tracklets.items():
-
         # add tracklet edges
         for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:]):
             track_graph.add_edge(contA.id, contB.id)
