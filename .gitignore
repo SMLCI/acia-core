@@ -125,3 +125,6 @@ ENV/
 
 # Auto Claude data directory
 .auto-claude/
+
+.claude_settings.json
+.worktrees/
