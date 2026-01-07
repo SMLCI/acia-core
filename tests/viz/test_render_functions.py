@@ -591,5 +591,307 @@ class TestRenderScalebar(unittest.TestCase):
             np.testing.assert_array_equal(frame.raw.shape, (200, 200, 3))
 
 
+# ============================================================================
+# Tests for render_time
+# ============================================================================
+
+
+class TestRenderTime(unittest.TestCase):
+    """Tests for the render_time function"""
+
+    def test_basic_rendering_with_pint_quantities(self):
+        """Render time with pint Quantity timepoints"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        # Check that result is an InMemorySequenceSource
+        self.assertIsInstance(result, InMemorySequenceSource)
+
+        # Verify output has correct number of frames and shape
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_basic_rendering_with_timedelta(self):
+        """Render time with timedelta timepoints"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [
+            timedelta(minutes=0),
+            timedelta(minutes=5),
+            timedelta(minutes=10),
+        ]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_mixed_timepoints(self):
+        """Render time with mixed pint and timedelta timepoints"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [
+            0 * ureg.minute,
+            timedelta(minutes=5),
+            10 * ureg.minute,
+        ]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_relative_float_position(self):
+        """Render time with relative float xy position (0-1 range)"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(0.1, 0.1),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_rendering_with_background_color(self):
+        """Render time with background color"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+            background_color=(0, 0, 0),
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_time_format(self):
+        """Render time with custom time format"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+            time_format="{M:02}:{S:02}",
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_color(self):
+        """Render time with custom color"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+            color=(255, 0, 0),
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_font_size(self):
+        """Render time with custom font size"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+            font_size=12,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_custom_background_margin(self):
+        """Render time with custom background margin"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+            background_color=(0, 0, 0),
+            background_margin_pixel=10,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_single_frame(self):
+        """Render time on a single frame"""
+        image_source = create_test_image_source(frames=1, height=100, width=100)
+        timepoints = [0 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 1)
+        frame = result.get_frame(0)
+        np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
+
+    def test_output_dtype_is_uint8(self):
+        """Verify output images are uint8 dtype"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            self.assertEqual(frame.raw.dtype, np.uint8)
+
+    def test_invalid_float_x_position_raises_error(self):
+        """Float x position > 1.0 should raise ValueError"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        with self.assertRaises(ValueError):
+            render_time(
+                image_source,
+                xy_position=(1.5, 0.1),
+                timepoints=timepoints,
+            )
+
+    def test_invalid_float_y_position_raises_error(self):
+        """Float y position > 1.0 should raise ValueError"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        with self.assertRaises(ValueError):
+            render_time(
+                image_source,
+                xy_position=(0.1, 1.5),
+                timepoints=timepoints,
+            )
+
+    def test_rendering_with_larger_image(self):
+        """Render time on larger images"""
+        image_source = create_test_image_source(frames=3, height=500, width=500)
+        timepoints = [0 * ureg.minute, 5 * ureg.minute, 10 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(50, 50),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (500, 500, 3))
+
+    def test_rendering_with_hours_format(self):
+        """Render time with hours-based pint quantities"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.hour, 1 * ureg.hour, 2 * ureg.hour]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_seconds_format(self):
+        """Render time with seconds-based pint quantities"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [0 * ureg.second, 30 * ureg.second, 60 * ureg.second]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+            time_format="{M:02}m {S:02}s",
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_timedelta_hours(self):
+        """Render time with timedelta containing hours"""
+        image_source = create_test_image_source(frames=3, height=100, width=100)
+        timepoints = [
+            timedelta(hours=0),
+            timedelta(hours=1),
+            timedelta(hours=2),
+        ]
+
+        result = render_time(
+            image_source,
+            xy_position=(10, 10),
+            timepoints=timepoints,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+
+    def test_rendering_with_all_options(self):
+        """Render time with all optional parameters specified"""
+        image_source = create_test_image_source(frames=3, height=200, width=200)
+        timepoints = [0 * ureg.minute, 15 * ureg.minute, 30 * ureg.minute]
+
+        result = render_time(
+            image_source,
+            xy_position=(20, 20),
+            timepoints=timepoints,
+            time_format="{H:02}:{M:02}",
+            color=(255, 255, 0),
+            font_size=18,
+            background_color=(50, 50, 50),
+            background_margin_pixel=5,
+        )
+
+        self.assertIsInstance(result, InMemorySequenceSource)
+        self.assertEqual(len(result), 3)
+        for frame_idx in range(len(result)):
+            frame = result.get_frame(frame_idx)
+            np.testing.assert_array_equal(frame.raw.shape, (200, 200, 3))
+
+
 if __name__ == "__main__":
     unittest.main()
