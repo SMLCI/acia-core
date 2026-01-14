@@ -1,6 +1,5 @@
 """Utils for OMERO segmenation data"""
 
-
 import cv2
 import numpy as np
 import omero
@@ -258,7 +257,10 @@ def has_all_tags(object, tag_list: list[str] | None = None):
 
     tag_list = tag_list.copy()
     for ann in object.listAnnotations():
-        if omero.model.TagAnnotationI == ann.OMERO_TYPE and ann.getTextValue() in tag_list:
+        if (
+            omero.model.TagAnnotationI == ann.OMERO_TYPE
+            and ann.getTextValue() in tag_list
+        ):
             del tag_list[tag_list.index(ann.getTextValue())]
 
         if len(tag_list) == 0:

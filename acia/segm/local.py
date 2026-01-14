@@ -241,7 +241,8 @@ class THWCSequenceSource(ImageSequenceSource):
             max_val = np.quantile(im, 0.99)
 
             result: np.ndarray = (
-                np.clip((im.astype(float) - min_val) / (max_val - min_val), 0.0, 1.0) * 255.0
+                np.clip((im.astype(float) - min_val) / (max_val - min_val), 0.0, 1.0)
+                * 255.0
             ).astype(np.uint8)
             return result
 
@@ -397,7 +398,8 @@ class RoiStorer:
         roi_id = -1
         # convert them into contours (recover time position)
         contours: list[Contour | Instance] = [
-            Contour(np.array(roi.coordinates()), -1.0, roi.position - 1, id=roi_id) for roi in rois
+            Contour(np.array(roi.coordinates()), -1.0, roi.position - 1, id=roi_id)
+            for roi in rois
         ]
 
         # return the overlay

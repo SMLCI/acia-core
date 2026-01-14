@@ -1,6 +1,5 @@
 """Utilities for working with OMERO shape objects"""
 
-
 import omero
 from omero.rtypes import rdouble, rint, rstring
 

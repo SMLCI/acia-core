@@ -29,7 +29,8 @@ def get_user() -> str:
     user = "Anonymous"
     if TRACK_USER:
         user = os.environ.get(
-            "JUPYTERHUB_USER", os.environ.get("USER", os.environ.get("USERNAME"))  # type: ignore[arg-type]
+            "JUPYTERHUB_USER",
+            os.environ.get("USER", os.environ.get("USERNAME")),  # type: ignore[arg-type]
         )
     return user
 

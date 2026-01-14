@@ -48,7 +48,9 @@ class OmniposeSegmenter(SegmentationProcessor):
             )
 
     @staticmethod
-    def __predict(images, model, omnipose_parameters: dict | None = None, batch_size=20):
+    def __predict(
+        images, model, omnipose_parameters: dict | None = None, batch_size=20
+    ):
         if omnipose_parameters is None:
             omnipose_parameters = {}
 

@@ -33,7 +33,10 @@ class PropertyExtractor:
     """Base class for single-cell property extractor"""
 
     def __init__(
-        self, name: str, input_unit: UnitLike | None, output_unit: UnitLike | None = None
+        self,
+        name: str,
+        input_unit: UnitLike | None,
+        output_unit: UnitLike | None = None,
     ):
         self.name = name
 
@@ -586,9 +589,12 @@ class FluorescenceEx(PropertyExtractor):
                 raise e
 
         else:
-            result = list(starmap(
-                FluorescenceEx.extract_fluorescence, iterator(overlay.timeIterator())
-            ))
+            result = list(
+                starmap(
+                    FluorescenceEx.extract_fluorescence,
+                    iterator(overlay.timeIterator()),
+                )
+            )
 
         # concatenate all results
         combined_result = reduce(lambda a, b: pd.concat([a, b]), result)

@@ -29,7 +29,9 @@ class NMSFilter:
         ]
 
         # sort contours by their score (lowest first)
-        sorted_contours = sorted(prefiltered_contours, key=lambda c: c.score if c.score is not None else 0.0)
+        sorted_contours = sorted(
+            prefiltered_contours, key=lambda c: c.score if c.score is not None else 0.0
+        )
         # make (valid) shapely polygons
         polygons = [
             make_valid(shapely.geometry.polygon.Polygon(contour.coordinates))

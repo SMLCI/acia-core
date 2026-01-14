@@ -28,7 +28,12 @@ class Instance:
     """Cell instance based on an image mask and a label"""
 
     def __init__(
-        self, mask: np.ndarray, frame: int, label: int, id=None, score: float | None = None
+        self,
+        mask: np.ndarray,
+        frame: int,
+        label: int,
+        id=None,
+        score: float | None = None,
     ):
         """Create an object instance
 
@@ -414,8 +419,14 @@ class Overlay:
     def draw(
         self,
         image: np.ndarray | Image.Image,
-        outlineColor: str | tuple[int, ...] | Callable[[Contour | Instance], tuple[int, ...]] | None = None,
-        fillColor: str | tuple[int, ...] | Callable[[Contour | Instance], tuple[int, ...]] | None = None,
+        outlineColor: str
+        | tuple[int, ...]
+        | Callable[[Contour | Instance], tuple[int, ...]]
+        | None = None,
+        fillColor: str
+        | tuple[int, ...]
+        | Callable[[Contour | Instance], tuple[int, ...]]
+        | None = None,
     ) -> np.ndarray | Image.Image:
         """Draw an overly onto an image frame. Hint: overlay should only contain contours for a single frame
 
@@ -466,7 +477,9 @@ class Overlay:
                     else:
                         fc_local = fillColor
 
-                cont.draw(pil_image, outlineColor=oc_local, fillColor=fc_local, draw=imdraw)
+                cont.draw(
+                    pil_image, outlineColor=oc_local, fillColor=fc_local, draw=imdraw
+                )
 
         if is_numpy:
             # return the numpy version

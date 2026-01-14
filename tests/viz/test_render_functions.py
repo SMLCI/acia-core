@@ -47,7 +47,9 @@ def create_test_image_source(frames=3, height=100, width=100):
     return InMemorySequenceSource(images)
 
 
-def create_test_overlay_with_contours(frames=3, contours_per_frame=2, height=100, width=100):
+def create_test_overlay_with_contours(
+    frames=3, contours_per_frame=2, height=100, width=100
+):
     """Create a test overlay with simple rectangular contours.
 
     Args:
@@ -63,12 +65,14 @@ def create_test_overlay_with_contours(frames=3, contours_per_frame=2, height=100
     for f in range(frames):
         for c in range(contours_per_frame):
             offset = c * 20
-            coords = np.array([
-                [10 + offset, 10],
-                [30 + offset, 10],
-                [30 + offset, 30],
-                [10 + offset, 30],
-            ])
+            coords = np.array(
+                [
+                    [10 + offset, 10],
+                    [30 + offset, 10],
+                    [30 + offset, 30],
+                    [10 + offset, 30],
+                ]
+            )
             contours.append(
                 Contour(
                     coordinates=coords,
@@ -81,7 +85,9 @@ def create_test_overlay_with_contours(frames=3, contours_per_frame=2, height=100
     return Overlay(contours)
 
 
-def create_test_overlay_with_instances(frames=3, instances_per_frame=2, height=100, width=100):
+def create_test_overlay_with_instances(
+    frames=3, instances_per_frame=2, height=100, width=100
+):
     """Create a test overlay with mask-based instances.
 
     Args:
@@ -1016,7 +1022,9 @@ class TestRenderSegmentationMask(unittest.TestCase):
         widths = [75, 150, 300]
 
         for height, width in zip(heights, widths, strict=False):
-            image_source = create_test_image_source(frames=2, height=height, width=width)
+            image_source = create_test_image_source(
+                frames=2, height=height, width=width
+            )
             overlay = create_test_overlay_with_instances(
                 frames=2, instances_per_frame=1, height=height, width=width
             )
@@ -1086,7 +1094,9 @@ class TestRenderTrackingMask(unittest.TestCase):
 
         overlay = Overlay(instances)
 
-        result = render_tracking_mask(image_source, overlay, alpha=0.0)  # alpha=0 to see only mask colors
+        result = render_tracking_mask(
+            image_source, overlay, alpha=0.0
+        )  # alpha=0 to see only mask colors
 
         # Extract colors from label 1 region across all frames
         label1_colors = []
@@ -1263,7 +1273,9 @@ class TestRenderTrackingMask(unittest.TestCase):
         widths = [75, 150, 300]
 
         for height, width in zip(heights, widths, strict=False):
-            image_source = create_test_image_source(frames=2, height=height, width=width)
+            image_source = create_test_image_source(
+                frames=2, height=height, width=width
+            )
             overlay = create_test_overlay_with_instances(
                 frames=2, instances_per_frame=1, height=height, width=width
             )

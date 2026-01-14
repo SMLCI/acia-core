@@ -412,7 +412,8 @@ def render_segmentation(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(imageSource, overlay.timeIterator(), strict=False), desc="Render cell segmentation..."
+        zip(imageSource, overlay.timeIterator(), strict=False),
+        desc="Render cell segmentation...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -477,7 +478,8 @@ def render_cell_centers(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(image_source, overlay.timeIterator(), strict=False), desc="Render cell centers..."
+        zip(image_source, overlay.timeIterator(), strict=False),
+        desc="Render cell centers...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -533,7 +535,9 @@ def render_tracking(
     contour_lookup = {cont.id: cont for cont in overlay}
 
     for image, frame_overlay in zip(
-        tqdm(image_source, desc="Render cell tracking paths..."), overlay.timeIterator(), strict=False
+        tqdm(image_source, desc="Render cell tracking paths..."),
+        overlay.timeIterator(),
+        strict=False,
     ):
         np_image = np.copy(image.raw)
 
@@ -828,7 +832,9 @@ def render_time(
             )
         ystart = int(np.round(image_height * ystart))
 
-    for image, timepoint in zip(tqdm(image_source, desc="Render time..."), timepoints, strict=False):
+    for image, timepoint in zip(
+        tqdm(image_source, desc="Render time..."), timepoints, strict=False
+    ):
         if isinstance(timepoint, pint.Quantity):
             timepoint = timedelta(seconds=float(timepoint.to(ureg.seconds).magnitude))
 
@@ -975,7 +981,9 @@ def render_segmentation_mask(
     return_images = []
 
     for im, ov in zip(
-        tqdm(source, desc="Render segmentation masks..."), overlay.time_iterator(), strict=False
+        tqdm(source, desc="Render segmentation masks..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
         im = np.copy(im.raw)
 
@@ -1029,7 +1037,9 @@ def render_tracking_mask(
     color_lut[0] = (0, 0, 0)
 
     for im, ov in zip(
-        tqdm(source, desc="Render tracking mask..."), overlay.time_iterator(), strict=False
+        tqdm(source, desc="Render tracking mask..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
         im = np.copy(im.raw)
 
@@ -1167,8 +1177,10 @@ def extract_lineage_plotdata(
         features = G.nodes[n]
         if features:
             maxk = max((len(str(k)) for k in features), default=1)
+
             def fmt(k, v, maxk):
                 return f"{str(k).ljust(maxk)} : {v}<br>"
+
             feat_lines = "".join(fmt(k, v, maxk) for k, v in features.items())
             hover_html = f"<b>Node:</b> {n}<br><span style='font-family:monospace'>{feat_lines}</span>"
         else:
@@ -1371,7 +1383,9 @@ def plot_cell_lineage(
     )
 
     if show_label:
-        for x, y, label in zip(data["xs"], data["ys"], data["node_labels"], strict=False):
+        for x, y, label in zip(
+            data["xs"], data["ys"], data["node_labels"], strict=False
+        ):
             ax.text(x, y + 0.12, label, fontsize=7, ha="center", va="bottom")
 
     # births / ends
