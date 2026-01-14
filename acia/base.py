@@ -7,8 +7,8 @@ import copy
 import logging
 import multiprocessing
 from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
-from typing import Any
 from functools import partial
+from typing import Any
 
 import cv2
 import numpy as np

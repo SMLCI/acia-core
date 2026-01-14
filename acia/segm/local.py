@@ -8,7 +8,14 @@ import numpy as np
 import roifile
 import tifffile
 
-from acia.base import BaseImage, Contour, ImageSequenceSource, Instance, Overlay, RoISource
+from acia.base import (
+    BaseImage,
+    Contour,
+    ImageSequenceSource,
+    Instance,
+    Overlay,
+    RoISource,
+)
 
 
 def prepare_image(image, normalize_image=True):

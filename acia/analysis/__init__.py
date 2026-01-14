@@ -6,11 +6,11 @@ import logging
 import os
 import shutil
 from collections.abc import Iterable
-from typing import Any
 from functools import reduce
 from itertools import starmap
 from multiprocessing import Pool
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
