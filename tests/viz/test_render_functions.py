@@ -27,7 +27,6 @@ from acia.viz import (
     render_tracking_mask,
 )
 
-
 # ============================================================================
 # Helper functions for creating test fixtures
 # ============================================================================
@@ -1016,7 +1015,7 @@ class TestRenderSegmentationMask(unittest.TestCase):
         heights = [50, 100, 200]
         widths = [75, 150, 300]
 
-        for height, width in zip(heights, widths):
+        for height, width in zip(heights, widths, strict=False):
             image_source = create_test_image_source(frames=2, height=height, width=width)
             overlay = create_test_overlay_with_instances(
                 frames=2, instances_per_frame=1, height=height, width=width
@@ -1263,7 +1262,7 @@ class TestRenderTrackingMask(unittest.TestCase):
         heights = [50, 100, 200]
         widths = [75, 150, 300]
 
-        for height, width in zip(heights, widths):
+        for height, width in zip(heights, widths, strict=False):
             image_source = create_test_image_source(frames=2, height=height, width=width)
             overlay = create_test_overlay_with_instances(
                 frames=2, instances_per_frame=1, height=height, width=width

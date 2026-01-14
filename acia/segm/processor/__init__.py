@@ -8,6 +8,3 @@ class SegmentationProcessor:
 
     def __call__(self, images: ImageSequenceSource) -> Overlay:
         raise NotImplementedError("Please implement this base function")
-
-
-from .canny import CannySegmentationProcessor
