@@ -451,7 +451,7 @@ class DynamicTimeEx(PropertyExtractor):
                     # convert to timepoint units
                     self.convert(
                         # lookup frame timepoint
-                        self.timepoints[row["frame"]]
+                        self.timepoints[int(row["frame"])]
                     ),
                     "id": id,
                 }

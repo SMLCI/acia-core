@@ -44,13 +44,13 @@ class TrackastraTracker(TrackingProcessor):
             logging.warning("Number of segmented frames and masks is unequal!")
 
         # perform the actual tracking
-        track_graph = self.model.track(imgs, masks, mode=self.mode)
+        track_graph, tracked_masks = self.model.track(imgs, masks, mode=self.mode)
 
         # Write to cell tracking challenge format
         with tempfile.TemporaryDirectory() as td:
             _, _ = graph_to_ctc(
                 track_graph,
-                masks,
+                tracked_masks,
                 outdir=td,
             )
 
