@@ -45,6 +45,7 @@ dependencies = [
     "retry>=0.9.2",
     "imagecodecs",
     "influxdb_client",
+    "ipywidgets>=8.0.0",
     "plotly",
 ]
 
