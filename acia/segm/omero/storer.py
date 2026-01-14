@@ -577,6 +577,27 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
             image = conn.getObject("Image", self.imageId)
             return image.getSizeT()
 
+    @property
+    def size_h(self) -> int:
+        """Returns the height of the image in pixels."""
+        with self.make_connection() as conn:
+            image = conn.getObject("Image", self.imageId)
+            return image.getSizeY()
+
+    @property
+    def size_w(self) -> int:
+        """Returns the width of the image in pixels."""
+        with self.make_connection() as conn:
+            image = conn.getObject("Image", self.imageId)
+            return image.getSizeX()
+
+    @property
+    def size_c(self) -> int:
+        """Returns the number of channels."""
+        with self.make_connection() as conn:
+            image = conn.getObject("Image", self.imageId)
+            return image.getSizeC()
+
     def toTHWC(self) -> THWCSequenceSource:
         """Convert to THWCSequenceSource
 
@@ -681,6 +702,27 @@ class OmeroRawSource(ImageSequenceSource, OmeroSource):
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
             return image.getSizeT()
+
+    @property
+    def size_h(self) -> int:
+        """Returns the height of the image in pixels."""
+        with self.make_connection() as conn:
+            image = conn.getObject("Image", self.imageId)
+            return image.getSizeY()
+
+    @property
+    def size_w(self) -> int:
+        """Returns the width of the image in pixels."""
+        with self.make_connection() as conn:
+            image = conn.getObject("Image", self.imageId)
+            return image.getSizeX()
+
+    @property
+    def size_c(self) -> int:
+        """Returns the number of channels."""
+        with self.make_connection() as conn:
+            image = conn.getObject("Image", self.imageId)
+            return image.getSizeC()
 
     def toTHWC(self) -> THWCSequenceSource:
         """Convert to THWCSequenceSource

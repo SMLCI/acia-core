@@ -485,6 +485,18 @@ class ImageSequenceSource:
     def size_t(self) -> int:
         raise NotImplementedError()
 
+    @property
+    def size_h(self) -> int:
+        raise NotImplementedError()
+
+    @property
+    def size_w(self) -> int:
+        raise NotImplementedError()
+
+    @property
+    def size_c(self) -> int:
+        raise NotImplementedError()
+
     def get_frame(self, frame: int) -> BaseImage:
         raise NotImplementedError()
 
