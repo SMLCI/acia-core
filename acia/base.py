@@ -87,13 +87,9 @@ class Instance:
         return bin_mask
 
     @property
-    def polygon(self) -> Polygon:
+    def polygon(self) -> Polygon | MultiPolygon | None:
         if self._polygon is None:
-            # TODO: need to get polygon from mask
             self._polygon = mask_to_polygons(self.binary_mask)
-            if self._polygon is None:
-                print("Error")
-
         return self._polygon
 
     @property

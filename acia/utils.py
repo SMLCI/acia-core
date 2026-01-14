@@ -32,18 +32,22 @@ def pairwise_distances(points: np.ndarray):
     return distances
 
 
-def mask_to_polygons(mask: np.ndarray) -> Polygon | MultiPolygon:
+def mask_to_polygons(mask: np.ndarray) -> Polygon | MultiPolygon | None:
     """Convert a mask to a Polygon or Multipolygon
 
     Args:
         mask (np.ndarray): Binary mask for an object
 
     Returns:
-        shapely.geometry.Polygon | shapely.geometry.MultiPolygon: Extracted polygon structure
+        shapely.geometry.Polygon | shapely.geometry.MultiPolygon | None:
+            Extracted polygon structure, or None if the mask is empty
     """
     all_polygons = []
     for shape, _ in features.shapes(mask.astype(np.int16), mask=(mask > 0)):
         all_polygons.append(shapely.geometry.shape(shape))
+
+    if len(all_polygons) == 0:
+        return None
 
     if len(all_polygons) > 1:
         all_polygons = shapely.geometry.MultiPolygon(all_polygons)
