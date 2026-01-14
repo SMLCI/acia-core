@@ -1,3 +1,9 @@
+CLAUDE.md
+lineage.html
+test_resources/
+tracking_output/
+.auto-claude-security.json
+
 coco/
 images/
 mlruns/
