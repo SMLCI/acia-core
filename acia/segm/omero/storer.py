@@ -13,6 +13,7 @@ from omero.model import LengthI
 
 from acia import ureg
 from acia.base import BaseImage, Contour, ImageSequenceSource, Overlay, RoISource
+from acia.notebook import JupyterVisualizationMixin
 from acia.segm.local import LocalImage, THWCSequenceSource
 from acia.segm.omero.shapeUtils import make_coordinates
 from acia.segm.utils import compute_indices
@@ -425,7 +426,7 @@ class OmeroSource(BlitzConn):
         print(f" Pixel Size Y: {size_y_obj.getValue()} ({size_y_obj.getSymbol()})")
 
 
-class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
+class OmeroSequenceSource(ImageSequenceSource, OmeroSource, JupyterVisualizationMixin):
     """
     Uses omero server as a source for images
     """
@@ -608,7 +609,7 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
         return THWCSequenceSource(image_stack)
 
 
-class OmeroRawSource(ImageSequenceSource, OmeroSource):
+class OmeroRawSource(ImageSequenceSource, OmeroSource, JupyterVisualizationMixin):
     """Raw OMERO source: Allows to easily access raw that is, e.g. 16-bit data of your OMERO images"""
 
     def __init__(
