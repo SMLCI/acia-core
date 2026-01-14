@@ -81,7 +81,7 @@ test:
         - test_resources/
   script:
     # test dependencies
-    - pip install pytest pytest-sugar pytest-cov python-dotenv coverage unittest-xml-reporting
+    - pip install pytest pytest-sugar pytest-cov python-dotenv unittest-xml-reporting
     - pip install git+https://github.com/JojoDevel/trackastra.git
     - pip install laptrack
     # install the pre-built wheel from build job
@@ -94,7 +94,7 @@ test:
         unzip test_resources/ctc_format.zip -d test_resources/ctc_format
       fi
     # perform the tests
-    - coverage run -m pytest --junitxml=report.xml --cov-report term --cov-report xml --cov=acia tests/
+    - pytest --cov=acia --cov-report=term --cov-report=xml --junitxml=report.xml tests/
   coverage: '/TOTAL.*\s+(\d+%)/'
   artifacts:
     reports:
