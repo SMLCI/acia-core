@@ -71,7 +71,7 @@ test:
     - job: build
       parallel:
         matrix:
-          - PY_VERSION: $PY_VERSION
+          - PY_VERSION: ['3.10', '3.11', '3.12', '3.13']
   cache:
     - key: pip-${CI_JOB_IMAGE}
       paths:
