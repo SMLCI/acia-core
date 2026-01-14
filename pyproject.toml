@@ -67,6 +67,7 @@ docs = [
     "sphinx-rtd-theme>=2.0.0",
 ]
 omero = ["omero-py>=5.9.3"]
+notebook = ["ipywidgets>=8.0.0"]
 
 [project.scripts]
 acia = "acia.cli:main"
