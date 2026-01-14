@@ -16,6 +16,7 @@ from acia.base import (
     Overlay,
     RoISource,
 )
+from acia.notebook import JupyterVisualizationMixin
 
 
 def prepare_image(image, normalize_image=True):
@@ -72,7 +73,7 @@ class LocalImage(BaseImage):
         return self.raw[item]
 
 
-class LocalImageSource(ImageSequenceSource):
+class LocalImageSource(ImageSequenceSource, JupyterVisualizationMixin):
     """Source for a single image only"""
 
     def __init__(self, image: LocalImage):
@@ -117,7 +118,7 @@ class LocalImageSource(ImageSequenceSource):
         return LocalImageSource(image)
 
 
-class InMemorySequenceSource(ImageSequenceSource):
+class InMemorySequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
     """Image sequence for an in memory image stack"""
 
     def __init__(self, image_stack):
@@ -144,7 +145,7 @@ class InMemorySequenceSource(ImageSequenceSource):
         return int(self.get_frame(0).num_channels)
 
 
-class THWCSequenceSource(ImageSequenceSource):
+class THWCSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
     """Image sequence for an in memory image stack [TxHxWxC]"""
 
     def __init__(self, image_stack: np.ndarray):
@@ -257,7 +258,7 @@ class THWCSequenceSource(ImageSequenceSource):
         return THWCSequenceSource(np.stack((image_stack,) * 3, axis=-1))
 
 
-class LocalSequenceSource(ImageSequenceSource):
+class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
     """Image sequence source for files in the local file system (e.g. a tif)."""
 
     def __init__(
