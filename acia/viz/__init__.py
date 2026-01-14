@@ -17,7 +17,6 @@ import imageio.v2 as iio
 import matplotlib as mpl
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
-import moviepy.editor as mpy
 import networkx as nx
 import numpy as np
 import pint
@@ -367,18 +366,15 @@ class VideoExporter2:
                 "Closing video writer without any images written and no video output generated! Did you forget to write the images?"
             )
         else:
-            # do the video rendering
-            clip = mpy.ImageSequenceClip(
-                list(self.images),
-                fps=self.framerate,
-            )
-            clip.write_videofile(
+            # do the video rendering using imageio
+            with iio.get_writer(
                 str(self.filename.absolute()),
+                fps=self.framerate,
                 codec=self.codec,
                 ffmpeg_params=self.ffmpeg_params,
-                # verbose=False,
-                # logger=None,
-            )
+            ) as writer:
+                for image in self.images:
+                    writer.append_data(image)  # type: ignore[attr-defined]
             self.images = []
 
     def __enter__(self):
