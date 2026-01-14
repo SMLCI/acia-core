@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 import networkx as nx
 import numpy as np
@@ -145,7 +146,7 @@ class CTCTrackingHelper:
         self.life_cycles = CTCTrackingHelper.compute_life_cycles(self.tracking_graph)
         # create lookup (cont id --> life cycle index)
         self.life_cycle_lookup = CTCTrackingHelper.create_life_cycle_lookup(
-            self.life_cycles
+            self.life_cycles  # type: ignore[arg-type]
         )
         self.overlay = overlay
         self.height = height
@@ -174,7 +175,7 @@ class CTCTrackingHelper:
             )
             ctc_masks.append(mask)
 
-        return ctc_masks, ctc_tracking_format
+        return ctc_masks, ctc_tracking_format  # type: ignore[return-value]
 
     @staticmethod
     def compute_life_cycles(tracking_graph: nx.DiGraph) -> list[list[str]]:
@@ -210,7 +211,7 @@ class CTCTrackingHelper:
     @staticmethod
     def txt_format(
         tracking_graph: nx.DiGraph,
-        life_cycles: list[list[any]],
+        life_cycles: list[list[Any]],
         contour_lookup,
         life_cycle_lookup,
     ) -> list[str]:
@@ -297,7 +298,7 @@ class CTCTrackingHelper:
                 image_mask, (cont_mask * life_cycle_id).astype(np.uint16)
             )
 
-        return image_mask
+        return image_mask  # type: ignore[return-value]
 
     @staticmethod
     def __load_masks(mask_path: Path) -> Overlay:
@@ -420,7 +421,7 @@ class CTCTrackingHelper:
         # remove nodes in overlay
         conts_to_remove = set(seg_ids).intersection(id_sym_difference)
         for cont_id in conts_to_remove:
-            seg_ids = np.array([cont.id for cont in overlay])
+            seg_ids = np.array([cont.id for cont in overlay])  # type: ignore[assignment]
             index = np.argmin(seg_ids == cont_id)
             del overlay.contours[index]
 

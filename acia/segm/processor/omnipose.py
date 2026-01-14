@@ -23,7 +23,7 @@ def batch(iterable, n=1):
 class OmniposeSegmenter(SegmentationProcessor):
     """Omnipose segmentation implementation"""
 
-    def __init__(self, use_GPU: bool = None, model="bact_phase_omni"):
+    def __init__(self, use_GPU: bool | None = None, model="bact_phase_omni"):
         if use_GPU is None:
             use_GPU = torch.cuda.is_available()
         self.use_GPU = use_GPU
@@ -48,7 +48,7 @@ class OmniposeSegmenter(SegmentationProcessor):
             )
 
     @staticmethod
-    def __predict(images, model, omnipose_parameters: dict = None, batch_size=20):
+    def __predict(images, model, omnipose_parameters: dict | None = None, batch_size=20):
         if omnipose_parameters is None:
             omnipose_parameters = {}
 
@@ -103,7 +103,7 @@ class OmniposeSegmenter(SegmentationProcessor):
         return self(images)
 
     def __call__(
-        self, images: ImageSequenceSource, omnipose_parameters: dict = None
+        self, images: ImageSequenceSource, omnipose_parameters: dict | None = None
     ) -> Overlay:
         imgs = []
         for image in images:

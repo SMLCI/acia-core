@@ -95,7 +95,7 @@ class PyUATTracker(TrackingProcessor):
             # read the tracking result
             with gzip.open(output_file) as input_file:
                 tracking_overlay, tracking_graph = parse_simple_tracking(
-                    input_file.read()
+                    input_file.read().decode("utf-8")
                 )
 
         # Convert from contour based overlay to a mask based overlay

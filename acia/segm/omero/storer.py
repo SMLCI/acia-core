@@ -176,7 +176,7 @@ class OmeroRoIStorer:
                     if isinstance(s, omero.model.PolygonI):
                         # extract important information
                         t = s.getTheT().getValue()
-                        points = make_coordinates(s.getPoints().getValue())
+                        points = np.array(make_coordinates(s.getPoints().getValue()))
                         score = -1.0
 
                         if size_z > 1:
@@ -196,9 +196,9 @@ class OmeroRoIStorer:
     @staticmethod
     def clear(
         imageId: int,
-        username: str = None,
-        password: str = None,
-        serverUrl: str = None,
+        username: str | None = None,
+        password: str | None = None,
+        serverUrl: str | None = None,
         port=4064,
         secure=True,
         conn=None,
@@ -334,9 +334,9 @@ class OmeroSource(BlitzConn):
     def __init__(
         self,
         imageId: float,
-        username: str = None,
-        password: str = None,
-        serverUrl: str = None,
+        username: str | None = None,
+        password: str | None = None,
+        serverUrl: str | None = None,
         port=4064,
         secure=True,
         conn=None,
@@ -433,9 +433,9 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
     def __init__(
         self,
         imageId: int,
-        username: str = None,
-        password: str = None,
-        serverUrl: str = None,
+        username: str | None = None,
+        password: str | None = None,
+        serverUrl: str | None = None,
         port=4064,
         channels=None,
         z=0,
@@ -502,21 +502,21 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
         returns the name of the image
         """
         with self.make_connection() as conn:
-            return conn.getObject("Image", self.imageId).getName()
+            return str(conn.getObject("Image", self.imageId).getName())
 
     def datasetName(self) -> str:
         """
         returns the name of the dataset
         """
         with self.make_connection() as conn:
-            return conn.getObject("Image", self.imageId).getParent().getName()
+            return str(conn.getObject("Image", self.imageId).getParent().getName())
 
     def projectName(self) -> str:
         """
         returns the name of the associated project
         """
         with self.make_connection() as conn:
-            return conn.getObject("Image", self.imageId).getProject().getName()
+            return str(conn.getObject("Image", self.imageId).getProject().getName())
 
     def __get_omero_image(self):
         # open the connection
@@ -575,28 +575,28 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource):
     def size_t(self) -> int:
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeT()
+            return int(image.getSizeT())
 
     @property
     def size_h(self) -> int:
         """Returns the height of the image in pixels."""
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeY()
+            return int(image.getSizeY())
 
     @property
     def size_w(self) -> int:
         """Returns the width of the image in pixels."""
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeX()
+            return int(image.getSizeX())
 
     @property
     def size_c(self) -> int:
         """Returns the number of channels."""
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeC()
+            return int(image.getSizeC())
 
     def toTHWC(self) -> THWCSequenceSource:
         """Convert to THWCSequenceSource
@@ -614,9 +614,9 @@ class OmeroRawSource(ImageSequenceSource, OmeroSource):
     def __init__(
         self,
         imageId: int,
-        username: str = None,
-        password: str = None,
-        serverUrl: str = None,
+        username: str | None = None,
+        password: str | None = None,
+        serverUrl: str | None = None,
         port=4064,
         secure=True,
         conn=None,
@@ -701,28 +701,28 @@ class OmeroRawSource(ImageSequenceSource, OmeroSource):
     def size_t(self) -> int:
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeT()
+            return int(image.getSizeT())
 
     @property
     def size_h(self) -> int:
         """Returns the height of the image in pixels."""
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeY()
+            return int(image.getSizeY())
 
     @property
     def size_w(self) -> int:
         """Returns the width of the image in pixels."""
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeX()
+            return int(image.getSizeX())
 
     @property
     def size_c(self) -> int:
         """Returns the number of channels."""
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
-            return image.getSizeC()
+            return int(image.getSizeC())
 
     def toTHWC(self) -> THWCSequenceSource:
         """Convert to THWCSequenceSource
@@ -800,8 +800,8 @@ class OmeroRoISource(OmeroSource, RoISource):
         with self.make_connection() as conn:
             image = conn.getObject("Image", self.imageId)
             if self.range is not None:
-                return min(image.getSizeT() * image.getSizeZ(), len(self.range))
-            return image.getSizeT() * image.getSizeZ()
+                return int(min(image.getSizeT() * image.getSizeZ(), len(self.range)))
+            return int(image.getSizeT()) * int(image.getSizeZ())
 
 
 def upload_file(
@@ -810,7 +810,7 @@ def upload_file(
     file_path: Path,
     conn: BlitzGateway,
     mime_type="text/plain",
-    namespace: str = None,
+    namespace: str | None = None,
 ):
     """Upload a file attachement for an OMERO object (Image, Datase, Project)
 

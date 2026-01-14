@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 from collections.abc import Iterable
+from typing import Any
 from functools import reduce
 from itertools import starmap
 from multiprocessing import Pool
@@ -32,12 +33,12 @@ class PropertyExtractor:
     """Base class for single-cell property extractor"""
 
     def __init__(
-        self, name: str, input_unit: UnitLike, output_unit: UnitLike | None = None
+        self, name: str, input_unit: UnitLike | None, output_unit: UnitLike | None = None
     ):
         self.name = name
 
         # try to parse input quantity
-        self.input_unit = Q_(input_unit)
+        self.input_unit = Q_(input_unit)  # type: ignore[arg-type]
         if self.input_unit.dimensionless and isinstance(self.input_unit.magnitude, U_):
             # if we have no dimension and magnitude is unit -> we better go with a unit
             self.input_unit = U_(input_unit)
@@ -77,7 +78,7 @@ class PropertyExtractor:
             # 1. convert input to input unit
             # 2. scale with input unit
             # 3. convert to output unit
-            return (
+            return float(
                 (input.to(self.input_unit).magnitude * self.input_unit)
                 .to(self.output_unit)
                 .magnitude
@@ -85,20 +86,20 @@ class PropertyExtractor:
         else:
             # 1. scale input with input unit/quantity
             # 2. convert to output unit
-            return (input * self.input_unit).to(self.output_unit).magnitude
+            return float((input * self.input_unit).to(self.output_unit).magnitude)
 
 
 class ExtractorExecutor:
     """Executor to extract a list of single-cell properties from segmentation and images"""
 
     def __init__(self) -> None:
-        self.units = {}
+        self.units: dict[str, Any] = {}
 
     def execute(
         self,
         overlay: Overlay,
         images: ImageSequenceSource,
-        extractors: list[PropertyExtractor] = None,
+        extractors: list[PropertyExtractor] | None = None,
     ):
         if extractors is None:
             extractors = []
@@ -542,7 +543,7 @@ class FluorescenceEx(PropertyExtractor):
                 roi_mask = cont.toMask(height=height, width=width)
 
                 # create masked array
-                masked_roi = ma.masked_array(raw_image, mask=~roi_mask)
+                masked_roi: ma.MaskedArray = ma.masked_array(raw_image, mask=~roi_mask)
 
                 # compute fluorescence response
                 value = summarize_operator(masked_roi.compressed())
@@ -567,7 +568,7 @@ class FluorescenceEx(PropertyExtractor):
                     self.summarize_operator,
                 )
 
-        result = None
+        result: list[pd.DataFrame] = []
 
         if self.parallel > 1:
             try:
@@ -585,14 +586,14 @@ class FluorescenceEx(PropertyExtractor):
                 raise e
 
         else:
-            result = starmap(
+            result = list(starmap(
                 FluorescenceEx.extract_fluorescence, iterator(overlay.timeIterator())
-            )
+            ))
 
         # concatenate all results
-        result = reduce(lambda a, b: pd.concat([a, b]), result)
+        combined_result = reduce(lambda a, b: pd.concat([a, b]), result)
 
-        return result, {
+        return combined_result, {
             self.channel_names[i]: self.output_unit for i in range(len(self.channels))
         }
 
@@ -638,9 +639,7 @@ def scale(
 
     experiment_executions = []
 
-    failed_ids = []
-
-    failed_ids = []
+    failed_ids: list[int] = []
 
     for image_id in tqdm(image_ids):
         try:

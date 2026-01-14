@@ -58,7 +58,7 @@ def make_polystr(points):
 
 
 def make_coordinates(polystr: str) -> list[tuple[float]]:
-    return [tuple(map(float, textCoord.split(","))) for textCoord in polystr.split(" ")]
+    return [tuple(map(float, textCoord.split(","))) for textCoord in polystr.split(" ")]  # type: ignore[misc]
 
 
 def create_polygon(

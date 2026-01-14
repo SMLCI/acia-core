@@ -110,7 +110,7 @@ class LAPTracker(TrackingProcessor):
         with tempfile.TemporaryDirectory() as td:
             self.__export(td, track_df, split_df, masks)
 
-            ov, tracklet_graph, tracking_graph = read_ctc_tracking(td)
+            ov, tracklet_graph, tracking_graph = read_ctc_tracking(Path(td))
 
             attribute_tracking(ov, tracking_graph, tracking_graph, self)
 
@@ -197,7 +197,7 @@ class LAPTracker2(TrackingProcessor):
         with tempfile.TemporaryDirectory() as td:
             self.__export(Path(td), track_df, split_df, masks)
 
-            ov, tracklet_graph, tracking_graph = read_ctc_tracking(td)
+            ov, tracklet_graph, tracking_graph = read_ctc_tracking(Path(td))
 
             return ov, tracklet_graph, tracking_graph
 

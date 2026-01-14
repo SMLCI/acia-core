@@ -25,7 +25,7 @@ def life_cycle_lineage(tr_graph: nx.DiGraph) -> nx.DiGraph:
     # compute the life-cycles of individual cells
     life_cycles = CTCTrackingHelper.compute_life_cycles(tr_graph)
     # create lookup (cont id --> life cycle index)
-    life_cycle_lookup = CTCTrackingHelper.create_life_cycle_lookup(life_cycles)
+    life_cycle_lookup = CTCTrackingHelper.create_life_cycle_lookup(life_cycles)  # type: ignore[arg-type]
     # contour_lookup = {cont.id: cont for cont in overlay}
 
     lc_graph = nx.DiGraph()
@@ -127,7 +127,7 @@ def tracklet_to_tracking(ov: Overlay, tracklet_graph: nx.DiGraph) -> nx.DiGraph:
     """
     tracking_graph = nx.DiGraph()
 
-    label_lookup = {}
+    label_lookup: dict = {}
 
     for cont in ov:
         if cont.label in tracklet_graph.nodes:
@@ -305,15 +305,16 @@ def compute_trace(lineage: nx.DiGraph) -> dict:
         dict: Dictionary that contains the trace (str) for every node (type of lineage node)
     """
 
-    traces = {}
+    traces: dict = {}
 
     for n in nx.dfs_preorder_nodes(lineage):
         # traverse nodes in dfs
-        parent = list(lineage.predecessors(n))
-        if len(parent) == 0:
+        parent_list = list(lineage.predecessors(n))
+        parent = None
+        if len(parent_list) == 0:
             parent = None
-        elif len(parent) == 1:
-            parent = parent[0]
+        elif len(parent_list) == 1:
+            parent = parent_list[0]
         else:
             raise ValueError("More than one parent! I cannot handle that!")
 
@@ -321,8 +322,8 @@ def compute_trace(lineage: nx.DiGraph) -> dict:
         if parent is not None:
             parent_trace = traces.get(parent)
 
-            if len(parent_trace) > 0:
-                parent_trace += "."
+            if len(parent_trace) > 0:  # type: ignore[arg-type]
+                parent_trace += "."  # type: ignore[operator]
         else:
             parent_trace = ""
 

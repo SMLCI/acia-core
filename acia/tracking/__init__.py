@@ -111,7 +111,7 @@ def subsample_tracking(
 
     # subsample frames
     subsampled_frames = set(
-        np.arange(overlay.numFrames(), step=subsampling_factor, dtype=np.int32)
+        np.arange(overlay.numFrames(), step=subsampling_factor, dtype=np.int32)  # type: ignore[call-overload]
     )
 
     frame_lookup = {
@@ -181,7 +181,7 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
     for cont in ov:
         track_graph.add_node(cont.id, frame=cont.frame)
 
-    tracklets = {}
+    tracklets: dict = {}
     for cont in ov:
         tracklets[cont.label] = tracklets.get(cont.label, []) + [cont]
 
