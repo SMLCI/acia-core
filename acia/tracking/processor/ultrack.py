@@ -54,7 +54,7 @@ class UltrackTracker(TrackingProcessor):
 
         # compute tracking graph
 
-        label_contours = {}
+        label_contours: dict = {}
         for cont in tracking_ov:
             label_contours[cont.label] = label_contours.get(cont.label, []) + [cont]
 

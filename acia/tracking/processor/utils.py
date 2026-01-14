@@ -16,6 +16,6 @@ def overlay_to_masks(segmentation: Overlay, height: int, width: int):
         masks.append(mask)
 
     # Convert to numpy inputs
-    masks = np.stack(masks)
+    masks = np.stack(masks)  # type: ignore[assignment]
 
     return masks

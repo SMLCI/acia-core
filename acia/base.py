@@ -8,8 +8,9 @@ import copy
 import io
 import logging
 import multiprocessing
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from functools import partial
+from typing import Any
 
 import cv2
 import numpy as np
@@ -29,7 +30,12 @@ class Instance:
     """Cell instance based on an image mask and a label"""
 
     def __init__(
-        self, mask: np.ndarray, frame: int, label: int, id=None, score: float = None
+        self,
+        mask: np.ndarray,
+        frame: int,
+        label: int,
+        id=None,
+        score: float | None = None,
     ):
         """Create an object instance
 
@@ -70,7 +76,7 @@ class Instance:
         Returns:
             [float]: area
         """
-        return np.sum(self.binary_mask)
+        return float(np.sum(self.binary_mask))
 
     def toMask(self, height, width):
         """
@@ -99,18 +105,21 @@ class Instance:
         """Extract contour coordinates
 
         Raises:
-            ValueError: if the polygon is not valid
+            ValueError: if the polygon is not valid or None
 
         Returns:
             np.ndarray: Nx2 contour coordinates of the polygon
         """
+        poly = self.polygon
+        if poly is None:
+            raise ValueError("Polygon is None (empty mask).")
 
-        if not self.polygon.is_valid:
+        if not poly.is_valid:
             raise ValueError("Invalid Shapely polygon.")
 
         # polygon.exterior.coords returns a coordinate sequence with first==last (closed ring)
         coords = np.array(
-            self.polygon.exterior.coords[:-1]
+            poly.exterior.coords[:-1]
         )  # remove duplicate last point if needed
         return coords
 
@@ -172,7 +181,8 @@ class Contour:
         outlineValues: mask values on the outline (border)
         """
         # perform rasterization into mask
-        return polygon_to_mask(self.polygon, height, width)
+        result: np.ndarray = polygon_to_mask(self.polygon, height, width)
+        return result
 
     def toMask(self, height, width):
         """
@@ -226,32 +236,34 @@ class Contour:
         Returns:
             [float]: area
         """
-        return self.polygon.area
+        return float(self.polygon.area)
 
     @property
     def polygon(self) -> Polygon:
         return Polygon(self.coordinates)
 
     def __repr__(self) -> str:
-        return self.id
+        return str(self.id)
 
 
 class Overlay:
     """Overlay contains Contours at different frames and provides functionalities iterate and modify them"""
 
-    def __init__(self, contours: list[Contour], frames=None):
-        self.contours = contours
+    def __init__(self, contours: Sequence[Contour | Instance], frames=None):
+        self.contours: list[Contour | Instance] = list(contours)
         if frames is not None:
             frames = sorted(list(frames))
         self.__frames = frames
 
-        self.cont_lookup = {cont.id: cont for cont in self.contours}
+        self.cont_lookup: dict[Any, Contour | Instance] = {
+            cont.id: cont for cont in self.contours
+        }
 
     def add_contour(self, contour: Contour | Instance):
         self.contours.append(contour)
         self.cont_lookup[contour.id] = contour
 
-    def add_contours(self, contours: list[Contour]):
+    def add_contours(self, contours: Sequence[Contour | Instance]):
         for cont in contours:
             self.add_contour(cont)
 
@@ -286,7 +298,8 @@ class Overlay:
             scale (float): [description]
         """
         for cont in self.contours:
-            cont.scale(scale)
+            if isinstance(cont, Contour):
+                cont.scale(scale)
 
     def croppedContours(self, cropping_parameters: tuple[slice, slice]):
         y, x = cropping_parameters
@@ -296,9 +309,11 @@ class Overlay:
             [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
         )
 
-        def __crop_function_filter(contour: Contour):
+        def __crop_function_filter(contour: Contour | Instance) -> bool:
+            if not isinstance(contour, Contour):
+                return False  # Instance doesn't have coordinates attribute
             try:
-                return crop_rectangle.contains(Polygon(contour.coordinates))
+                return bool(crop_rectangle.contains(Polygon(contour.coordinates)))
             # TODO: more precise exception catching here!
             # pylint: disable=W0703
             except Exception:
@@ -309,10 +324,10 @@ class Overlay:
                 return False
 
         for cont in filter(__crop_function_filter, self.contours):
-            new_cont = copy.deepcopy(cont)
-            new_cont.coordinates -= np.array([minx, miny])
-
-            yield new_cont
+            if isinstance(cont, Contour):
+                new_cont = copy.deepcopy(cont)
+                new_cont.coordinates -= np.array([minx, miny])
+                yield new_cont
 
     def time_iterator(
         self, start_frame=None, end_frame=None, frame_range=None
@@ -343,7 +358,7 @@ class Overlay:
         assert endFrame >= 0
         assert endFrame <= np.max(self.frames())
 
-        it_frames = range(startFrame, endFrame + 1)
+        it_frames: Iterable[int] = range(startFrame, endFrame + 1)
 
         if self.__frames:
             it_frames = sorted(self.__frames)
@@ -365,11 +380,11 @@ class Overlay:
             # filter sub overlay with all contours in the current frame
             yield Overlay(list(contour_array[cont_mask]))
 
-    def toMasks(self, height, width, binary_mask=True) -> list[np.array]:
+    def toMasks(self, height, width, binary_mask=True) -> list[np.ndarray]:
         """
         Turn the individual overlays into masks. For every time point we create a mask of all contours.
 
-        returns: List of masks (np.array[bool])
+        returns: List of masks (np.ndarray[bool])
 
         height: height of the image
         width: width of the image
@@ -406,9 +421,15 @@ class Overlay:
     def draw(
         self,
         image: np.ndarray | Image.Image,
-        outlineColor: str | Callable[[Contour], tuple[int]] = None,
-        fillColor: str | Callable[[Contour], tuple[int]] = None,
-    ):
+        outlineColor: str
+        | tuple[int, ...]
+        | Callable[[Contour | Instance], tuple[int, ...]]
+        | None = None,
+        fillColor: str
+        | tuple[int, ...]
+        | Callable[[Contour | Instance], tuple[int, ...]]
+        | None = None,
+    ) -> np.ndarray | Image.Image:
         """Draw an overly onto an image frame. Hint: overlay should only contain contours for a single frame
 
         Args:
@@ -426,35 +447,48 @@ class Overlay:
             )
 
         is_numpy = isinstance(image, np.ndarray)
+        pil_image: Image.Image
 
         # Deal with numpy or PIL.Image
         if is_numpy:
+            assert isinstance(image, np.ndarray)
             # convert into rgb PIL image
             if len(image.shape) == 2:
                 image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-            image = Image.fromarray(image)
+            pil_image = Image.fromarray(image)
+        else:
+            assert isinstance(image, Image.Image)
+            pil_image = image
 
-        imdraw = ImageDraw.Draw(image)
+        imdraw = ImageDraw.Draw(pil_image)
         for timeOverlay in self.timeIterator():
             for cont in timeOverlay:
-                oc_local = outlineColor
-                fc_local = fillColor
+                oc_local: str | tuple[int, ...] | None = None
+                fc_local: str | tuple[int, ...] | None = None
 
                 # compute the contour color for the object
-                if oc_local and isinstance(oc_local, Callable):
-                    oc_local = oc_local(cont)
+                if outlineColor is not None:
+                    if callable(outlineColor):
+                        oc_local = outlineColor(cont)
+                    else:
+                        oc_local = outlineColor
                 # compute the fill color for the object
-                if fc_local and isinstance(fc_local, Callable):
-                    fc_local = fc_local(cont)
+                if fillColor is not None:
+                    if callable(fillColor):
+                        fc_local = fillColor(cont)
+                    else:
+                        fc_local = fillColor
 
-                cont.draw(image, outlineColor=oc_local, fillColor=fc_local, draw=imdraw)
+                cont.draw(
+                    pil_image, outlineColor=oc_local, fillColor=fc_local, draw=imdraw
+                )
 
         if is_numpy:
             # return the numpy version
-            return np.asarray(image)
+            return np.asarray(pil_image)
         else:
             # return the PIL image
-            return image
+            return pil_image
 
 
 class BaseImage:
@@ -476,7 +510,7 @@ class Processor:
     """Base class for a processor"""
 
 
-class ImageSequenceSource:
+class ImageSequenceSource(Iterable[BaseImage], Sized):
     """Base class for an image sequence source (e.g. Tiff, OMERO, png, ...)"""
 
     @property
@@ -485,6 +519,18 @@ class ImageSequenceSource:
 
     @property
     def size_t(self) -> int:
+        raise NotImplementedError()
+
+    @property
+    def size_h(self) -> int:
+        raise NotImplementedError()
+
+    @property
+    def size_w(self) -> int:
+        raise NotImplementedError()
+
+    @property
+    def size_c(self) -> int:
         raise NotImplementedError()
 
     def get_frame(self, frame: int) -> BaseImage:
@@ -700,10 +746,24 @@ class ImageSequenceSource:
 
         # Return empty string to satisfy _repr_html_ protocol
         return ""
+    
+    def __iter__(self) -> Iterator[BaseImage]:
+        for i in range(self.size_t):
+            yield self.get_frame(i)
 
 
-class RoISource:
+    def __len__(self) -> int:
+        return self.size_t
+
+
+class RoISource(Iterable[Overlay], Sized):
     """Base class for a RoI source (e.g. tiff metadata, OMERO, json, ...)"""
+
+    def __iter__(self) -> Iterator[Overlay]:
+        raise NotImplementedError()
+
+    def __len__(self) -> int:
+        raise NotImplementedError()
 
 
 class ImageRoISource:
@@ -715,8 +775,8 @@ class ImageRoISource:
         self.imageSource = imageSource
         self.roiSource = roiSource
 
-    def __iter__(self) -> Iterator[tuple[np.array, Overlay]]:
-        return zip(iter(self.imageSource), iter(self.roiSource), strict=False)
+    def __iter__(self) -> Iterator[tuple[BaseImage, Overlay]]:
+        return zip(iter(self.imageSource), iter(self.roiSource), strict=False)  # type: ignore[return-value]
 
     def __len__(self):
         return min(len(self.imageSource), len(self.roiSource))

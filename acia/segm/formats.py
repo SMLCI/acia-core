@@ -119,7 +119,7 @@ def read_ctc_segmentation_native(segmentation_path: Path) -> Overlay:
 
     segm_masks = [imread(segm_file) for segm_file in segm_mask_files]
 
-    return overlay_from_masks(segm_masks)
+    return overlay_from_masks(segm_masks)  # type: ignore[arg-type]
 
 
 def overlay_from_masks(segm_masks: np.ndarray) -> Overlay:

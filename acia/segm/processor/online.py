@@ -8,10 +8,10 @@ from itertools import chain, islice
 from urllib.parse import urlparse
 
 import numpy as np
-import requests
+import requests  # type: ignore[import-untyped]
 import tqdm.auto as tqdm
 from PIL import Image
-from retry import retry
+from retry import retry  # type: ignore[import-untyped]
 
 from acia.base import Contour, ImageSequenceSource, Overlay, Processor
 
@@ -83,16 +83,18 @@ class OnlineModel(Processor):
             for detection in content:
                 # label = detection['label']
                 contour_lists = detection["contours"][0]
-                contour = list(zip(contour_lists["x"], contour_lists["y"], strict=False))
+                contour = list(
+                    zip(contour_lists["x"], contour_lists["y"], strict=False)
+                )
                 score = detection["score"]
 
-                contours.append(Contour(contour, score, frame, -1))
+                contours.append(Contour(np.array(contour), score, frame, -1))
 
         return Overlay(contours)
 
     @staticmethod
     def parseContours(response_body) -> list[Contour]:
-        pass
+        raise NotImplementedError()
 
 
 class ModelDescriptor:
@@ -315,8 +317,8 @@ class FlexibleOnlineModel(Processor):
 
         logging.debug("Finished batch prediction")
 
-        return contours
+        return Overlay(contours)
 
     @staticmethod
     def parseContours(response_body) -> list[Contour]:
-        pass
+        raise NotImplementedError()

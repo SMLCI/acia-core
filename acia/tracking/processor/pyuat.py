@@ -59,7 +59,8 @@ class PyUATTracker(TrackingProcessor):
 
         if mip_method != "GRB":
             warnings.warn(
-                "You are not using Gurobi! Please install gurobi and specify 'GRB' as optimizer for a tremendous speedup!", stacklevel=2
+                "You are not using Gurobi! Please install gurobi and specify 'GRB' as optimizer for a tremendous speedup!",
+                stacklevel=2,
             )
 
     def __call__(self, images: ImageSequenceSource, segmentation: Overlay):
@@ -95,7 +96,7 @@ class PyUATTracker(TrackingProcessor):
             # read the tracking result
             with gzip.open(output_file) as input_file:
                 tracking_overlay, tracking_graph = parse_simple_tracking(
-                    input_file.read()
+                    input_file.read().decode("utf-8")
                 )
 
         # Convert from contour based overlay to a mask based overlay

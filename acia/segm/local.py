@@ -8,7 +8,14 @@ import numpy as np
 import roifile
 import tifffile
 
-from acia.base import BaseImage, Contour, ImageSequenceSource, Overlay, RoISource
+from acia.base import (
+    BaseImage,
+    Contour,
+    ImageSequenceSource,
+    Instance,
+    Overlay,
+    RoISource,
+)
 
 
 def prepare_image(image, normalize_image=True):
@@ -84,7 +91,7 @@ class LocalImageSource(ImageSequenceSource):
 
     @property
     def num_channels(self) -> int:
-        return self.__get_image().num_channels
+        return int(self.__get_image().num_channels)
 
     @property
     def num_frames(self) -> int:
@@ -134,7 +141,7 @@ class InMemorySequenceSource(ImageSequenceSource):
 
     @property
     def num_channels(self) -> int:
-        return self.get_frame(0).num_channels
+        return int(self.get_frame(0).num_channels)
 
 
 class THWCSequenceSource(ImageSequenceSource):
@@ -162,7 +169,7 @@ class THWCSequenceSource(ImageSequenceSource):
 
     @property
     def num_channels(self) -> int:
-        return self.get_frame(0).num_channels
+        return int(self.get_frame(0).num_channels)
 
     @property
     def size_c(self) -> int:
@@ -171,7 +178,7 @@ class THWCSequenceSource(ImageSequenceSource):
         Returns:
             int: size of the C dimension
         """
-        return self.image_stack.shape[3]
+        return int(self.image_stack.shape[3])
 
     @property
     def size_t(self) -> int:
@@ -180,7 +187,7 @@ class THWCSequenceSource(ImageSequenceSource):
         Returns:
             int: size of the T dimension
         """
-        return self.image_stack.shape[0]
+        return int(self.image_stack.shape[0])
 
     @property
     def size_h(self) -> int:
@@ -189,7 +196,7 @@ class THWCSequenceSource(ImageSequenceSource):
         Returns:
             int: size of the C dimension
         """
-        return self.image_stack.shape[1]
+        return int(self.image_stack.shape[1])
 
     @property
     def size_w(self) -> int:
@@ -198,7 +205,7 @@ class THWCSequenceSource(ImageSequenceSource):
         Returns:
             int: size of the T dimension
         """
-        return self.image_stack.shape[2]
+        return int(self.image_stack.shape[2])
 
     def to_channel(self, c: int) -> "THWCSequenceSource":
         """Converts multi-channel source into single-channel source
@@ -230,12 +237,14 @@ class THWCSequenceSource(ImageSequenceSource):
 
         def normalize(im: np.ndarray) -> np.ndarray:
             """Normalize image"""
-            min = np.quantile(im, 0.01)
-            max = np.quantile(im, 0.99)
+            min_val = np.quantile(im, 0.01)
+            max_val = np.quantile(im, 0.99)
 
-            return (
-                np.clip((im.astype(float) - min) / (max - min), 0.0, 1.0) * 255.0
+            result: np.ndarray = (
+                np.clip((im.astype(float) - min_val) / (max_val - min_val), 0.0, 1.0)
+                * 255.0
             ).astype(np.uint8)
+            return result
 
         # select the first channel
         image_stack = self.image_stack[..., 0]
@@ -309,7 +318,7 @@ class LocalSequenceSource(ImageSequenceSource):
 
     @property
     def num_channels(self) -> int:
-        return self.get_frame(0).num_channels
+        return int(self.get_frame(0).num_channels)
 
     def slice(self, start, end):
         images = tifffile.imread(self.filename)
@@ -382,10 +391,15 @@ class RoiStorer:
         # read the imagej rois from file
         rois = roifile.roiread(filename)
 
-        id = -1
+        # Ensure rois is a list
+        if not isinstance(rois, list):
+            rois = [rois]
+
+        roi_id = -1
         # convert them into contours (recover time position)
-        contours = [
-            Contour(roi.coordinates(), -1.0, roi.position - 1, id=id) for roi in rois
+        contours: list[Contour | Instance] = [
+            Contour(np.array(roi.coordinates()), -1.0, roi.position - 1, id=roi_id)
+            for roi in rois
         ]
 
         # return the overlay

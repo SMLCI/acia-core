@@ -91,7 +91,10 @@ class OfflineModel(Processor):
             all_contours = [contour_from_mask(mask, 0.5) for mask in all_masks]
             # drop non-sense contours
             all_contours = list(
-                filter(lambda comb: len(comb[1]) >= 5, zip(pred_result, all_contours, strict=False))
+                filter(
+                    lambda comb: len(comb[1]) >= 5,
+                    zip(pred_result, all_contours, strict=False),
+                )
             )
 
             contours = [

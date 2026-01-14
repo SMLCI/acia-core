@@ -305,9 +305,9 @@ class VideoExporter2:
         if ffmpeg_params is None:
             ffmpeg_params = []
 
-        self.ffmpeg_params = ffmpeg_params
+        self.ffmpeg_params: list[str] = ffmpeg_params
 
-        self.images = []
+        self.images: list[np.ndarray] = []
 
     @staticmethod
     def default_vp9(
@@ -348,7 +348,7 @@ class VideoExporter2:
 
     @staticmethod
     def default_mjpg(filename: Path, framerate: int):
-        ffmpeg_params = []
+        ffmpeg_params: list[str] = []
         return VideoExporter2(
             filename, framerate, codec="mjpeg", ffmpeg_params=ffmpeg_params
         )
@@ -412,7 +412,8 @@ def render_segmentation(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(imageSource, overlay.timeIterator(), strict=False), desc="Render cell segmentation..."
+        zip(imageSource, overlay.timeIterator(), strict=False),
+        desc="Render cell segmentation...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -477,7 +478,8 @@ def render_cell_centers(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(image_source, overlay.timeIterator(), strict=False), desc="Render cell centers..."
+        zip(image_source, overlay.timeIterator(), strict=False),
+        desc="Render cell centers...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -533,7 +535,9 @@ def render_tracking(
     contour_lookup = {cont.id: cont for cont in overlay}
 
     for image, frame_overlay in zip(
-        tqdm(image_source, desc="Render cell tracking paths..."), overlay.timeIterator(), strict=False
+        tqdm(image_source, desc="Render cell tracking paths..."),
+        overlay.timeIterator(),
+        strict=False,
     ):
         np_image = np.copy(image.raw)
 
@@ -580,10 +584,11 @@ def render_tracking(
                         )
 
                 if len(edges) == 0:
+                    center = np.array(cont.center).astype(np.int32)
                     cv2.rectangle(
                         np_image,
-                        np.array(cont.center).astype(np.int32) - 2,
-                        np.array(cont.center).astype(np.int32) + 2,
+                        tuple(center - 2),
+                        tuple(center + 2),
                         (203, 192, 255),
                     )
 
@@ -597,7 +602,7 @@ def render_video(
     filename: str,
     framerate: int = 10,
     codec: str = "libx264",
-    ffmpeg_params: list[str] = None,
+    ffmpeg_params: list[str] | None = None,
 ) -> None:
     """Render video
 
@@ -624,11 +629,11 @@ def render_video(
                     image.shape,
                 )
 
-            writer.append_data(image)
+            writer.append_data(image)  # type: ignore[attr-defined]
 
 
 def render_scalebar(
-    image_source: Overlay,
+    image_source: ImageSequenceSource,
     xy_position: tuple[int | float, int | float],
     size_of_pixel: pint.Quantity,
     bar_width: pint.Quantity,
@@ -636,14 +641,14 @@ def render_scalebar(
     color=(255, 255, 255),
     font_size=25,
     font_path=default_font,
-    background_color: tuple[int, int, int] = None,
+    background_color: tuple[int, int, int] | None = None,
     background_margin_pixel=3,
     show_text=True,
 ) -> ImageSequenceSource:
     """Draws a scale bar on all images of an image sequence or iterable image array
 
     Args:
-        image_source (Overlay): image sequence or iterator over images
+        image_source (ImageSequenceSource): image sequence or iterator over images
         xy_position (tuple[int, int]): lower left xy position of the scale bar
         size_of_pixel (pint.Quantity): metric size of a pixel (e.g. 0.007 * ureg.micrometer)
         bar_width (pint.Quantity): width of the scalebar (e.g. 5 * ureg.micrometer). Also the text over the bar.
@@ -782,7 +787,7 @@ def render_time(
     color=(255, 255, 255),
     font_size=25,
     font_path=default_font,
-    background_color: tuple[int, int, int] = None,
+    background_color: tuple[int, int, int] | None = None,
     background_margin_pixel=3,
 ) -> ImageSequenceSource:
     """Draw time onto images
@@ -827,7 +832,9 @@ def render_time(
             )
         ystart = int(np.round(image_height * ystart))
 
-    for image, timepoint in zip(tqdm(image_source, desc="Render time..."), timepoints, strict=False):
+    for image, timepoint in zip(
+        tqdm(image_source, desc="Render time..."), timepoints, strict=False
+    ):
         if isinstance(timepoint, pint.Quantity):
             timepoint = timedelta(seconds=float(timepoint.to(ureg.seconds).magnitude))
 
@@ -923,14 +930,14 @@ def colorize_instance_mask(
     # Map colors to mask using LUT
     colored_mask = color_lut[instance_mask]
 
-    return colored_mask
+    return colored_mask  # type: ignore[no-any-return]
 
 
-def get_mask(self, height, width, binary_mask=True) -> list[np.array]:
+def get_mask(self, height, width, binary_mask=True) -> np.ndarray:
     """
     Turn the individual overlays into masks. For every time point we create a mask of all contours.
 
-    returns: List of masks (np.array[bool])
+    returns: np.ndarray mask
 
     height: height of the image
     width: width of the image
@@ -974,7 +981,9 @@ def render_segmentation_mask(
     return_images = []
 
     for im, ov in zip(
-        tqdm(source, desc="Render segmentation masks..."), overlay.time_iterator(), strict=False
+        tqdm(source, desc="Render segmentation masks..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
         im = np.copy(im.raw)
 
@@ -986,15 +995,15 @@ def render_segmentation_mask(
         colored_mask = colorize_instance_mask(label_mask)
 
         # Alpha blend with original image
-        overlay = cv2.addWeighted(
+        blended = cv2.addWeighted(
             im.astype(np.float32), alpha, colored_mask.astype(np.float32), 1 - alpha, 0
         ).astype(np.uint8)
 
-        # use the original image where no overlay is availabel
+        # use the original image where no overlay is available
         binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-        overlay = np.where(binary_mask, overlay, im)
+        result = np.where(binary_mask, blended, im)
 
-        return_images.append(overlay)
+        return_images.append(result)
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
@@ -1028,7 +1037,9 @@ def render_tracking_mask(
     color_lut[0] = (0, 0, 0)
 
     for im, ov in zip(
-        tqdm(source, desc="Render tracking mask..."), overlay.time_iterator(), strict=False
+        tqdm(source, desc="Render tracking mask..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
         im = np.copy(im.raw)
 
@@ -1043,10 +1054,11 @@ def render_tracking_mask(
 
             # render label numbers if necessary
             if show_label_numbers:
+                center_pt = tuple(np.array(cont.center).astype(int))
                 cv2.putText(
                     im,
                     f"{cont.label}",
-                    np.array(cont.center).astype(int),
+                    center_pt,
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (255, 0, 0),
@@ -1058,15 +1070,15 @@ def render_tracking_mask(
         colored_mask = colorize_instance_mask(label_mask, color_lut=color_lut)
 
         # Alpha blend with original image
-        overlay = cv2.addWeighted(
+        blended = cv2.addWeighted(
             im.astype(np.float32), alpha, colored_mask.astype(np.float32), 1 - alpha, 0
         ).astype(np.uint8)
 
-        # use the original image where no overlay is availabel
+        # use the original image where no overlay is available
         binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-        overlay = np.where(binary_mask, overlay, im)
+        result = np.where(binary_mask, blended, im)
 
-        return_images.append(overlay)
+        return_images.append(result)
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
@@ -1165,8 +1177,10 @@ def extract_lineage_plotdata(
         features = G.nodes[n]
         if features:
             maxk = max((len(str(k)) for k in features), default=1)
+
             def fmt(k, v, maxk):
                 return f"{str(k).ljust(maxk)} : {v}<br>"
+
             feat_lines = "".join(fmt(k, v, maxk) for k, v in features.items())
             hover_html = f"<b>Node:</b> {n}<br><span style='font-family:monospace'>{feat_lines}</span>"
         else:
@@ -1302,16 +1316,16 @@ def plot_cell_lineage(
     colors = None
     if node_color_by is not None:
         vals = _value_getter(G, data["node_ids"], node_color_by)
-        if _is_numeric_series(vals):
-            vmin = min(v for v in vals if v is not None)
-            vmax = max(v for v in vals if v is not None)
+        if _is_numeric_series(vals):  # type: ignore[arg-type]
+            vmin = min(v for v in vals if v is not None)  # type: ignore[union-attr]
+            vmax = max(v for v in vals if v is not None)  # type: ignore[union-attr]
             if vmin == vmax:  # avoid zero-range
                 vmin, vmax = vmin - 0.5, vmax + 0.5
             norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
             cmap = mpl.colormaps.get_cmap(node_cmap)
             colors = [
                 cmap(norm(v)) if v is not None else mcolors.to_rgba(node_na_color)
-                for v in vals
+                for v in vals  # type: ignore[union-attr]
             ]
 
             if show_colorbar:
@@ -1330,13 +1344,13 @@ def plot_cell_lineage(
                 cb.set_label(title)
         else:
             # categorical → discrete palette
-            uniq = list(dict.fromkeys(v for v in vals if v is not None))
+            uniq = list(dict.fromkeys(v for v in vals if v is not None))  # type: ignore[union-attr]
             if len(uniq) == 0:
-                colors = [node_na_color] * len(vals)
+                colors = [node_na_color] * len(vals)  # type: ignore[arg-type]
             else:
                 base = mpl.colormaps.get_cmap(node_cmap).resampled(max(len(uniq), 3))
                 lut = {u: base(i / max(len(uniq) - 1, 1)) for i, u in enumerate(uniq)}
-                colors = [lut.get(v, mcolors.to_rgba(node_na_color)) for v in vals]
+                colors = [lut.get(v, mcolors.to_rgba(node_na_color)) for v in vals]  # type: ignore[union-attr]
             if show_legend and len(uniq) > 0:
                 # legend proxies
                 handles, labels = [], []
@@ -1369,7 +1383,9 @@ def plot_cell_lineage(
     )
 
     if show_label:
-        for x, y, label in zip(data["xs"], data["ys"], data["node_labels"], strict=False):
+        for x, y, label in zip(
+            data["xs"], data["ys"], data["node_labels"], strict=False
+        ):
             ax.text(x, y + 0.12, label, fontsize=7, ha="center", va="bottom")
 
     # births / ends
@@ -1539,7 +1555,7 @@ def plotly_cell_lineage(
             add_nodes_subset(
                 idx_valid,
                 name=str(node_color_by) if isinstance(node_color_by, str) else "value",
-                color=[color[i] for i in idx_valid],
+                color=[color[i] for i in idx_valid],  # type: ignore[misc]
                 colorscale=node_colorscale,
                 colorbar=dict(
                     title=(

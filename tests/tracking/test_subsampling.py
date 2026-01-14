@@ -29,12 +29,18 @@ class TestSubsampling(unittest.TestCase):
         frames = [frame_start + i for i in range(length)]
 
         overlay = Overlay(
-            [Contour(None, -1, frame, id) for id, frame in zip(ids, frames, strict=False)]
+            [
+                Contour(None, -1, frame, id)
+                for id, frame in zip(ids, frames, strict=False)
+            ]
         )
         tracking_graph = nx.DiGraph()
         tracking_graph.add_nodes_from([cont.id for cont in overlay])
         tracking_graph.add_edges_from(
-            [(a.id, b.id) for a, b in zip(overlay.contours, overlay.contours[1:], strict=False)]
+            [
+                (a.id, b.id)
+                for a, b in zip(overlay.contours, overlay.contours[1:], strict=False)
+            ]
         )
 
         linear_ts = TrackingSourceInMemory(overlay, tracking_graph)

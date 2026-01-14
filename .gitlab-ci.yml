@@ -6,6 +6,12 @@ image: python:3.10
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
+# Global pip cache - persisted between pipeline runs
+cache:
+  key: pip-${CI_JOB_IMAGE}
+  paths:
+    - .cache/pip/
+
 stages:
   - lint
   - build
@@ -61,18 +67,32 @@ test:
   stage: test
   tags:
     - biggpu
+  needs:
+    - job: build
+      parallel:
+        matrix:
+          - PY_VERSION: $PY_VERSION
+  cache:
+    - key: pip-${CI_JOB_IMAGE}
+      paths:
+        - .cache/pip/
+    - key: test-resources-v1
+      paths:
+        - test_resources/
   script:
     # test dependencies
     - pip install pytest pytest-sugar pytest-cov python-dotenv coverage unittest-xml-reporting
     - pip install git+https://github.com/JojoDevel/trackastra.git
     - pip install laptrack
-    - pip install build
-    - python -m build
+    # install the pre-built wheel from build job
     - pip install dist/*.whl
-    # download data for testing
-    - mkdir -p test_resources
-    - wget -O test_resources/ctc_format.zip https://fz-juelich.sciebo.de/s/8dEFaTKl26H26wO/download
-    - unzip test_resources/ctc_format.zip -d test_resources/ctc_format
+    # download data for testing (only if not cached)
+    - |
+      if [ ! -d "test_resources/ctc_format" ]; then
+        mkdir -p test_resources
+        wget -O test_resources/ctc_format.zip https://fz-juelich.sciebo.de/s/8dEFaTKl26H26wO/download
+        unzip test_resources/ctc_format.zip -d test_resources/ctc_format
+      fi
     # perform the tests
     - coverage run -m pytest --junitxml=report.xml --cov-report term --cov-report xml --cov=acia tests/
   coverage: '/TOTAL.*\s+(\d+%)/'

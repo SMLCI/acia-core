@@ -14,7 +14,7 @@ from shapely.validation import make_valid
 from acia.base import Overlay
 
 
-def bbox_to_rectangle(bbox: tuple[float]):
+def bbox_to_rectangle(bbox: tuple[float, float, float, float]):
     minx, miny, maxx, maxy = bbox
     return Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
 
@@ -29,7 +29,9 @@ class NMSFilter:
         ]
 
         # sort contours by their score (lowest first)
-        sorted_contours = sorted(prefiltered_contours, key=lambda c: c.score)
+        sorted_contours = sorted(
+            prefiltered_contours, key=lambda c: c.score if c.score is not None else 0.0
+        )
         # make (valid) shapely polygons
         polygons = [
             make_valid(shapely.geometry.polygon.Polygon(contour.coordinates))
@@ -63,7 +65,7 @@ class NMSFilter:
             right = maxx
             top = maxy
             bottom = miny
-            candidate_idx_list = idx.intersection((left, bottom, right, top))
+            candidate_idx_iter = idx.intersection((left, bottom, right, top))
 
             candidate_idx_list = list(
                 filter(
@@ -74,7 +76,7 @@ class NMSFilter:
                         loop_index=i,
                         sorted_contours=sorted_contours,
                     ),
-                    candidate_idx_list,
+                    candidate_idx_iter,
                 )
             )
 

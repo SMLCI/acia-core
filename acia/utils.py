@@ -20,14 +20,14 @@ def lut_mapping(image, in_min, in_max, out_min, out_max, dtype=None):
     return mapped_data
 
 
-def pairwise_distances(points: np.ndarray):
-    distances = []
+def pairwise_distances(points: np.ndarray) -> list[float]:
+    distances: list[float] = []
 
     if len(points) == 0:
         return distances
 
     for a, b in zip(points, points[1:], strict=False):
-        distances.append(np.linalg.norm(a - b))
+        distances.append(float(np.linalg.norm(a - b)))
 
     return distances
 

@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import networkx as nx
 import numpy as np
@@ -212,7 +213,7 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
     for cont in ov:
         track_graph.add_node(cont.id, frame=cont.frame)
 
-    tracklets = {}
+    tracklets: dict[Any, list[Any]] = {}
     for cont in ov:
         tracklets[cont.label] = tracklets.get(cont.label, []) + [cont]
 
