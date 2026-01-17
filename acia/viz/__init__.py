@@ -995,9 +995,21 @@ def render_overlay_frame(
     # Get image dimensions
     height, width = im.shape[:2]
 
+    # Convert image to uint8 if necessary
+    if im.dtype == np.uint16:
+        im = (im / 256).astype(np.uint8)
+    elif im.dtype in (np.float32, np.float64):
+        im = np.clip(im * 255, 0, 255).astype(np.uint8)
+    elif im.dtype != np.uint8:
+        im = im.astype(np.uint8)
+
     # Convert grayscale images to RGB by duplicating channels
     if len(im.shape) == 2:
+        # 2D array (HxW)
         im = np.stack([im] * 3, axis=-1)
+    elif len(im.shape) == 3 and im.shape[2] == 1:
+        # 3D array with single channel (HxWx1)
+        im = np.stack([im[:, :, 0]] * 3, axis=-1)
 
     # Convert overlay to instance label mask (uint16, where each instance has unique ID)
     label_mask = get_mask(overlay, height, width, False)
