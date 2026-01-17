@@ -184,8 +184,12 @@ class TestRenderOverlayFrameAlphaBlending(unittest.TestCase):
         overlay = Overlay([])
 
         # Render with different alpha values
-        result_alpha_01 = render_overlay_frame(image, overlay, self.frame_idx, alpha=0.1)
-        result_alpha_09 = render_overlay_frame(image, overlay, self.frame_idx, alpha=0.9)
+        result_alpha_01 = render_overlay_frame(
+            image, overlay, self.frame_idx, alpha=0.1
+        )
+        result_alpha_09 = render_overlay_frame(
+            image, overlay, self.frame_idx, alpha=0.9
+        )
 
         # Results should be different (different alpha values)
         # Although with empty overlay, results might be similar
