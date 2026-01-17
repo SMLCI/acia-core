@@ -105,6 +105,27 @@ class JupyterVisualizationMixin:
         else:
             channel_toggles = []
 
+        # Create overlay controls (only if overlay is provided)
+        overlay = getattr(self, "overlay", None)
+        if overlay is not None:
+            overlay_checkbox = widgets.Checkbox(
+                value=True,
+                description="Overlay",
+                indent=False,
+            )
+            opacity_slider = widgets.FloatSlider(
+                value=0.8,
+                min=0.0,
+                max=1.0,
+                step=0.05,
+                description="Opacity:",
+                continuous_update=False,
+                layout=widgets.Layout(width="80%"),
+            )
+        else:
+            overlay_checkbox = None
+            opacity_slider = None
+
         def normalize_to_uint8(image_array: np.ndarray) -> np.ndarray:
             """Normalize image array to uint8 [0, 255] range."""
             if image_array.dtype == np.uint8:
