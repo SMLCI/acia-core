@@ -259,6 +259,13 @@ class JupyterVisualizationMixin:
         controls = []
         if time_slider:
             controls.append(time_slider)
+        if overlay_checkbox is not None and opacity_slider is not None:
+            controls.append(
+                widgets.HBox(
+                    [overlay_checkbox, opacity_slider],
+                    layout=widgets.Layout(flex_flow="row wrap"),
+                )
+            )
         if channel_toggles:
             controls.append(
                 widgets.HBox(
