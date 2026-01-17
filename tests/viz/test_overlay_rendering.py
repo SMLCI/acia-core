@@ -3,10 +3,9 @@
 import unittest
 from unittest.mock import Mock
 
-import cv2
 import numpy as np
 
-from acia.base import Contour, Overlay, Instance
+from acia.base import Contour, Overlay
 from acia.viz import render_overlay_frame
 
 
