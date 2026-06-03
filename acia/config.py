@@ -98,7 +98,8 @@ def _load_config(path: str, _mtime: float) -> dict:
     """
     _warn_on_loose_permissions(path)
     with open(path, "rb") as f:
-        return tomllib.load(f)
+        config: dict = tomllib.load(f)
+    return config
 
 
 def _read_config() -> dict:
