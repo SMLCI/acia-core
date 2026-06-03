@@ -20,6 +20,10 @@ from pint._typing import UnitLike
 from tqdm.auto import tqdm
 
 from acia import Q_, U_
+from acia.analysis.units import UNIT_ATTR, units_in_header
+from acia.analysis.units import attach_units as attach_units
+from acia.analysis.units import from_header as from_header
+from acia.analysis.units import strip_units as strip_units
 from acia.base import BaseImage, ImageSequenceSource, Overlay
 from acia.utils import pairwise_distances
 
@@ -103,9 +107,35 @@ class ExtractorExecutor:
         overlay: Overlay,
         images: ImageSequenceSource,
         extractors: list[PropertyExtractor] | None = None,
+        units: str = "none",
     ):
+        """Extract single-cell properties into a DataFrame.
+
+        Args:
+            overlay: the contours to extract properties from.
+            images: the image source (needed e.g. for fluorescence).
+            extractors: the property extractors to run.
+            units: representation of physical units in the returned table:
+
+                * ``"none"`` (default) -- plain numeric columns; the unit map is
+                  carried in ``df.attrs["units"]``. Not unit-safe.
+                * ``"header"`` -- plain values with the unit as a column-index
+                  level (export/readable form). Not unit-safe.
+                * ``"pint"`` -- ``pint[...]`` columns; the only representation
+                  with unit-safe arithmetic (propagation + dimensional checks).
+
+                The forms are convertible afterwards via
+                :func:`acia.analysis.attach_units` / ``strip_units`` /
+                ``units_in_header``.
+        """
         if extractors is None:
             extractors = []
+
+        valid_units = {"none", "magnitude", "header", "pint"}
+        if units not in valid_units:
+            raise ValueError(
+                f"Unknown units={units!r}. Expected one of {sorted(valid_units)}."
+            )
 
         df = pd.DataFrame()
 
@@ -115,11 +145,21 @@ class ExtractorExecutor:
 
         for extractor in tqdm(extractors):
             print(f"Extracting: {extractor.name}...")
-            result_df, units = extractor.extract(overlay, images, df)
+            result_df, extractor_units = extractor.extract(overlay, images, df)
 
             df = pd.merge(df, result_df, on="id")
 
-            self.units.update(**units)
+            self.units.update(**extractor_units)
+
+        # carry the unit map with the table (replaces relying on self.units)
+        df.attrs[UNIT_ATTR] = {k: str(v) for k, v in self.units.items()}
+
+        # convert once, after all merges, to avoid pint+merge edge cases
+        if units == "pint":
+            df = attach_units(df)
+        elif units == "header":
+            df = units_in_header(df)
+        # "none"/"magnitude" -> leave as plain floats
 
         return df
 
