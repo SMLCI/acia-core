@@ -604,29 +604,76 @@ class FluorescenceEx(PropertyExtractor):
         }
 
 
+def default_execution_naming(source) -> str:
+    """Source-aware default folder name for one scaled execution.
+
+    * ``int`` (e.g. an OMERO image id) -> ``"execution_<id>"``
+    * ``str`` (a file path or fsspec URL) -> the file *stem*, i.e. the file name
+      without directory and extension (``smb://host/share/pos1.tif`` -> ``pos1``)
+
+    For other item types (e.g. a parameter ``dict``) the name cannot be inferred;
+    pass an explicit ``execution_naming`` to :func:`scale` in that case.
+    """
+    if isinstance(source, bool):  # bool is an int subclass; treat as unsupported
+        raise ValueError(f"Cannot derive an execution name from {source!r}.")
+    if isinstance(source, int):
+        return f"execution_{source}"
+    if isinstance(source, str):
+        # strip a possible query string, then take the file stem (works for URLs)
+        return Path(source.split("?", 1)[0]).stem
+    raise ValueError(
+        f"Cannot derive a default execution name from {type(source).__name__}. "
+        "Please pass an explicit `execution_naming` function to scale()."
+    )
+
+
 def scale(
     output_path: Path,
     analysis_script: Path | list[Path],
-    image_ids: list[int],
+    image_ids: list[int | str | dict],
     additional_parameters=None,
     exist_ok=False,
-    execution_naming=lambda image_id: f"execution_{image_id}",
+    execution_naming=None,
     exist_skip=False,
     kernel_name=None,
+    parameter_name: str = "image_id",
 ):
-    """Scale an analysis notebook to several image sequences
+    """Scale an analysis notebook to several image sources.
+
+    Each entry in ``image_ids`` identifies one image source and triggers one
+    notebook execution. An entry may be:
+
+    * an ``int`` -- e.g. an OMERO image id (default folder ``execution_<id>``),
+    * a ``str`` -- a local path or fsspec URL such as ``smb://host/share/x.tif``
+      (default folder name is the file stem, e.g. ``x``),
+    * a ``dict`` -- arbitrary parameters merged into the notebook; provide an
+      explicit ``execution_naming`` for these.
+
+    The identifier is injected into the notebook under ``parameter_name``
+    (default ``"image_id"``), so existing notebooks keep working. The notebook is
+    responsible for turning it into a concrete source (e.g.
+    ``OmeroSequenceSource(image_id)`` or ``SambaSequenceSource.from_url(image_id)``).
 
     **Hint:** the analysis script should only use absolute paths as the file is copied and executed in another folder.
 
     Args:
         output_path (Path): the general output path to the storage
         analysis_script (Path): the template script
-        image_ids (List[int]): list of (OMERO) image sources
+        image_ids (list[int | str | dict]): image sources to scale over (ids,
+            paths/URLs, or parameter dicts).
         additional_parameters (dict): Parameters to be inserted into the jupyter script
         exist_ok (Bool): True when it is okay that the directory exists, False will throw an error when the directory exists.
+        execution_naming (Callable): maps an entry to its output folder name. By
+            default :func:`default_execution_naming` is used, which dispatches on
+            the entry type (id -> ``execution_<id>``, path -> file stem).
         exist_skip (Bool): If true existing executions are skipped.
         kernel_name (str): specifies the notebook kernel to be used. None is the default kernel.
+        parameter_name (str): name of the notebook parameter the identifier is
+            injected as (ignored for ``dict`` entries, which are merged as-is).
     """
+
+    if execution_naming is None:
+        execution_naming = default_execution_naming
 
     if isinstance(analysis_script, str):
         # if this is just a single string, then we make it a list of a single path
@@ -645,13 +692,37 @@ def scale(
 
     experiment_executions = []
 
-    failed_ids: list[int] = []
+    failed_ids: list[int | str | dict] = []
+
+    # warn (don't fail) if two entries map to the same output folder, since later
+    # executions would otherwise silently overwrite earlier ones
+    seen_names: dict[str, object] = {}
+    for entry in image_ids:
+        if isinstance(entry, dict):
+            continue  # naming for dicts is user-defined; skip the heuristic check
+        name = execution_naming(entry)
+        if name in seen_names:
+            logger.warning(
+                "Execution name %r maps to multiple sources (%r and %r); their "
+                "outputs will collide. Pass a unique `execution_naming` to avoid this.",
+                name,
+                seen_names[name],
+                entry,
+            )
+        seen_names[name] = entry
 
     for image_id in tqdm(image_ids):
         try:
             # create the main output folder
             output_parent = output_path / execution_naming(image_id)
             os.makedirs(output_parent, exist_ok=exist_ok)
+
+            # per-entry notebook parameters: dict entries are merged as-is,
+            # everything else is injected under `parameter_name`.
+            if isinstance(image_id, dict):
+                source_parameters = dict(image_id)
+            else:
+                source_parameters = {parameter_name: image_id}
 
             for script in analysis_script:
                 # path to the new notebook file
@@ -667,7 +738,7 @@ def scale(
                 # parameters to integrate into notebook
                 parameters = dict(
                     storage_folder=str(output_file.parent.absolute()),
-                    image_id=image_id,
+                    **source_parameters,
                     **additional_parameters,
                 )
 
