@@ -5,10 +5,14 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from acia.segm.local import InMemorySequenceSource
 from acia.segm.output import renderVideo
 from acia.viz import VideoExporter, VideoExporter2
+
+# encodes real video files via moviepy/ffmpeg
+pytestmark = pytest.mark.integration
 
 
 class TestVideoGen(unittest.TestCase):

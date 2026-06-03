@@ -4,12 +4,18 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from acia.segm.local import InMemorySequenceSource
-from acia.tracking.formats import read_ctc_tracking
+# needs the trackastra heavy dependency + the external ctc_format dataset
+pytest.importorskip("trackastra")
+
+from acia.segm.local import InMemorySequenceSource  # noqa: E402
+from acia.tracking.formats import read_ctc_tracking  # noqa: E402
 
 # from acia.tracking.processor.laptrack import LAPTracker
-from acia.tracking.processor.trackastra import TrackastraTracker
+from acia.tracking.processor.trackastra import TrackastraTracker  # noqa: E402
+
+pytestmark = pytest.mark.integration
 
 
 class TestTrackingProcessors(unittest.TestCase):

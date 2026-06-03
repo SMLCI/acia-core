@@ -5,10 +5,14 @@ from pathlib import Path
 from shutil import rmtree
 
 import numpy as np
+import pytest
 import tifffile
 
 from acia.segm.local import LocalImage
 from acia.tracking.formats import read_ctc_tracking, write_ctc_tracking
+
+# reads/writes the external ctc_format dataset under test_resources/
+pytestmark = pytest.mark.integration
 
 
 class TestSubsampling(unittest.TestCase):

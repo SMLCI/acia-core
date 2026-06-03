@@ -50,6 +50,8 @@ dependencies = [
     "fsspec>=2023.1.0",
     "platformdirs>=3.0.0",
     "tomli>=2.0.0; python_version < '3.11'",
+    "imageio>=2.0",
+    "moviepy<2",
 ]
 
 [project.optional-dependencies]
@@ -69,6 +71,7 @@ dev = [
 docs = [
     "sphinx>=7.0.0",
     "sphinx-rtd-theme>=2.0.0",
+    "myst-parser>=2.0.0",
 ]
 omero = ["omero-py>=5.9.3"]
 notebook = ["ipywidgets>=8.0.0"]
@@ -78,9 +81,9 @@ remote = ["smbprotocol>=1.10.0", "keyring>=24.0.0"]
 acia = "acia.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/JuBiotech/acia-core"
-Repository = "https://github.com/JuBiotech/acia-core"
-Documentation = "https://jubiotech.github.io/acia-core"
+Homepage = "https://github.com/SMLCI/acia-core"
+Repository = "https://github.com/SMLCI/acia-core"
+Documentation = "https://smlci.github.io/acia-core"
 
 [tool.setuptools.packages.find]
 include = ["acia", "acia.*"]
@@ -127,7 +130,12 @@ exclude = ["docs", "build", "dist"]
 # Pytest configuration
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+# integration tests (external data / heavy deps) are deselected by default so
+# normal and CI runs stay fast; run them explicitly with `-m integration`
+addopts = "-v --tb=short -m 'not integration'"
+markers = [
+    "integration: needs external data or heavy deps (trackastra, laptrack, ffmpeg)",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
@@ -161,3 +169,10 @@ replace = 'version = "{new_version}"'
 filename = "acia/__init__.py"
 search = '__version__ = "{current_version}"'
 replace = '__version__ = "{new_version}"'
+
+# promote the changelog: turn the Unreleased section into a dated version section
+# and re-seed an empty Unreleased on every bump
+[[tool.bumpversion.files]]
+filename = "CHANGELOG.md"
+search = "## [Unreleased]"
+replace = "## [Unreleased]\n\n## [{new_version}] - {now:%Y-%m-%d}"
