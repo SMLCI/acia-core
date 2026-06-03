@@ -22,7 +22,8 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install ruff
+      # pinned for deterministic lint/format (must match pre-commit + dev extra)
+      - run: pip install ruff==0.15.15
       - run: ruff check acia tests
       - run: ruff format --check acia tests
 

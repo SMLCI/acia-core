@@ -70,9 +70,11 @@ class NMSFilter:
             candidate_idx_list = list(
                 filter(
                     partial(
-                        lambda index, loop_index, sorted_contours: index > loop_index
-                        and sorted_contours[loop_index].frame
-                        == sorted_contours[index].frame,
+                        lambda index, loop_index, sorted_contours: (
+                            index > loop_index
+                            and sorted_contours[loop_index].frame
+                            == sorted_contours[index].frame
+                        ),
                         loop_index=i,
                         sorted_contours=sorted_contours,
                     ),
