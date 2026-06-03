@@ -276,15 +276,15 @@ class CTCTrackingHelper:
         contour_life_cycle_lookup: dict[str, int],
         height: int,
         width: int,
-    ) -> list[np.ndarray]:
-        """Creates a ctc masks with correct numbering for a frame overlay
+    ) -> np.ndarray:
+        """Creates a ctc mask with correct numbering for a frame overlay
 
         Args:
             overlay (Overlay): overlay containing the contours
             contour_life_cycle_lookup (Dict[str, int]): lookup for the life cycle
 
         Returns:
-            List[np.ndarray]: list of ctc masks
+            np.ndarray: the ctc mask for the frame
         """
         assert height > 0 and width > 0
 
@@ -298,7 +298,7 @@ class CTCTrackingHelper:
                 image_mask, (cont_mask * life_cycle_id).astype(np.uint16)
             )
 
-        return image_mask  # type: ignore[return-value]
+        return image_mask
 
     @staticmethod
     def __load_masks(mask_path: Path) -> Overlay:

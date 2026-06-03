@@ -231,7 +231,7 @@ def renderVideo(
                 image = scaleBar.draw(
                     image,
                     width - scaleBar.pixelWidth - 10,
-                    height - 10,  # type: ignore[attr-defined]
+                    height - 10,
                 )
 
             # output images

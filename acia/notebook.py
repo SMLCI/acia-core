@@ -28,9 +28,15 @@ class JupyterVisualizationMixin:
             ...
     """
 
-    # Type hints for expected interface (duck typing)
-    size_t: int
-    num_channels: int
+    if TYPE_CHECKING:
+        # `size_t`/`num_channels` are supplied by the host ImageSequenceSource.
+        # They are declared here for the type checker only (guarded by
+        # TYPE_CHECKING so no runtime descriptor is created) and as read-only
+        # properties so concrete sources may override them with `@property`.
+        @property
+        def size_t(self) -> int: ...
+        @property
+        def num_channels(self) -> int: ...
 
     def get_frame(self, frame: int) -> BaseImage:
         """Get frame at given index."""
@@ -135,6 +141,7 @@ class JupyterVisualizationMixin:
             min_val = np.min(image_array)
             max_val = np.max(image_array)
 
+            normalized: np.ndarray
             if max_val > min_val:
                 normalized = (
                     (image_array - min_val) / (max_val - min_val) * 255

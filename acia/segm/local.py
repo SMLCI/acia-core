@@ -486,10 +486,8 @@ class SambaSequenceSource(LocalSequenceSource):
             **kwargs: forwarded to :class:`LocalSequenceSource`.
         """
         parts = urlsplit(url)
-        if parts.scheme != "smb":
-            raise ValueError(
-                f"Expected an 'smb://' URL, got scheme {parts.scheme!r} in {url!r}."
-            )
+        if parts.scheme != "smb" or not parts.hostname:
+            raise ValueError(f"Expected an 'smb://host/...' URL, got {url!r}.")
 
         share, _, path = parts.path.lstrip("/").partition("/")
         if not share or not path:

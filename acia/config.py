@@ -153,7 +153,7 @@ def _resolve_secrets(entry: dict, *, protocol: str, host: str | None) -> dict:
 
         service = f"{protocol}://{host}" if host else protocol
         username = options.get("username")
-        password = keyring.get_password(service, username)
+        password = keyring.get_password(service, username) if username else None
         if password is None:
             raise KeyError(
                 f"acia credentials: no keyring entry found for service "
