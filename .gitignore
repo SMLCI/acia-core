@@ -135,3 +135,6 @@ ENV/
 .claude_settings.json
 .worktrees/
 .auto-claudo-status
+
+# macOS
+.DS_Store
