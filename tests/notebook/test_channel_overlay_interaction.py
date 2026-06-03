@@ -6,7 +6,6 @@ properly overlays on top of selected channels.
 """
 
 import unittest
-from unittest.mock import Mock, patch, MagicMock
 
 import numpy as np
 
@@ -73,7 +72,9 @@ class MockImageSequenceSource(JupyterVisualizationMixin):
         if frames_data is None:
             # Create random frames with specified channels
             frames_data = [
-                np.random.randint(0, 255, size=(height, width, num_channels), dtype=np.uint8)
+                np.random.randint(
+                    0, 255, size=(height, width, num_channels), dtype=np.uint8
+                )
                 for _ in range(num_frames)
             ]
 
@@ -211,8 +212,8 @@ class TestSingleChannelWithOverlay(unittest.TestCase):
         # Create frame with distinct channel values
         frame_data = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         frame_data[:, :, 0] = 100  # Red channel
-        frame_data[:, :, 1] = 50   # Green channel
-        frame_data[:, :, 2] = 25   # Blue channel
+        frame_data[:, :, 1] = 50  # Green channel
+        frame_data[:, :, 2] = 25  # Blue channel
 
         frames_data = [frame_data.copy() for _ in range(self.num_frames)]
 
@@ -365,7 +366,9 @@ class TestOverlayCompositingWithChannels(unittest.TestCase):
     def test_overlay_always_renders_same_regardless_of_channel_selection(self):
         """Test overlay rendering is independent of channel selection."""
         # Create distinct overlay
-        overlay = create_simple_overlay(frames=self.num_frames, height=self.height, width=self.width)
+        overlay = create_simple_overlay(
+            frames=self.num_frames, height=self.height, width=self.width
+        )
 
         # Create frame with uniform gray value
         frame_data = np.ones((self.height, self.width, 3), dtype=np.uint8) * 128
@@ -534,7 +537,10 @@ class TestChannelOverlayEdgeCases(unittest.TestCase):
                 frame_data = np.ones((self.height, self.width), dtype=np.uint8) * 100
                 frames_data = [frame_data.copy() for _ in range(self.num_frames)]
             else:
-                frame_data = np.ones((self.height, self.width, num_channels), dtype=np.uint8) * 100
+                frame_data = (
+                    np.ones((self.height, self.width, num_channels), dtype=np.uint8)
+                    * 100
+                )
                 frames_data = [frame_data.copy() for _ in range(self.num_frames)]
 
             source = MockImageSequenceSource(
@@ -555,7 +561,9 @@ class TestChannelOverlayEdgeCases(unittest.TestCase):
             elif image.shape[2] != 3:
                 # Pad or trim to 3 channels
                 if image.shape[2] < 3:
-                    padding = np.zeros((self.height, self.width, 3 - image.shape[2]), dtype=np.uint8)
+                    padding = np.zeros(
+                        (self.height, self.width, 3 - image.shape[2]), dtype=np.uint8
+                    )
                     image = np.concatenate([image, padding], axis=2)
                 else:
                     image = image[:, :, :3]

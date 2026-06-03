@@ -178,8 +178,8 @@ class TestRenderOverlayFrameAlphaBlending(unittest.TestCase):
         # Create a colored image for testing
         image = np.ones((50, 50, 3), dtype=np.uint8) * 200
         image[:, :, 0] = 200  # Red channel
-        image[:, :, 1] = 0    # Green channel
-        image[:, :, 2] = 0    # Blue channel
+        image[:, :, 1] = 0  # Green channel
+        image[:, :, 2] = 0  # Blue channel
 
         overlay = Overlay([])
 
@@ -352,7 +352,7 @@ class TestRenderOverlayFrameEdgeCases(unittest.TestCase):
         image = np.zeros((100, 100, 3), dtype=np.uint8)
         image[:, :, 0] = 255  # Max red
         image[:, :, 1] = 128  # Mid green
-        image[:, :, 2] = 64   # Low blue
+        image[:, :, 2] = 64  # Low blue
         overlay = Overlay([])
 
         result = render_overlay_frame(image, overlay, 0)
@@ -401,7 +401,7 @@ class TestRenderOverlayFrameOutputValidation(unittest.TestCase):
 
         result = render_overlay_frame(image, overlay, 0)
 
-        self.assertTrue(result.flags['C_CONTIGUOUS'] or result.flags['F_CONTIGUOUS'])
+        self.assertTrue(result.flags["C_CONTIGUOUS"] or result.flags["F_CONTIGUOUS"])
 
 
 if __name__ == "__main__":

@@ -8,11 +8,10 @@ Tests simulate complete user workflows:
 """
 
 import unittest
-from unittest.mock import Mock, patch, MagicMock
 
 import numpy as np
 
-from acia.base import Contour, Instance, Overlay
+from acia.base import Contour, Overlay
 from acia.notebook import JupyterVisualizationMixin
 from acia.viz import render_overlay_frame
 
@@ -272,9 +271,9 @@ class TestE2EAdjustOpacityWithFrameChanges(unittest.TestCase):
     def test_e2e_opacity_with_render_overlay_frame(self):
         """Test opacity affects render_overlay_frame output."""
         frame = self.source.get_frame(0)
-        frame_overlays = list(self.source.overlay.time_iterator(
-            start_frame=0, end_frame=0
-        ))
+        frame_overlays = list(
+            self.source.overlay.time_iterator(start_frame=0, end_frame=0)
+        )
         frame_overlay = frame_overlays[0]
 
         # Test with different opacity values
@@ -282,9 +281,7 @@ class TestE2EAdjustOpacityWithFrameChanges(unittest.TestCase):
         results = []
 
         for opacity in opacity_values:
-            result = render_overlay_frame(
-                frame.raw, frame_overlay, 0, alpha=opacity
-            )
+            result = render_overlay_frame(frame.raw, frame_overlay, 0, alpha=opacity)
             results.append(result)
             # Verify output is valid
             self.assertIsNotNone(result)
@@ -343,13 +340,13 @@ class TestE2EChangeChannelsWithOverlay(unittest.TestCase):
 
         # Test different channel combinations
         channel_combinations = [
-            [True, True, True],    # All channels
+            [True, True, True],  # All channels
             [True, False, False],  # Channel 0 only
             [False, True, False],  # Channel 1 only
             [False, False, True],  # Channel 2 only
-            [True, True, False],   # Channels 0,1
-            [True, False, True],   # Channels 0,2
-            [False, True, True],   # Channels 1,2
+            [True, True, False],  # Channels 0,1
+            [True, False, True],  # Channels 0,2
+            [False, True, True],  # Channels 1,2
         ]
 
         for active_channels in channel_combinations:
@@ -397,9 +394,7 @@ class TestE2EChangeChannelsWithOverlay(unittest.TestCase):
             if sum(active_channels) == 1:
                 # Single channel: convert to RGB
                 channel_idx = active_channels.index(True)
-                composed = np.stack(
-                    [frame.get_channel(channel_idx)] * 3, axis=-1
-                )
+                composed = np.stack([frame.get_channel(channel_idx)] * 3, axis=-1)
             else:
                 # Multiple channels: stack selected ones
                 channels = [
@@ -581,16 +576,13 @@ class TestE2EEdgeCases(unittest.TestCase):
     def test_e2e_single_frame_source_with_overlay(self):
         """Test E2E flow with single-frame source."""
         overlay = create_overlay_with_multiple_frames(frames=1)
-        source = MockImageSequenceSource(
-            num_frames=1, num_channels=3, overlay=overlay
-        )
+        source = MockImageSequenceSource(num_frames=1, num_channels=3, overlay=overlay)
 
         # Navigate through single frame
         frame = source.get_frame(0)
         self.assertIsNotNone(frame.raw)
 
         # Toggle overlay
-        overlay_enabled = True
         frame_overlays = list(overlay.time_iterator(start_frame=0, end_frame=0))
         self.assertEqual(len(frame_overlays), 1)
 
@@ -615,9 +607,7 @@ class TestE2EEdgeCases(unittest.TestCase):
             ),
         ]
         overlay = Overlay(contours)
-        source = MockImageSequenceSource(
-            num_frames=3, num_channels=3, overlay=overlay
-        )
+        source = MockImageSequenceSource(num_frames=3, num_channels=3, overlay=overlay)
 
         overlay_enabled = True
 
@@ -628,9 +618,7 @@ class TestE2EEdgeCases(unittest.TestCase):
 
             if overlay_enabled and overlay:
                 frame_overlays = list(
-                    overlay.time_iterator(
-                        start_frame=frame_idx, end_frame=frame_idx
-                    )
+                    overlay.time_iterator(start_frame=frame_idx, end_frame=frame_idx)
                 )
                 self.assertEqual(len(frame_overlays), 1)
                 # Frame may be empty (no contours) but iterator returns it
@@ -639,9 +627,7 @@ class TestE2EEdgeCases(unittest.TestCase):
     def test_e2e_single_channel_image_with_overlay(self):
         """Test E2E flow with single-channel images."""
         overlay = create_overlay_with_multiple_frames(frames=3)
-        source = MockImageSequenceSource(
-            num_frames=3, num_channels=1, overlay=overlay
-        )
+        source = MockImageSequenceSource(num_frames=3, num_channels=1, overlay=overlay)
 
         overlay_enabled = True
 
@@ -653,9 +639,7 @@ class TestE2EEdgeCases(unittest.TestCase):
 
             if overlay_enabled and overlay:
                 frame_overlays = list(
-                    overlay.time_iterator(
-                        start_frame=frame_idx, end_frame=frame_idx
-                    )
+                    overlay.time_iterator(start_frame=frame_idx, end_frame=frame_idx)
                 )
                 # render_overlay_frame should handle single-channel by converting to RGB
                 result = render_overlay_frame(

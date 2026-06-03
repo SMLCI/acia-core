@@ -1,7 +1,7 @@
 """Unit tests for overlay widget creation and configuration in JupyterVisualizationMixin."""
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -23,13 +23,11 @@ class MockImageSequenceSource(JupyterVisualizationMixin):
         self.num_channels = num_channels
         self.overlay = overlay
         self._frames = []
-        for t in range(num_frames):
+        for _t in range(num_frames):
             # Create mock frame with raw data
             frame = Mock()
             frame.raw = np.zeros((100, 100, num_channels), dtype=np.uint8)
-            frame.get_channel = Mock(
-                return_value=np.zeros((100, 100), dtype=np.uint8)
-            )
+            frame.get_channel = Mock(return_value=np.zeros((100, 100), dtype=np.uint8))
             self._frames.append(frame)
 
     def get_frame(self, frame_idx):
@@ -45,7 +43,9 @@ class TestOverlayWidgetConfiguration(unittest.TestCase):
         # This test verifies the widget creation logic by checking the code paths
         # Create image source with overlay
         mock_overlay = Mock()
-        source = MockImageSequenceSource(num_frames=3, num_channels=3, overlay=mock_overlay)
+        source = MockImageSequenceSource(
+            num_frames=3, num_channels=3, overlay=mock_overlay
+        )
 
         # Verify overlay is set
         self.assertIsNotNone(source.overlay)

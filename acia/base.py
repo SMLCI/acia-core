@@ -538,7 +538,6 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
         for i in range(self.size_t):
             yield self.get_frame(i)
 
-
     def __len__(self) -> int:
         return self.size_t
 

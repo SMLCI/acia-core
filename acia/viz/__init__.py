@@ -1,14 +1,14 @@
-"""Module for general visualization functionality
-"""
+"""Module for general visualization functionality"""
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import numbers
-from collections import deque
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any
 
 import cv2
 import imageio.v2 as iio
@@ -87,7 +87,6 @@ def draw_scale_bar(
     xstart, ystart = xy_position
 
     for image in image_iterator:
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -187,7 +186,6 @@ def draw_time(
     font = ImageFont.truetype(font_path, font_size)
 
     for frame, image in enumerate(image_iterator):
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -414,7 +412,8 @@ def render_segmentation(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(imageSource, overlay.timeIterator()), desc="Render cell segmentation..."
+        zip(imageSource, overlay.timeIterator(), strict=False),
+        desc="Render cell segmentation...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -479,7 +478,8 @@ def render_cell_centers(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(image_source, overlay.timeIterator()), desc="Render cell centers..."
+        zip(image_source, overlay.timeIterator(), strict=False),
+        desc="Render cell centers...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -494,7 +494,6 @@ def render_cell_centers(
 
         # Draw overlay
         if frame_overlay:
-
             # compute all centers
             centers = [cont.center for cont in frame_overlay]
 
@@ -536,9 +535,10 @@ def render_tracking(
     contour_lookup = {cont.id: cont for cont in overlay}
 
     for image, frame_overlay in zip(
-        tqdm(image_source, desc="Render cell tracking paths..."), overlay.timeIterator()
+        tqdm(image_source, desc="Render cell tracking paths..."),
+        overlay.timeIterator(),
+        strict=False,
     ):
-
         np_image = np.copy(image.raw)
 
         if len(np_image.shape) == 2:
@@ -616,7 +616,6 @@ def render_video(
         filename, fps=framerate, codec=codec, ffmpeg_params=ffmpeg_params
     ) as writer:
         for im in tqdm(image_source, desc="Encoding video..."):
-
             image = im.raw
 
             if len(image.shape) == 2:
@@ -703,7 +702,6 @@ def render_scalebar(
     images = []
 
     for image in tqdm(image_source, desc="Render scale bar..."):
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -833,8 +831,9 @@ def render_time(
             )
         ystart = int(np.round(image_height * ystart))
 
-    for image, timepoint in zip(tqdm(image_source, desc="Render time..."), timepoints):
-
+    for image, timepoint in zip(
+        tqdm(image_source, desc="Render time..."), timepoints, strict=False
+    ):
         if isinstance(timepoint, pint.Quantity):
             timepoint = timedelta(seconds=float(timepoint.to(ureg.seconds).magnitude))
 
@@ -954,11 +953,9 @@ def get_mask(self, height, width, binary_mask=True) -> list[np.array]:
         if not binary_mask:
             label = i + 1
             if cont.label is not None:
-                try:
+                # could not convert label to integer -> keep the fallback label
+                with contextlib.suppress(ValueError):
                     label = int(cont.label)
-                except ValueError:
-                    # could not convert label to integer
-                    pass
 
             mask = mask.astype(np.uint16) * (label)  # convert into a non-binary mask
 
@@ -1053,7 +1050,9 @@ def render_segmentation_mask(
     return_images = []
 
     for im, ov in zip(
-        tqdm(source, desc="Render segmentation masks..."), overlay.time_iterator()
+        tqdm(source, desc="Render segmentation masks..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
         im = np.copy(im.raw)
 
@@ -1107,7 +1106,9 @@ def render_tracking_mask(
     color_lut[0] = (0, 0, 0)
 
     for im, ov in zip(
-        tqdm(source, desc="Render tracking mask..."), overlay.time_iterator()
+        tqdm(source, desc="Render tracking mask..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
         im = np.copy(im.raw)
 
@@ -1244,7 +1245,10 @@ def extract_lineage_plotdata(
         features = G.nodes[n]
         if features:
             maxk = max((len(str(k)) for k in features), default=1)
-            fmt = lambda k, v, maxk: f"{str(k).ljust(maxk)} : {v}<br>"
+
+            def fmt(k, v, maxk):
+                return f"{str(k).ljust(maxk)} : {v}<br>"
+
             feat_lines = "".join(fmt(k, v, maxk) for k, v in features.items())
             hover_html = f"<b>Node:</b> {n}<br><span style='font-family:monospace'>{feat_lines}</span>"
         else:
@@ -1373,7 +1377,7 @@ def plot_cell_lineage(
         fig = None
 
     # edges
-    for x, y in zip(data["edge_xs"], data["edge_ys"]):
+    for x, y in zip(data["edge_xs"], data["edge_ys"], strict=False):
         ax.plot(x, y, "-", color=line_color, lw=line_lw)
 
     # coloring
@@ -1447,7 +1451,9 @@ def plot_cell_lineage(
     )
 
     if show_label:
-        for x, y, label in zip(data["xs"], data["ys"], data["node_labels"]):
+        for x, y, label in zip(
+            data["xs"], data["ys"], data["node_labels"], strict=False
+        ):
             ax.text(x, y + 0.12, label, fontsize=7, ha="center", va="bottom")
 
     # births / ends
@@ -1555,7 +1561,7 @@ def plotly_cell_lineage(
     fig = go.Figure()
 
     # edges
-    for x, y in zip(data["edge_xs"], data["edge_ys"]):
+    for x, y in zip(data["edge_xs"], data["edge_ys"], strict=False):
         fig.add_trace(
             go.Scatter(
                 x=x,

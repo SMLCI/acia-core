@@ -215,9 +215,7 @@ class JupyterVisualizationMixin:
                     # Ensure image is in correct format for PIL
                     if len(image_data.shape) == 2:
                         # Grayscale - convert to RGB
-                        image_data = np.repeat(
-                            image_data[:, :, np.newaxis], 3, axis=-1
-                        )
+                        image_data = np.repeat(image_data[:, :, np.newaxis], 3, axis=-1)
 
                     # Convert to PIL Image
                     pil_image = Image.fromarray(image_data)

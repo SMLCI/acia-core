@@ -21,13 +21,11 @@ class MockImageSequenceSource:
         self.size_t = num_frames
         self.num_channels = num_channels
         self._frames = []
-        for t in range(num_frames):
+        for _t in range(num_frames):
             # Create mock frame with raw data
             frame = Mock()
             frame.raw = np.zeros((100, 100, num_channels), dtype=np.uint8)
-            frame.get_channel = Mock(
-                return_value=np.zeros((100, 100), dtype=np.uint8)
-            )
+            frame.get_channel = Mock(return_value=np.zeros((100, 100), dtype=np.uint8))
             self._frames.append(frame)
 
     def get_frame(self, frame_idx):
@@ -54,15 +52,13 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             )
         ]
         overlay = Overlay(contours)
 
         # Get overlay for frame 0
-        frame_overlays = list(
-            overlay.time_iterator(start_frame=0, end_frame=0)
-        )
+        frame_overlays = list(overlay.time_iterator(start_frame=0, end_frame=0))
 
         self.assertEqual(len(frame_overlays), 1)
         self.assertEqual(len(frame_overlays[0]), 1)
@@ -76,27 +72,25 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=1,
-                id=2
+                id=2,
             ),
             Contour(
                 coordinates=np.array([[50, 50], [60, 50], [60, 60]]),
                 score=1.0,
                 frame=2,
-                id=3
+                id=3,
             ),
         ]
         overlay = Overlay(contours)
 
         # Get overlays for frames 0-2
-        frame_overlays = list(
-            overlay.time_iterator(start_frame=0, end_frame=2)
-        )
+        frame_overlays = list(overlay.time_iterator(start_frame=0, end_frame=2))
 
         self.assertEqual(len(frame_overlays), 3)
         self.assertEqual(len(frame_overlays[0]), 1)  # Frame 0 has 1 contour
@@ -111,21 +105,19 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=2,
-                id=2
+                id=2,
             ),
         ]
         overlay = Overlay(contours)
 
         # Get overlays for frames 0-2
-        frame_overlays = list(
-            overlay.time_iterator(start_frame=0, end_frame=2)
-        )
+        frame_overlays = list(overlay.time_iterator(start_frame=0, end_frame=2))
 
         self.assertEqual(len(frame_overlays), 3)
         self.assertEqual(len(frame_overlays[0]), 1)  # Frame 0 has 1 contour
@@ -140,33 +132,31 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=1,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=1,
-                id=2
+                id=2,
             ),
             Contour(
                 coordinates=np.array([[50, 50], [60, 50], [60, 60]]),
                 score=1.0,
                 frame=3,
-                id=3
+                id=3,
             ),
             Contour(
                 coordinates=np.array([[70, 70], [80, 70], [80, 80]]),
                 score=1.0,
                 frame=3,
-                id=4
+                id=4,
             ),
         ]
         overlay = Overlay(contours)
 
         # Get overlays for frames 1-3
-        frame_overlays = list(
-            overlay.time_iterator(start_frame=1, end_frame=3)
-        )
+        frame_overlays = list(overlay.time_iterator(start_frame=1, end_frame=3))
 
         # Frame 1 should have 2 contours
         self.assertEqual(len(frame_overlays[0]), 2)
@@ -189,7 +179,7 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=i,
-                id=i+1
+                id=i + 1,
             )
             for i in range(self.num_frames)
         ]
@@ -215,25 +205,25 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=1,
-                id=2
+                id=2,
             ),
             Contour(
                 coordinates=np.array([[50, 50], [60, 50], [60, 60]]),
                 score=1.0,
                 frame=1,
-                id=3
+                id=3,
             ),
             Contour(
                 coordinates=np.array([[70, 70], [80, 70], [80, 80]]),
                 score=1.0,
                 frame=2,
-                id=4
+                id=4,
             ),
         ]
         overlay = Overlay(contours)
@@ -242,12 +232,17 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
         test_frames = [0, 1, 2, 1, 0]
         expected_contour_counts = [1, 2, 1, 2, 1]
 
-        for frame_idx, expected_count in zip(test_frames, expected_contour_counts):
+        for frame_idx, expected_count in zip(
+            test_frames, expected_contour_counts, strict=False
+        ):
             frame_overlay = next(
                 overlay.time_iterator(start_frame=frame_idx, end_frame=frame_idx)
             )
-            self.assertEqual(len(frame_overlay), expected_count,
-                           f"Frame {frame_idx} should have {expected_count} contours")
+            self.assertEqual(
+                len(frame_overlay),
+                expected_count,
+                f"Frame {frame_idx} should have {expected_count} contours",
+            )
 
     def test_overlay_empty_overlay(self):
         """Test handling of empty overlay (no contours)."""
@@ -255,9 +250,7 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
         overlay = Overlay([])
 
         # Get overlay for any frame
-        frame_overlay = next(
-            overlay.time_iterator(start_frame=0, end_frame=0)
-        )
+        frame_overlay = next(overlay.time_iterator(start_frame=0, end_frame=0))
 
         # Should return empty overlay
         self.assertEqual(len(frame_overlay), 0)
@@ -270,27 +263,25 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=3,
-                id=2
+                id=2,
             ),
             Contour(
                 coordinates=np.array([[50, 50], [60, 50], [60, 60]]),
                 score=1.0,
                 frame=5,
-                id=3
+                id=3,
             ),
         ]
         overlay = Overlay(contours)
 
         # Get overlays across the range
-        frame_overlays = list(
-            overlay.time_iterator(start_frame=0, end_frame=5)
-        )
+        frame_overlays = list(overlay.time_iterator(start_frame=0, end_frame=5))
 
         # Should have 6 frames (0-5)
         self.assertEqual(len(frame_overlays), 6)
@@ -311,28 +302,24 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=4,
-                id=2
+                id=2,
             ),
         ]
         overlay = Overlay(contours)
 
         # Get first frame
-        first_frame_overlay = next(
-            overlay.time_iterator(start_frame=0, end_frame=0)
-        )
+        first_frame_overlay = next(overlay.time_iterator(start_frame=0, end_frame=0))
         self.assertEqual(len(first_frame_overlay), 1)
         self.assertEqual(first_frame_overlay.contours[0].frame, 0)
 
         # Get last frame
-        last_frame_overlay = next(
-            overlay.time_iterator(start_frame=4, end_frame=4)
-        )
+        last_frame_overlay = next(overlay.time_iterator(start_frame=4, end_frame=4))
         self.assertEqual(len(last_frame_overlay), 1)
         self.assertEqual(last_frame_overlay.contours[0].frame, 4)
 
@@ -344,27 +331,25 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=2,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=2,
-                id=2
+                id=2,
             ),
             Contour(
                 coordinates=np.array([[50, 50], [60, 50], [60, 60]]),
                 score=1.0,
                 frame=2,
-                id=3
+                id=3,
             ),
         ]
         overlay = Overlay(contours)
 
         # Get frame 2
-        frame_overlay = next(
-            overlay.time_iterator(start_frame=2, end_frame=2)
-        )
+        frame_overlay = next(overlay.time_iterator(start_frame=2, end_frame=2))
 
         # Should have all 3 contours
         self.assertEqual(len(frame_overlay), 3)
@@ -378,17 +363,15 @@ class TestOverlayFrameSynchronization(unittest.TestCase):
             Contour(
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
-                frame=i*2,
-                id=i
+                frame=i * 2,
+                id=i,
             )
             for i in range(1, 4)
         ]
         overlay = Overlay(contours)
 
         # Iterate and verify frame values
-        frame_overlays = list(
-            overlay.time_iterator(start_frame=2, end_frame=6)
-        )
+        frame_overlays = list(overlay.time_iterator(start_frame=2, end_frame=6))
 
         # Collect all contours from iteration
         all_contours = []
@@ -411,19 +394,19 @@ class TestFrameSyncWithRenderCallback(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=1,
-                id=2
+                id=2,
             ),
             Contour(
                 coordinates=np.array([[50, 50], [60, 50], [60, 60]]),
                 score=1.0,
                 frame=2,
-                id=3
+                id=3,
             ),
         ]
         overlay = Overlay(contours)
@@ -447,21 +430,19 @@ class TestFrameSyncWithRenderCallback(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=0,
-                id=1
+                id=1,
             ),
             Contour(
                 coordinates=np.array([[30, 30], [40, 30], [40, 40]]),
                 score=1.0,
                 frame=2,
-                id=2
+                id=2,
             ),
         ]
         overlay = Overlay(contours)
 
         # Try to get overlay for frame 1 (no data)
-        frame_overlay = next(
-            overlay.time_iterator(start_frame=1, end_frame=1)
-        )
+        frame_overlay = next(overlay.time_iterator(start_frame=1, end_frame=1))
 
         # Should return empty overlay
         self.assertEqual(len(frame_overlay), 0)
@@ -486,7 +467,9 @@ class TestFrameSyncWithRenderCallback(unittest.TestCase):
         navigation_sequence = [0, 5, 2, 9, 1, 8, 3, 7, 4, 6]
         expected_counts = [1, 6, 3, 10, 2, 9, 4, 8, 5, 7]
 
-        for frame_idx, expected_count in zip(navigation_sequence, expected_counts):
+        for frame_idx, expected_count in zip(
+            navigation_sequence, expected_counts, strict=False
+        ):
             frame_overlay = next(
                 overlay.time_iterator(start_frame=frame_idx, end_frame=frame_idx)
             )
@@ -500,7 +483,7 @@ class TestFrameSyncWithRenderCallback(unittest.TestCase):
                 coordinates=np.array([[10, 10], [20, 10], [20, 20]]),
                 score=1.0,
                 frame=i % 3,
-                id=i
+                id=i,
             )
             for i in range(9)
         ]
