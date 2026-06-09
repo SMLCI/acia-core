@@ -7,8 +7,12 @@ import copy
 import logging
 import multiprocessing
 from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
+from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from acia.segm.local import THWCSequenceSource
 
 import cv2
 import numpy as np
@@ -757,6 +761,195 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
             key_list = key_list[:i] + [slice(None)] * fill + key_list[i + 1 :]
 
         return key_list[0], tuple(key_list[1:])
+
+    def crop_rotated(self, spec: RotatedCropSpec) -> RotatedCropSequenceSource:
+        """Return a lazy rotated-rectangle crop view of this source.
+
+        The crop is defined by a :class:`RotatedCropSpec` (center, size, angle).
+        Each frame is warped on demand so the resulting source stays lazy and the
+        parent's calibration (``pixel_size``/``timepoints``) is preserved.
+
+        Args:
+            spec: The rotated-rectangle crop specification.
+
+        Returns:
+            RotatedCropSequenceSource: A lazy straightened crop of this source.
+        """
+        return RotatedCropSequenceSource(self, spec)
+
+    def materialize(self) -> THWCSequenceSource:
+        """Eagerly freeze this (possibly lazy) source into an in-memory source.
+
+        Stacks every frame into a single ``(T, H, W, C)`` array, normalizing
+        grayscale ``(H, W)`` frames to ``(H, W, 1)``, and returns a
+        :class:`~acia.segm.local.THWCSequenceSource` carrying the same
+        ``pixel_size``/``timepoints``. This trades RAM for repeated warp/IO CPU
+        and lets a large parent be released once a small ROI has been extracted.
+
+        Returns:
+            THWCSequenceSource: An in-memory source independent of any parent.
+        """
+        from acia.segm.local import THWCSequenceSource
+
+        if self.size_t == 0:
+            raise ValueError("Cannot materialize an empty source (size_t == 0).")
+        arr = np.stack([np.asarray(self.get_frame(i).raw) for i in range(self.size_t)])
+        if arr.ndim == 3:  # (T, H, W) grayscale -> (T, H, W, 1)
+            arr = arr[..., None]
+        return THWCSequenceSource(
+            arr, timepoints=self.timepoints, pixel_size=self.pixel_size
+        )
+
+
+@dataclass(frozen=True)
+class RotatedCropSpec:
+    """Specification of a rotated-rectangle crop.
+
+    The crop is described in the parent image's pixel coordinate system. The
+    region is straightened (de-rotated) into an axis-aligned output of shape
+    ``(size[1], size[0])`` == ``(h, w)``.
+
+    Attributes:
+        center: Rectangle center as ``(x, y)`` in pixel coordinates.
+        size: Output size as ``(w, h)`` in pixels; both must be positive ints.
+        angle: Rotation angle in degrees, counter-clockwise, following the
+            OpenCV ``getRotationMatrix2D`` convention.
+    """
+
+    center: tuple[float, float]
+    size: tuple[int, int]
+    angle: float
+
+    def __post_init__(self) -> None:
+        w, h = self.size
+        for name, value in (("width", w), ("height", h)):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(
+                    f"RotatedCropSpec size {name} must be a positive integer, "
+                    f"got {value!r}"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a plain JSON-friendly dict representation.
+
+        Returns:
+            dict: ``{"center": [x, y], "size": [w, h], "angle": angle}``.
+        """
+        return {
+            "center": [float(self.center[0]), float(self.center[1])],
+            "size": [int(self.size[0]), int(self.size[1])],
+            "angle": float(self.angle),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RotatedCropSpec:
+        """Build a :class:`RotatedCropSpec` from a plain dict.
+
+        Args:
+            data: A mapping as produced by :meth:`to_dict`.
+
+        Returns:
+            RotatedCropSpec: The reconstructed spec.
+        """
+        cx, cy = data["center"]
+        w, h = data["size"]
+        return cls(
+            center=(float(cx), float(cy)),
+            size=(int(w), int(h)),
+            angle=float(data["angle"]),
+        )
+
+
+class RotatedCropSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
+    """A lazy rotated-rectangle crop view over a parent sequence.
+
+    Each frame is warped on demand via OpenCV so the rotated region is
+    straightened and centered into an axis-aligned ``(h, w)`` output. Pixel
+    spacing is unchanged by rotation and no frames are dropped, so ``pixel_size``
+    and ``timepoints`` pass through from the parent (own-wins-else-parent).
+
+    A rotated rectangle that extends past the image bounds is filled with a zero
+    border (no crash).
+
+    Note:
+        ``pixel_size`` pass-through is exact only for isotropic (square) pixels.
+        For an anisotropic ``[y, x]`` pixel size, a rotation that is not a
+        multiple of 90 degrees mixes the axes, so the reported pixel size is
+        approximate. Frames are interpolated with ``INTER_LINEAR``; this crops
+        intensity images, not label/mask images (linear interpolation would
+        blend label ids).
+    """
+
+    def __init__(self, parent: ImageSequenceSource, spec: RotatedCropSpec):
+        self.parent = parent
+        self.spec = spec
+
+    def _warp(self, raw: np.ndarray) -> np.ndarray:
+        cx, cy = self.spec.center
+        w, h = self.spec.size
+        M = cv2.getRotationMatrix2D((cx, cy), self.spec.angle, 1.0)
+        M[0, 2] += w / 2 - cx
+        M[1, 2] += h / 2 - cy
+
+        if raw.ndim == 2:
+            # grayscale (H, W): warpAffine handles directly
+            return cv2.warpAffine(raw, M, (w, h), flags=cv2.INTER_LINEAR)
+
+        if raw.shape[2] <= 4:
+            # up to 4 channels: warpAffine handles directly, but it collapses a
+            # trailing singleton channel -- restore the (H, W, C) axis so a
+            # (H, W, 1) parent does not silently become a 2D frame.
+            out = cv2.warpAffine(raw, M, (w, h), flags=cv2.INTER_LINEAR)
+            return out if out.ndim == 3 else out[..., None]
+
+        # cv2.warpAffine only supports <= 4 channels: warp per-channel and re-stack
+        channels = [
+            cv2.warpAffine(raw[..., c], M, (w, h), flags=cv2.INTER_LINEAR)
+            for c in range(raw.shape[2])
+        ]
+        return np.stack(channels, axis=-1)
+
+    def get_frame(self, frame: int) -> BaseImage:
+        idx = self._resolve_t_index(frame)
+        raw = np.asarray(self.parent.get_frame(idx).raw)
+        return ArrayImage(self._warp(raw), frame=idx)
+
+    @property
+    def size_t(self) -> int:
+        return self.parent.size_t
+
+    @property
+    def size_h(self) -> int:
+        return int(self.spec.size[1])
+
+    @property
+    def size_w(self) -> int:
+        return int(self.spec.size[0])
+
+    @property
+    def size_c(self) -> int:
+        return int(self.parent.size_c)
+
+    @property
+    def num_channels(self) -> int:
+        return int(self.parent.num_channels)
+
+    @property
+    def timepoints(self):
+        # an explicit calibration set on the view itself wins
+        if (
+            getattr(self, "_timepoints_raw", None) is not None
+            or getattr(self, "_frame_interval", None) is not None
+        ):
+            return super().timepoints
+        return self.parent.timepoints
+
+    @property
+    def pixel_size(self):
+        own = getattr(self, "_pixel_size", None)
+        if own is not None:
+            return own
+        return self.parent.pixel_size
 
 
 class SlicedSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
