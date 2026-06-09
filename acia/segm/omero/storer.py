@@ -445,6 +445,9 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource, JupyterVisualization
         colorList=None,
         range=None,
         conn=None,
+        frame_interval=None,
+        timepoints=None,
+        pixel_size=None,
     ):
         """
         imageId: id of the image sequence
@@ -456,6 +459,8 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource, JupyterVisualization
         z: focus plane
         imageQuality: quality of the rendered images (1.0=no compression, 0.0=super compression)
         base_channel: id of the phase contrast channel (visualized over all rgb channels)
+        frame_interval/timepoints: imaging time calibration (pint); see ImageSequenceSource.
+        pixel_size: pixel size (pint); defaults to the OMERO server metadata when omitted.
         """
 
         OmeroSource.__init__(
@@ -481,6 +486,7 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource, JupyterVisualization
         self.imageQuality = imageQuality
         self.colorList = colorList
         self.range = range
+        self._init_calibration(frame_interval, timepoints, pixel_size)
 
         if self.range is not None:
             # we make it a list
@@ -497,6 +503,13 @@ class OmeroSequenceSource(ImageSequenceSource, OmeroSource, JupyterVisualization
         assert len(self.channels) <= len(self.colorList), (
             f"you must specify a color for every channel! You have {len(self.channels)} channels ({self.channels}) but only {len(self.colorList)} color(s) ({self.colorList}). Please update your colorList!"
         )
+
+    @property
+    def pixel_size(self):
+        """User-set pixel size (pint), else the OMERO server metadata ``(x, y)``."""
+        if getattr(self, "_pixel_size", None) is not None:
+            return self._pixel_size
+        return OmeroSource.pixel_size.fget(self)
 
     def imageName(self) -> str:
         """
@@ -638,6 +651,13 @@ class OmeroRawSource(ImageSequenceSource, OmeroSource, JupyterVisualizationMixin
             channels = [0]
 
         self.channels = channels
+
+    @property
+    def pixel_size(self):
+        """User-set pixel size (pint), else the OMERO server metadata ``(x, y)``."""
+        if getattr(self, "_pixel_size", None) is not None:
+            return self._pixel_size
+        return OmeroSource.pixel_size.fget(self)
 
     def __len__(self):
         with self.make_connection() as conn:

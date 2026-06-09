@@ -17,6 +17,8 @@ from PIL import Image, ImageDraw
 from shapely.geometry import MultiPolygon, Polygon
 from tqdm.contrib.concurrent import process_map
 
+from acia.notebook import JupyterVisualizationMixin
+
 from .utils import mask_to_polygons, polygon_to_mask
 
 
@@ -49,6 +51,7 @@ class Instance:
         self.label = label
         self.id = id  # id is unique in an overlay
         self.score = score
+        self.time = None  # pint timestamp, set when the overlay carries a time model
 
         self._polygon = None
 
@@ -169,6 +172,7 @@ class Contour:
         self.frame = frame
         self.id = id
         self.label = label
+        self.time = None  # pint timestamp, set when the overlay carries a time model
 
     def _toMask(self, height: int, width: int) -> np.ndarray:
         """
@@ -247,7 +251,13 @@ class Contour:
 class Overlay:
     """Overlay contains Contours at different frames and provides functionalities iterate and modify them"""
 
-    def __init__(self, contours: Sequence[Contour | Instance], frames=None):
+    def __init__(
+        self,
+        contours: Sequence[Contour | Instance],
+        frames=None,
+        timepoints=None,
+        frame_interval=None,
+    ):
         self.contours: list[Contour | Instance] = list(contours)
         if frames is not None:
             frames = sorted(list(frames))
@@ -257,6 +267,11 @@ class Overlay:
             cont.id: cont for cont in self.contours
         }
 
+        self._timepoints = None
+        self._frame_interval = None
+        if timepoints is not None or frame_interval is not None:
+            self._set_time(timepoints=timepoints, frame_interval=frame_interval)
+
     def add_contour(self, contour: Contour | Instance):
         self.contours.append(contour)
         self.cont_lookup[contour.id] = contour
@@ -265,8 +280,35 @@ class Overlay:
         for cont in contours:
             self.add_contour(cont)
 
-    def __getitem__(self, id):
-        return self.cont_lookup[id]
+    def __getitem__(self, key):
+        """``overlay[id]`` -> contour by id; ``overlay[slice|list]`` -> temporal
+        sub-overlay (frames remapped to ``0..n-1``, time model carried)."""
+        if isinstance(key, slice | list | range | np.ndarray):
+            return self._slice_frames(key)
+        return self.cont_lookup[key]
+
+    def _slice_frames(self, key) -> Overlay:
+        all_frames = sorted(self.frames())
+        if isinstance(key, slice):
+            selected = list(np.array(all_frames)[key])
+        else:
+            selected = [all_frames[int(i)] for i in key]
+
+        selected_set = set(selected)
+        frame_map = {old: new for new, old in enumerate(selected)}
+
+        new_contours = []
+        for cont in self.contours:
+            if cont.frame in selected_set:
+                new_cont = copy.deepcopy(cont)
+                new_cont.frame = frame_map[cont.frame]
+                new_contours.append(new_cont)
+
+        sub = Overlay(new_contours, frames=list(range(len(selected))))
+        tp = self.timepoints
+        if tp is not None and len(selected) > 0:
+            sub = sub.with_timepoints(tp[selected])
+        return sub
 
     def __iter__(self):
         return iter(self.contours)
@@ -286,6 +328,53 @@ class Overlay:
             return self.__frames
         else:
             return np.unique([c.frame for c in self.contours])
+
+    # --- time model (pint), so detections carry timestamps ---
+
+    def _frame_extent(self) -> int:
+        fr = self.frames()
+        return int(np.max(fr)) + 1 if len(fr) else 0
+
+    @property
+    def timepoints(self):
+        """Per-frame pint ``Quantity`` of timepoints, or ``None`` if uncalibrated."""
+        from acia.timing import resolve_timepoints
+
+        if self._timepoints is not None:
+            return self._timepoints
+        if self._frame_interval is not None:
+            return resolve_timepoints(
+                self._frame_extent(), frame_interval=self._frame_interval
+            )
+        return None
+
+    @property
+    def timestamps(self):
+        """Pint ``Quantity`` of per-contour timestamps (in ``contours`` order)."""
+        tp = self.timepoints
+        if tp is None:
+            return None
+        return tp[[c.frame for c in self.contours]]
+
+    def _set_time(self, *, timepoints=None, frame_interval=None) -> Overlay:
+        from acia.timing import to_quantity
+
+        self._timepoints = timepoints
+        self._frame_interval = to_quantity(frame_interval)
+        tp = self.timepoints
+        if tp is not None:
+            for cont in self.contours:
+                if 0 <= cont.frame < len(tp):
+                    cont.time = tp[cont.frame]
+        return self
+
+    def with_timepoints(self, timepoints) -> Overlay:
+        """Attach explicit per-frame timepoints (pint) and stamp each detection."""
+        return self._set_time(timepoints=timepoints)
+
+    def with_frame_interval(self, interval) -> Overlay:
+        """Attach a scalar frame interval (pint) and stamp each detection."""
+        return self._set_time(frame_interval=interval)
 
     def scale(self, scale: float):
         """Scale the contour with the specified scale factor
@@ -504,12 +593,46 @@ class BaseImage:
         raise NotImplementedError()
 
 
+class ArrayImage(BaseImage):
+    """A `BaseImage` backed directly by a numpy array (e.g. a cropped frame)."""
+
+    def __init__(self, content: np.ndarray, frame: int | None = None):
+        self.content = content
+        self.frame = frame
+
+    @property
+    def raw(self):
+        return self.content
+
+    @property
+    def num_channels(self):
+        if len(self.raw.shape) == 2:
+            return 1
+        return self.raw.shape[-1]
+
+    def get_channel(self, channel: int):
+        assert channel < self.num_channels
+        if self.num_channels == 1 and len(self.raw.shape) == 2:
+            return self.raw
+        return self.raw[..., channel]
+
+    def __getitem__(self, item):
+        return self.raw[item]
+
+
 class Processor:
     """Base class for a processor"""
 
 
 class ImageSequenceSource(Iterable[BaseImage], Sized):
-    """Base class for an image sequence source (e.g. Tiff, OMERO, png, ...)"""
+    """Base class for an image sequence source (e.g. Tiff, OMERO, png, ...).
+
+    Supports numpy-style indexing over the (T, H, W, C) axes:
+
+    * ``src[5]`` -> the frame at index 5 (a :class:`BaseImage`)
+    * ``src[::2]`` -> a view sequence of every second frame
+    * ``src[3:23, 10:90, 10:90, 0]`` -> a cropped, single-channel subsequence
+    """
 
     @property
     def num_channels(self) -> int:
@@ -540,6 +663,188 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
 
     def __len__(self) -> int:
         return self.size_t
+
+    def __getitem__(self, key):
+        """numpy-style indexing over (T, H, W, C). See class docstring."""
+        t_key, spatial = self._split_index(key)
+
+        if isinstance(t_key, int | np.integer):
+            idx = self._resolve_t_index(int(t_key))
+            frame = self.get_frame(idx)
+            if spatial:
+                return ArrayImage(frame.raw[spatial], frame=idx)
+            return frame
+
+        if isinstance(t_key, slice):
+            t_indices = list(range(*t_key.indices(self.size_t)))
+        else:
+            # fancy indexing: a list/array of frame indices
+            t_indices = [self._resolve_t_index(int(i)) for i in t_key]
+
+        return SlicedSequenceSource(self, t_indices, spatial)
+
+    def _resolve_t_index(self, idx: int) -> int:
+        n = self.size_t
+        if idx < 0:
+            idx += n
+        if not 0 <= idx < n:
+            raise IndexError(f"frame index {idx} out of range for size_t={n}")
+        return idx
+
+    # --- physical calibration (time + space), all optional and in pint units ---
+
+    @property
+    def timepoints(self):
+        """Per-frame pint ``Quantity`` of timepoints, or ``None`` if uncalibrated."""
+        from acia.timing import resolve_timepoints
+
+        return resolve_timepoints(
+            self.size_t,
+            timepoints=getattr(self, "_timepoints_raw", None),
+            frame_interval=getattr(self, "_frame_interval", None),
+        )
+
+    @property
+    def pixel_size(self):
+        """Pint length per pixel (scalar or ``[y, x]``), or ``None``."""
+        return getattr(self, "_pixel_size", None)
+
+    def with_frame_interval(self, interval):
+        """Tag this source with a scalar frame interval (pint); returns self."""
+        from acia.timing import to_quantity
+
+        self._frame_interval = to_quantity(interval)
+        self._timepoints_raw = None
+        return self
+
+    def with_timepoints(self, timepoints):
+        """Tag this source with explicit per-frame timepoints (pint); returns self."""
+        self._timepoints_raw = timepoints
+        self._frame_interval = None
+        return self
+
+    def with_pixel_size(self, pixel_size):
+        """Tag this source with a pixel size (pint length per pixel); returns self."""
+        from acia.timing import to_quantity
+
+        self._pixel_size = to_quantity(pixel_size)
+        return self
+
+    def _init_calibration(self, frame_interval=None, timepoints=None, pixel_size=None):
+        """Store load-time calibration (called from concrete source constructors)."""
+        from acia.timing import to_quantity
+
+        self._frame_interval = to_quantity(frame_interval)
+        self._timepoints_raw = timepoints
+        self._pixel_size = to_quantity(pixel_size)
+
+    def _split_index(self, key) -> tuple[Any, tuple]:
+        """Split an index into the temporal key and the trailing spatial key.
+
+        Expands a single ``Ellipsis`` against the frame dimensionality so that
+        e.g. ``src[..., 0]`` selects channel 0 across all frames.
+        """
+        if not isinstance(key, tuple):
+            return key, ()
+
+        key_list = list(key)
+        if Ellipsis in key_list:
+            frame_ndim = self.get_frame(0).raw.ndim
+            total = 1 + frame_ndim  # T + frame axes
+            n_explicit = len(key_list) - 1  # all entries except the Ellipsis
+            fill = max(total - n_explicit, 0)
+            i = key_list.index(Ellipsis)
+            key_list = key_list[:i] + [slice(None)] * fill + key_list[i + 1 :]
+
+        return key_list[0], tuple(key_list[1:])
+
+
+class SlicedSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
+    """A lazy view over a parent sequence selecting frames and cropping each.
+
+    Holds the parent source, a list of original frame indices and a trailing
+    spatial/channel key applied to every frame's array. Re-slicing nests another
+    view, so composition is automatic.
+    """
+
+    def __init__(
+        self,
+        parent: ImageSequenceSource,
+        t_indices: Sequence[int],
+        spatial: tuple = (),
+    ):
+        self.parent = parent
+        self.t_indices = list(t_indices)
+        self.spatial = spatial
+        self._shape: tuple | None = None
+
+    def get_frame(self, frame: int) -> BaseImage:
+        idx = self.t_indices[frame]
+        frame_obj = self.parent.get_frame(idx)
+        if self.spatial:
+            return ArrayImage(frame_obj.raw[self.spatial], frame=frame)
+        return frame_obj
+
+    @property
+    def size_t(self) -> int:
+        return len(self.t_indices)
+
+    def _frame_shape(self) -> tuple:
+        if self._shape is None:
+            self._shape = tuple(self.get_frame(0).raw.shape)
+        return self._shape
+
+    @property
+    def size_h(self) -> int:
+        return int(self._frame_shape()[0])
+
+    @property
+    def size_w(self) -> int:
+        return int(self._frame_shape()[1])
+
+    @property
+    def size_c(self) -> int:
+        shape = self._frame_shape()
+        return int(shape[2]) if len(shape) > 2 else 1
+
+    @property
+    def num_channels(self) -> int:
+        return int(self.get_frame(0).num_channels)
+
+    def _axis_step(self, axis: int) -> int:
+        """Step of the spatial indexer for a frame axis (0=H, 1=W); 1 if none."""
+        if axis < len(self.spatial) and isinstance(self.spatial[axis], slice):
+            return self.spatial[axis].step or 1
+        return 1
+
+    @property
+    def timepoints(self):
+        # an explicit calibration set on the view itself wins
+        if (
+            getattr(self, "_timepoints_raw", None) is not None
+            or getattr(self, "_frame_interval", None) is not None
+        ):
+            return super().timepoints
+        parent_tp = self.parent.timepoints
+        if parent_tp is None:
+            return None
+        return parent_tp[self.t_indices]
+
+    @property
+    def pixel_size(self):
+        own = getattr(self, "_pixel_size", None)
+        if own is not None:
+            return own
+        base = self.parent.pixel_size
+        if base is None:
+            return None
+        h_step, w_step = self._axis_step(0), self._axis_step(1)
+        if h_step == 1 and w_step == 1:
+            return base  # crop keeps the pixel size
+        if h_step == w_step:
+            return base * h_step
+        # anisotropic after differing spatial steps -> [y, x]
+        return base * np.array([h_step, w_step])
 
 
 class RoISource(Iterable[Overlay], Sized):

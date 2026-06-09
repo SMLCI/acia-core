@@ -20,6 +20,12 @@ section to a dated version entry automatically.
 - Unit-aware property-extractor tables via pint-pandas:
   `ExtractorExecutor.execute(units="none"|"header"|"pint")` plus
   `attach_units` / `strip_units` / `units_in_header` converters.
+- numpy-style `(T, H, W, C)` indexing on image sequence sources
+  (`src[::2, 100:200, 50:150, 0]`, composable lazy views) and temporal slicing of
+  overlays (`overlay[:20]`).
+- pint calibration defined at load: `pixel_size` and `frame_interval`/`timepoints`
+  flow through slices, into overlays (per-detection `contour.time`) and are pulled
+  automatically by the extractors (explicit `input_unit` still overrides).
 
 ### Changed
 - Migrated CI/CD to GitHub Actions with automated, OIDC-based PyPI releases and

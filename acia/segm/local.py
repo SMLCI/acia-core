@@ -172,8 +172,11 @@ class LocalImageSource(ImageSequenceSource, JupyterVisualizationMixin):
 class InMemorySequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
     """Image sequence for an in memory image stack"""
 
-    def __init__(self, image_stack):
+    def __init__(
+        self, image_stack, frame_interval=None, timepoints=None, pixel_size=None
+    ):
         self.image_stack = image_stack
+        self._init_calibration(frame_interval, timepoints, pixel_size)
 
     def get_frame(self, frame: int) -> BaseImage:
         assert frame < len(self.image_stack)
@@ -199,8 +202,15 @@ class InMemorySequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
 class THWCSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
     """Image sequence for an in memory image stack [TxHxWxC]"""
 
-    def __init__(self, image_stack: np.ndarray):
+    def __init__(
+        self,
+        image_stack: np.ndarray,
+        frame_interval=None,
+        timepoints=None,
+        pixel_size=None,
+    ):
         self.image_stack = image_stack
+        self._init_calibration(frame_interval, timepoints, pixel_size)
 
         if len(self.image_stack.shape) != 4:
             raise ValueError(
@@ -319,6 +329,9 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         luts=None,
         channel_index: int = 0,
         storage_options: dict | None = None,
+        frame_interval=None,
+        timepoints=None,
+        pixel_size=None,
     ):
         """Create a new local image source
 
@@ -331,12 +344,18 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
             storage_options (dict, optional): extra fsspec storage options (e.g.
                 credentials) for remote URLs. Merged on top of any matching entry
                 in the acia credentials config (see :mod:`acia.config`).
+            frame_interval: scalar time between frames (pint Quantity or str like
+                ``"15 minute"``) defining the imaging interval at load.
+            timepoints: explicit per-frame timepoints (pint Quantity array).
+            pixel_size: physical pixel size (pint length per pixel) for spatial
+                calibration; extractors pull this for their units.
         """
         self.filename = tif_file
         self.normalize_image = normalize_image
         self.luts = luts
         self.channel_index = channel_index
         self.storage_options = storage_options
+        self._init_calibration(frame_interval, timepoints, pixel_size)
 
     def _read_images(self):
         """Read the image stack via fsspec (works for local and remote URLs)."""
@@ -389,26 +408,11 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         return int(self.get_frame(0).num_channels)
 
     def slice(self, start, end):
-        images = self._read_images()
+        """Return a view over frames [start:end).
 
-        for image in images[start:end]:
-            # normalize image space
-            if self.normalize_image:
-                min_val = np.min(image)
-                max_val = np.max(image)
-                image = np.floor((image - min_val) / (max_val - min_val) * 255).astype(
-                    np.uint8
-                )
-
-            if len(image.shape) > 2:
-                # select only the first channel
-                image = image[0]
-
-            if len(image.shape) == 2:
-                # make it artificially rgb
-                image = np.repeat(image[:, :, None], 3, axis=-1)
-
-            yield LocalImage(image)
+        Kept for backward compatibility; equivalent to ``self[start:end]``.
+        """
+        return self[start:end]
 
 
 class SambaSequenceSource(LocalSequenceSource):

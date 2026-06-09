@@ -59,6 +59,30 @@ class PropertyExtractor:
         # test the conversion here
         self.output_unit.is_compatible_with(self.input_unit)
 
+        # remember the configured units so auto-calibration can fall back to them
+        self._default_input_unit = self.input_unit
+        self._default_output_unit = self.output_unit
+
+    #: spatial dimensionality for pixel-size auto-calibration (1=length, 2=area)
+    _dim: int | None = None
+
+    def _calibrate(self, images: ImageSequenceSource):
+        """When in auto mode, derive the spatial ``input_unit`` from the source's
+        ``pixel_size``; otherwise keep the explicitly configured units."""
+        if not getattr(self, "_auto_unit", False) or self._dim is None:
+            return
+
+        from acia.timing import pixel_input_unit
+
+        iu = pixel_input_unit(getattr(images, "pixel_size", None), self._dim)
+        if iu is not None:
+            self.input_unit = iu
+            self.output_unit = iu.units
+        else:
+            # no source calibration -> use the configured defaults
+            self.input_unit = self._default_input_unit
+            self.output_unit = self._default_output_unit
+
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         """Extract the desired properties for a single contour
 
@@ -167,16 +191,23 @@ class ExtractorExecutor:
 class AreaEx(PropertyExtractor):
     """Extract area for every contour"""
 
+    _dim = 2
+
     def __init__(
         self,
-        input_unit: UnitLike | None = DEFAULT_UNIT_AREA,
-        output_unit: UnitLike | None = DEFAULT_UNIT_AREA,
+        input_unit: UnitLike | None = None,
+        output_unit: UnitLike | None = None,
     ):
+        self._auto_unit = input_unit is None
         PropertyExtractor.__init__(
-            self, "area", input_unit=input_unit, output_unit=output_unit
+            self,
+            "area",
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_AREA,
+            output_unit=output_unit if output_unit is not None else DEFAULT_UNIT_AREA,
         )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
+        self._calibrate(images)
         data = []
         for cont in overlay:
             data.append({"id": cont.id, self.name: self.convert(cont.area)})
@@ -189,16 +220,23 @@ class AreaEx(PropertyExtractor):
 class PerimeterEx(PropertyExtractor):
     """Extract area for every contour"""
 
+    _dim = 1
+
     def __init__(
         self,
-        input_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
-        output_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
+        input_unit: UnitLike | None = None,
+        output_unit: UnitLike | None = None,
     ):
+        self._auto_unit = input_unit is None
         PropertyExtractor.__init__(
-            self, "perimeter", input_unit=input_unit, output_unit=output_unit
+            self,
+            "perimeter",
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_LENGTH,
+            output_unit=output_unit if output_unit is not None else DEFAULT_UNIT_LENGTH,
         )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
+        self._calibrate(images)
         data = []
         for cont in overlay:
             # extract the length of the polygon
@@ -236,16 +274,23 @@ class CircularityEx(PropertyExtractor):
 class LengthEx(PropertyExtractor):
     """Extracts width of cells based on the shorter edge of a minimum rotated bbox approximation"""
 
+    _dim = 1
+
     def __init__(
         self,
-        input_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
-        output_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
+        input_unit: UnitLike | None = None,
+        output_unit: UnitLike | None = None,
     ):
+        self._auto_unit = input_unit is None
         PropertyExtractor.__init__(
-            self, "length", input_unit=input_unit, output_unit=output_unit
+            self,
+            "length",
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_LENGTH,
+            output_unit=output_unit if output_unit is not None else DEFAULT_UNIT_LENGTH,
         )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
+        self._calibrate(images)
         lengths = []
         for cont in overlay:
             lengths.append(
@@ -271,17 +316,24 @@ class LengthEx(PropertyExtractor):
 class WidthEx(PropertyExtractor):
     """Extracts width of cells based on the shorter edge of a minimum rotated bbox approximation"""
 
+    _dim = 1
+
     def __init__(
         self,
-        input_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
-        output_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
+        input_unit: UnitLike | None = None,
+        output_unit: UnitLike | None = None,
     ):
+        self._auto_unit = input_unit is None
         PropertyExtractor.__init__(
-            self, "width", input_unit=input_unit, output_unit=output_unit
+            self,
+            "width",
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_LENGTH,
+            output_unit=output_unit if output_unit is not None else DEFAULT_UNIT_LENGTH,
         )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         """Extract width information for all contours"""
+        self._calibrate(images)
         widths = []
         for cont in overlay:
             widths.append(
@@ -309,23 +361,27 @@ class WidthEx(PropertyExtractor):
 class LengthWidthEx(PropertyExtractor):
     """Extracts length and width of cells based on the shorter edge of a minimum rotated bbox approximation"""
 
+    _dim = 1
+
     def __init__(
         self,
         prefix="",
-        input_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
-        output_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
+        input_unit: UnitLike | None = None,
+        output_unit: UnitLike | None = None,
     ):
         self.prefix = prefix
+        self._auto_unit = input_unit is None
 
         PropertyExtractor.__init__(
             self,
             f"{prefix}length-width",
-            input_unit=input_unit,
-            output_unit=output_unit,
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_LENGTH,
+            output_unit=output_unit if output_unit is not None else DEFAULT_UNIT_LENGTH,
         )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         """Extract length and width information for all contours"""
+        self._calibrate(images)
         widths = []
         lengths = []
         for cont in overlay:
@@ -421,29 +477,45 @@ class LabelEx(PropertyExtractor):
 
 
 class TimeEx(PropertyExtractor):
-    """Extract time information for every contour"""
+    """Extract time information for every contour.
 
-    def __init__(self, input_unit: UnitLike, output_unit: UnitLike | None = "hour"):
-        super().__init__("time", input_unit, output_unit)
+    If no ``input_unit`` is given, the per-frame timepoints are taken from the
+    image source (or the overlay) calibration -- so a source loaded with a
+    ``frame_interval`` (or sliced) yields correct, automatically-updated times.
+    Passing ``input_unit`` keeps the legacy ``frame * interval`` behavior.
+    """
+
+    def __init__(
+        self, input_unit: UnitLike | None = None, output_unit: UnitLike | None = "hour"
+    ):
+        self._auto_unit = input_unit is None
+        super().__init__(
+            "time", input_unit if input_unit is not None else "second", output_unit
+        )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
-        times = []
-        ids = []
-        for id, row in df.iterrows():
-            times.append(self.convert(row["frame"]))
-            ids.append(id)
-
         local_df = df.copy()
-        # convert frame to time
-        local_df[self.name] = local_df["frame"].apply(self.convert)
 
-        local_df = local_df[
-            [
-                self.name,
-            ]
-        ]
+        if not self._auto_unit:
+            # explicit input_unit -> legacy frame * interval
+            local_df[self.name] = local_df["frame"].apply(self.convert)
+            return local_df[[self.name]], {self.name: self.output_unit}
 
-        return local_df, {self.name: self.output_unit}
+        # auto: pull per-frame timepoints from the source, then the overlay
+        timepoints = getattr(images, "timepoints", None)
+        if timepoints is None:
+            timepoints = getattr(overlay, "timepoints", None)
+        if timepoints is None:
+            raise ValueError(
+                "TimeEx(): no time information available. Pass input_unit=..., or "
+                "set a frame_interval/timepoints on the image source or overlay."
+            )
+
+        out_unit = str(self.output_unit)
+        local_df[self.name] = local_df["frame"].apply(
+            lambda f: float(timepoints[int(f)].to(out_unit).magnitude)
+        )
+        return local_df[[self.name]], {self.name: self.output_unit}
 
 
 class DynamicTimeEx(PropertyExtractor):
@@ -505,14 +577,22 @@ class DynamicTimeEx(PropertyExtractor):
 class PositionEx(PropertyExtractor):
     """Extract cell center information from image RoI detections"""
 
+    _dim = 1
+
     def __init__(
         self,
-        input_unit: UnitLike,
+        input_unit: UnitLike | None = None,
         output_unit: UnitLike | None = DEFAULT_UNIT_LENGTH,
     ):
-        super().__init__("position", input_unit=input_unit, output_unit=output_unit)
+        self._auto_unit = input_unit is None
+        super().__init__(
+            "position",
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_LENGTH,
+            output_unit=output_unit,
+        )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
+        self._calibrate(images)
         positions_x = []
         positions_y = []
         ids = []

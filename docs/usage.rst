@@ -152,14 +152,25 @@ The property extractors compute numeric values together with a physical unit per
 column. :meth:`acia.analysis.ExtractorExecutor.execute` lets you pick how those
 units appear in the returned DataFrame via ``units=``:
 
-=============  ====================================  ===============  ===========================
-mode           columns                               unit-safe math?  use for
-=============  ====================================  ===============  ===========================
-``"none"``     plain floats (unit map in            no               fast value access, plotting,
-(default)      ``df.attrs["units"]``)                                 existing code
-``"header"``   floats; unit as a column-index level  no               CSV export, readable tables
-``"pint"``     ``pint[...]`` extension dtype          **yes**          unit-correct computation
-=============  ====================================  ===============  ===========================
+.. list-table::
+   :header-rows: 1
+
+   * - mode
+     - columns
+     - unit-safe math?
+     - use for
+   * - ``"none"`` (default)
+     - plain floats (unit map in ``df.attrs["units"]``)
+     - no
+     - fast value access, plotting, existing code
+   * - ``"header"``
+     - floats; unit as a column-index level
+     - no
+     - CSV export, readable tables
+   * - ``"pint"``
+     - ``pint[...]`` extension dtype
+     - **yes**
+     - unit-correct computation
 
 Only ``"pint"`` is **unit-safe**: arithmetic propagates units and raises on
 dimensional mismatch. The ``"header"`` form and the ``df.attrs`` map are *inert*
@@ -195,3 +206,85 @@ dead end::
     q = attach_units(df)            # floats (+ df.attrs) -> pint dtype
     floats, units = strip_units(q)  # pint dtype -> floats + {col: unit}
     q = from_header(h)              # header form -> pint dtype
+
+
+Slicing & calibration (pixel size & frame interval)
+===================================================
+
+Image sequences support **numpy-style indexing** over the ``(T, H, W, C)`` axes,
+implemented once on :class:`acia.base.ImageSequenceSource` so every source
+(local, in-memory, THWC, OMERO, SMB) gets it::
+
+    src[5]                      # the frame at index 5 (a BaseImage)
+    src[::2]                    # a view: every second frame
+    src[3:23]                   # a view: frames 3..22
+    src[:, 100:200, 50:150]     # spatial crop (all frames)
+    src[..., 0]                 # select channel 0 across all frames
+    src[::2, 100:200, 50:150, 0]  # subsample + crop + channel, composed
+
+An integer on the ``T`` axis returns that frame; a slice/list returns a lazy view
+sequence. Views compose (``src[::2][1:]``) and never copy pixel data eagerly.
+
+Physical calibration
+--------------------
+
+Define the **imaging interval** and **pixel size** in pint units once, at load.
+They become metadata on the source and flow through slices and into extractors::
+
+    from acia import ureg
+    from acia.segm.local import LocalSequenceSource
+
+    src = LocalSequenceSource(
+        "exp.tif",
+        pixel_size=0.065 * ureg.micrometer,   # space
+        frame_interval=10 * ureg.minute,      # time
+    )
+
+    src.timepoints          # [0, 10, 20, ...] minute  (per frame)
+    src.pixel_size          # 0.065 micrometer
+
+Slicing transforms the calibration automatically:
+
+* temporal subsampling scales the interval -- ``src[::2].timepoints`` is
+  ``[0, 20, 40, ...]`` minute;
+* a spatial **crop** keeps ``pixel_size``; a uniform spatial **step** scales it --
+  ``src[:, ::2, ::2].pixel_size`` is ``0.13 micrometer``.
+
+You can also tag an existing source/overlay fluently:
+``src.with_frame_interval("10 minute")``, ``src.with_timepoints(...)``,
+``src.with_pixel_size(0.065 * ureg.micrometer)``.
+
+Overlays and detection timestamps
+--------------------------------
+
+Overlays support **temporal slicing** with slices/lists (``overlay[:20]`` cuts
+after 20 frames; ``overlay[::2]`` subsamples), remapping frames to ``0..n-1``.
+Indexing by a single id is unchanged (``overlay[contour_id]``). When an overlay
+carries a time model, every detection gets a pint timestamp::
+
+    overlay = overlay.with_frame_interval(10 * ureg.minute)
+    overlay[:20]                 # first 20 frames, frames remapped
+    overlay.timestamps          # pint array, one per contour
+    contour.time                # pint Quantity for a single detection
+
+Extractors pull the calibration
+------------------------------
+
+Spatial extractors derive their unit from ``images.pixel_size`` and the time
+extractor reads ``images.timepoints`` (or the overlay's), so the common case
+needs no per-extractor units::
+
+    from acia.analysis import ExtractorExecutor, FrameEx, AreaEx, TimeEx
+
+    df = ExtractorExecutor().execute(src, src, extractors=[
+        FrameEx(), AreaEx(), TimeEx(),     # no input_unit needed
+    ])
+
+Precedence is **explicit ``input_unit`` > source calibration > default**, so the
+classic style keeps working and overrides the source::
+
+    AreaEx(input_unit=(0.065 * ureg.micrometer) ** 2)   # explicit wins
+    TimeEx(input_unit="10 * minute")                    # legacy frame * interval
+
+See also the "Units in the extracted tables" section above for how the resulting
+DataFrame can expose those units (``units="none" | "header" | "pint"``).
