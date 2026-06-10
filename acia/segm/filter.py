@@ -1,6 +1,9 @@
 """Filters for segmentating overlay objects"""
 
+from __future__ import annotations
+
 from functools import partial
+from typing import TYPE_CHECKING, cast
 
 import cv2
 import numpy as np
@@ -11,7 +14,11 @@ from rtree import index
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
 
-from acia.base import Overlay
+from acia import Q_
+from acia.base import Contour, ImageSequenceSource, Overlay
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def bbox_to_rectangle(bbox: tuple[float, float, float, float]):
@@ -178,3 +185,302 @@ class EllipsoidFilter:
                 result_overlay.add_contour(cont)
 
         return result_overlay
+
+
+def _rotated_rect_coords(polygon) -> np.ndarray | None:
+    """Min-rotated-rectangle vertices of ``polygon``; ``None`` if degenerate.
+
+    A degenerate (``None``, empty, zero-area, or collinear) polygon has a
+    ``minimum_rotated_rectangle`` that collapses to a ``LineString``/``Point``
+    with no ``exterior``. Callers treat ``None`` as a 0 measurement so junk
+    contours are dropped rather than crashing the whole filtering run.
+    """
+    if polygon is None or polygon.is_empty:
+        return None
+    mrr = polygon.minimum_rotated_rectangle
+    exterior = getattr(mrr, "exterior", None)
+    if exterior is None:
+        return None
+    return np.array(exterior.coords)
+
+
+class CellFilter:
+    """Pluggable, physical-unit cell filter for an :class:`~acia.base.Overlay`.
+
+    A ``CellFilter`` keeps contours whose backing property (its calibrated
+    :meth:`value`) falls within a ``(vmin, vmax)`` range. The range bounds are
+    pint ``Quantity`` objects in *physical* units (e.g. ``Q_(2, "um**2")``) so
+    the same filter stays valid across cameras with different ``pixel_size`` --
+    the per-contour :meth:`value` is calibrated from the source ``pixel_size``,
+    not measured in raw pixels.
+
+    Mirrors :class:`~acia.analysis.PropertyExtractor`: adding a new filter is a
+    single small subclass that sets ``name`` and overrides :meth:`value`; there
+    is no central registry. Instances are simply passed in a list to
+    :func:`apply_cell_filters`.
+
+    Attributes:
+        name: short identifier for the backing property (e.g. ``"area"``).
+        vmin: inclusive lower bound (pint ``Quantity`` / number), or ``None``
+            for an open lower bound.
+        vmax: inclusive upper bound (pint ``Quantity`` / number), or ``None``
+            for an open upper bound.
+    """
+
+    #: short identifier for the backing property; overridden by subclasses.
+    name: str = "cell"
+
+    def __init__(
+        self,
+        vmin: Q_ | float | None = None,
+        vmax: Q_ | float | None = None,
+    ) -> None:
+        """Create a filter with an inclusive ``(vmin, vmax)`` range.
+
+        Args:
+            vmin: inclusive lower bound as a pint ``Quantity`` (physical unit),
+                a plain number for dimensionless properties, or ``None`` for an
+                open lower bound.
+            vmax: inclusive upper bound, analogous to ``vmin``.
+        """
+        self.vmin = vmin
+        self.vmax = vmax
+
+    @property
+    def range(self) -> tuple[Q_ | float | None, Q_ | float | None]:
+        """The ``(vmin, vmax)`` range driving this filter."""
+        return (self.vmin, self.vmax)
+
+    def value(self, cont: Contour, *, images: ImageSequenceSource) -> Q_:
+        """Return the calibrated physical value of ``cont`` for this filter.
+
+        Subclasses derive a raw pixel measurement from ``cont`` and convert it
+        to physical units using ``images.pixel_size``.
+
+        Args:
+            cont: the contour to measure.
+            images: the calibrated image source (provides ``pixel_size``).
+
+        Returns:
+            The contour's property as a pint ``Quantity``.
+
+        Raises:
+            NotImplementedError: always, in the base class.
+        """
+        raise NotImplementedError()
+
+    def accepts(self, cont: Contour, *, images: ImageSequenceSource) -> bool:
+        """Whether ``cont`` falls within the ``(vmin, vmax)`` range.
+
+        The comparison uses pint, so a dimensionality mismatch between the
+        contour value and a bound (e.g. a µm² value vs a µm bound) raises a
+        ``pint.DimensionalityError`` -- a deliberate guard against misconfigured
+        filters. ``None`` bounds are open on that side.
+
+        Args:
+            cont: the contour to test.
+            images: the calibrated image source (provides ``pixel_size``).
+
+        Returns:
+            ``True`` if the contour's value is within range.
+        """
+        v = self.value(cont, images=images)
+        return (self.vmin is None or v >= self.vmin) and (
+            self.vmax is None or v <= self.vmax
+        )
+
+
+class _ExtractorCalibratedFilter(CellFilter):
+    """Base for filters that reuse an :class:`~acia.analysis.PropertyExtractor`.
+
+    The shared extractor instance provides acia's canonical calibration
+    (``convert`` / ``_dim`` / auto-unit from ``pixel_size``) and physical-unit
+    bookkeeping, so values match exactly how acia reports the property.
+    """
+
+    def _extractor(self):
+        """Return the (auto-unit) extractor instance backing this filter."""
+        raise NotImplementedError()
+
+    def _raw_value(self, cont: Contour) -> float:
+        """Return the raw pixel measurement to be calibrated by the extractor."""
+        raise NotImplementedError()
+
+    def value(self, cont: Contour, *, images: ImageSequenceSource) -> Q_:
+        extractor = self._extractor()
+        # reuse acia's pixel_size -> physical-unit calibration
+        extractor._calibrate(images)
+        magnitude = extractor.convert(self._raw_value(cont))
+        return magnitude * extractor.output_unit
+
+
+class AreaFilter(_ExtractorCalibratedFilter):
+    """Filter cells by physical area (``pixel_size**2`` -> µm²).
+
+    Reuses :class:`~acia.analysis.AreaEx` for calibration, so the range bounds
+    must be areas, e.g. ``AreaFilter(Q_(2, "um**2"), Q_(20, "um**2"))``.
+    """
+
+    name = "area"
+
+    def _extractor(self):
+        from acia.analysis import AreaEx
+
+        return AreaEx()
+
+    def _raw_value(self, cont: Contour) -> float:
+        return cont.area
+
+
+class LengthFilter(_ExtractorCalibratedFilter):
+    """Filter cells by physical length (major axis, ``pixel_size`` -> µm).
+
+    Length is the longer edge of the contour's minimum rotated bounding box,
+    computed exactly like :class:`~acia.analysis.LengthEx`.
+    """
+
+    name = "length"
+
+    def _extractor(self):
+        from acia.analysis import LengthEx
+
+        return LengthEx()
+
+    def _raw_value(self, cont: Contour) -> float:
+        from acia.utils import pairwise_distances
+
+        coords = _rotated_rect_coords(cont.polygon)
+        if (
+            coords is None
+        ):  # degenerate contour -> 0 length (dropped by a positive vmin)
+            return 0.0
+        return float(np.max(pairwise_distances(coords)))
+
+
+class WidthFilter(_ExtractorCalibratedFilter):
+    """Filter cells by physical width (minor axis, ``pixel_size`` -> µm).
+
+    Width is the shorter edge of the contour's minimum rotated bounding box,
+    computed exactly like :class:`~acia.analysis.WidthEx`.
+    """
+
+    name = "width"
+
+    def _extractor(self):
+        from acia.analysis import WidthEx
+
+        return WidthEx()
+
+    def _raw_value(self, cont: Contour) -> float:
+        from acia.utils import pairwise_distances
+
+        coords = _rotated_rect_coords(cont.polygon)
+        if coords is None:  # degenerate contour -> 0 width (dropped by a positive vmin)
+            return 0.0
+        return float(np.min(pairwise_distances(coords)))
+
+
+class CircularityFilter(CellFilter):
+    """Filter cells by circularity (dimensionless, ``4*pi*area / perimeter**2``).
+
+    Computed exactly like :class:`~acia.analysis.CircularityEx`. Bounds are
+    dimensionless (plain floats or dimensionless ``Quantity``), e.g.
+    ``CircularityFilter(vmin=0.8)``.
+    """
+
+    name = "circularity"
+
+    def value(self, cont: Contour, *, images: ImageSequenceSource) -> Q_:
+        polygon = cont.polygon
+        if polygon is None or polygon.is_empty or polygon.length == 0:
+            # degenerate contour -> circularity 0 (dropped by a positive vmin)
+            return Q_(0.0)
+        circularity = (4 * np.pi * polygon.area) / polygon.length**2
+        # dimensionless quantity so comparisons stay pint-consistent
+        return Q_(float(circularity))
+
+
+class BoundaryClosenessFilter(CellFilter):
+    """Drop cells whose bounding box lies near any image border.
+
+    The :meth:`value` is the minimum distance (in physical units) from the
+    contour's bounding box to any of the four image borders, using the source
+    ``size_h`` / ``size_w`` and ``pixel_size``. The range is
+    ``(min_distance, None)`` so cells closer than ``min_distance`` to a border
+    are dropped.
+    """
+
+    name = "boundary_closeness"
+
+    def __init__(self, min_distance: Q_) -> None:
+        """Create the filter.
+
+        Args:
+            min_distance: minimum allowed distance from any image border as a
+                pint length ``Quantity`` (e.g. ``Q_(1, "um")``).
+        """
+        super().__init__(vmin=min_distance, vmax=None)
+
+    def value(self, cont: Contour, *, images: ImageSequenceSource) -> Q_:
+        polygon = cont.polygon
+        if polygon is None or polygon.is_empty:
+            # degenerate contour -> distance 0 (treated as at-border, dropped)
+            raw = 0.0
+        else:
+            minx, miny, maxx, maxy = polygon.bounds
+            # distance (in px) to each of the four borders; x in [0, size_w], y in
+            # [0, size_h]. The bbox is the closest part of the contour to a border.
+            raw = float(min(minx, miny, images.size_w - maxx, images.size_h - maxy))
+
+        # reuse acia's length calibration (pixel_size -> µm) via LengthEx
+        from acia.analysis import LengthEx
+
+        extractor = LengthEx()
+        extractor._calibrate(images)
+        return extractor.convert(raw) * extractor.output_unit
+
+
+def apply_cell_filters(
+    overlay: Overlay,
+    filters: Sequence[CellFilter],
+    *,
+    images: ImageSequenceSource | None,
+) -> Overlay:
+    """Keep contours accepted by ALL filters, preserving the overlay time model.
+
+    Physical-unit filtering requires calibration: ``images`` must be provided
+    and carry a non-``None`` ``pixel_size``. A raw-pixel fallback is out of
+    scope (it would reintroduce the unit ambiguity this abstraction removes).
+
+    Args:
+        overlay: the overlay to filter.
+        filters: the cell filters to apply; a contour is kept iff every filter
+            accepts it (logical AND). An empty filter list keeps everything.
+        images: the calibrated image source (must expose ``pixel_size``).
+
+    Returns:
+        A new :class:`~acia.base.Overlay` with the kept contours and the same
+        time model (timepoints / frame_interval). The result may be empty.
+
+    Raises:
+        ValueError: if ``images`` is ``None`` or its ``pixel_size`` is ``None``.
+    """
+    if images is None or getattr(images, "pixel_size", None) is None:
+        raise ValueError(
+            "apply_cell_filters requires a calibrated source (pixel_size); "
+            "physical-unit filtering cannot run on uncalibrated data."
+        )
+
+    kept = [
+        cont
+        for cont in overlay.contours
+        if all(f.accepts(cast(Contour, cont), images=images) for f in filters)
+    ]
+
+    # preserve the overlay's time model (private attrs, since Overlay exposes
+    # only the resolved `timepoints` property, not `frame_interval`)
+    return Overlay(
+        kept,
+        timepoints=getattr(overlay, "_timepoints", None),
+        frame_interval=getattr(overlay, "_frame_interval", None),
+    )
