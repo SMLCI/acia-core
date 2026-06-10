@@ -20,6 +20,8 @@ from pint._typing import UnitLike
 from tqdm.auto import tqdm
 
 from acia import Q_, U_
+from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
+from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
 from acia.analysis.units import UNIT_ATTR, units_in_header
 from acia.analysis.units import attach_units as attach_units
 from acia.analysis.units import from_header as from_header
