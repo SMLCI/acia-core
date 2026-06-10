@@ -6,17 +6,22 @@ from acia.attribute import attribute_segmentation
 from acia.base import ImageSequenceSource, Overlay
 from acia.segm.formats import overlay_from_masks
 
+from . import SegmentationProcessor
 
-class CellposeSAMSegmenter:
+
+class CellposeSAMSegmenter(SegmentationProcessor):
     """CellposeSAMSegmenter using Cellpose SAM: https://doi.org/10.1101/2025.04.28.651001"""
 
-    def __init__(self, use_GPU=None):
+    def __init__(self, use_GPU=None, autorelease: bool = True):
+        super().__init__(autorelease=autorelease)
         if use_GPU is None:
-            self.use_GPU = core.use_gpu()
+            use_GPU = core.use_gpu()
+        self.use_GPU = use_GPU
         print(f"Use GPU? {self.use_GPU}")
 
+    def _load_model(self):
         # create CellPose model
-        self.model = models.CellposeModel(gpu=self.use_GPU)
+        return models.CellposeModel(gpu=self.use_GPU)
 
     @staticmethod
     def __predict(images, model, cellpose_params=None):
@@ -30,7 +35,7 @@ class CellposeSAMSegmenter:
 
         return masks
 
-    def __call__(self, images: ImageSequenceSource, cellpose_params=None) -> Overlay:
+    def _segment(self, images: ImageSequenceSource, cellpose_params=None) -> Overlay:
         # list of images
         imgs = [im.raw for im in images]
 
