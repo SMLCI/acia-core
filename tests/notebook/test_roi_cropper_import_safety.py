@@ -43,9 +43,11 @@ def test_import_safe_without_anywidget():
         notebook = importlib.import_module("acia.notebook")
         # Importing succeeded even though anywidget/traitlets are "missing".
         assert notebook._HAS_ANYWIDGET is False
-        # The stub raises a clear, actionable ImportError on instantiation.
+        # The stubs raise a clear, actionable ImportError on instantiation.
         with pytest.raises(ImportError, match=r"acia\[widget\]"):
             notebook.ROICropper(object())
+        with pytest.raises(ImportError, match=r"acia\[widget\]"):
+            notebook.FilterExplorer(object(), object(), [])
     finally:
         builtins.__import__ = real_import
         # Restore the original modules so other tests see a normal import state.

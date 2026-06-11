@@ -305,6 +305,54 @@ class JupyterVisualizationMixin:
         return ""
 
 
+def _encode_frame_png(source, frame: int = 0, channel: int | None = None):
+    """Encode one frame of ``source`` as a PNG data URL for an anywidget.
+
+    Selects a single 2D display channel (channel ``0`` by default for a
+    multi-channel frame), min-max normalizes it to ``uint8``, promotes
+    grayscale to RGB, and returns a base64 PNG ``data:`` URL plus the frame
+    ``(width, height)`` in pixels. Shared by the ``ROICropper`` /
+    ``FilterExplorer`` widgets so frames travel to the browser as bytes.
+
+    Args:
+        source: An :class:`~acia.base.ImageSequenceSource` (uses ``get_frame``).
+        frame: Frame index to encode.
+        channel: Display channel for a multi-channel frame; ``None`` -> channel 0.
+
+    Returns:
+        tuple[str, int, int]: ``(data_url, width, height)``.
+
+    Raises:
+        ValueError: if ``channel`` is out of range for the frame.
+    """
+    raw = np.asarray(source.get_frame(frame).raw)
+
+    num_channels = raw.shape[-1] if raw.ndim == 3 else 1
+    if channel is not None and not (0 <= channel < num_channels):
+        raise ValueError(f"channel must be in [0, {num_channels}); got {channel}.")
+
+    if raw.ndim == 3:
+        if raw.shape[-1] == 1:
+            display = raw[..., 0]
+        else:
+            display = raw[..., 0 if channel is None else channel]
+    else:
+        display = raw
+
+    display = normalize_to_uint8(display)
+    if display.ndim == 2:
+        display = np.repeat(display[:, :, np.newaxis], 3, axis=-1)
+
+    frame_h, frame_w = int(raw.shape[0]), int(raw.shape[1])
+
+    pil_image = Image.fromarray(display)
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="PNG")
+    buffer.seek(0)
+    img_b64 = base64.b64encode(buffer.read()).decode("utf-8")
+    return f"data:image/png;base64,{img_b64}", frame_w, frame_h
+
+
 # ---------------------------------------------------------------------------
 # ROICropper -- optional anywidget for drawing a rotated-rectangle ROI on
 # frame 0. anywidget is an OPTIONAL dependency (pip install acia[widget]);
@@ -664,6 +712,189 @@ export default { render };
 """
 
 
+# The FilterExplorer ESM is BEST-EFFORT JavaScript, exercised by the headless
+# Playwright suite (tests/notebook/test_filter_explorer_esm_playwright.py) but
+# not by the pure-Python tests. Live mask filtering happens entirely client-side
+# from the precomputed per-contour values, so NO kernel round-trip is needed as
+# the sliders move (the spec's "reactive, no observer wiring"). render() returns
+# a disposer so marimo re-renders don't stack canvases/listeners.
+_FILTER_EXPLORER_ESM = r"""
+// FilterExplorer render() -- one (min,max) slider row per filter; live overlay
+// recolouring kept=green / dropped=red as the handles move. Client-side only.
+function render({ model, el }) {
+  el.innerHTML = ""; // wipe prior render output (no stacked canvases on re-run)
+
+  const wrap = document.createElement("div");
+  wrap.style.font = "12px sans-serif";
+
+  const canvas = document.createElement("canvas");
+  canvas.style.display = "block";
+  wrap.appendChild(canvas);
+
+  const count = document.createElement("div");
+  count.style.margin = "4px 0";
+  wrap.appendChild(count);
+
+  const controls = document.createElement("div");
+  wrap.appendChild(controls);
+  el.appendChild(wrap);
+
+  const MAX_W = 480;
+  let scale = 1;
+  function imgW() { return model.get("image_w") || 1; }
+  function imgH() { return model.get("image_h") || 1; }
+  function layout() {
+    const w = imgW(), h = imgH();
+    scale = Math.min(1, MAX_W / w);
+    canvas.width = Math.round(w * scale);
+    canvas.height = Math.round(h * scale);
+  }
+
+  const img = new Image();
+  let imgReady = false;
+  img.onload = () => { imgReady = true; draw(); };
+  img.onerror = () => { imgReady = false; draw(); };
+
+  // local working copy of the handle values; written back to the model on input.
+  let sel = JSON.parse(JSON.stringify(model.get("selection") || []));
+
+  function fmt(x) {
+    const a = Math.abs(x);
+    if (a >= 100) return x.toFixed(0);
+    if (a >= 1) return x.toFixed(2);
+    return x.toFixed(3);
+  }
+
+  // a contour is kept iff every filter's value is within its [vmin, vmax].
+  // The positive form (rather than `v < vmin || v > vmax`) also drops a
+  // non-finite value, matching Python's `accepts` (>=/<= are false for NaN).
+  function keep(rec) {
+    const v = rec.values || [];
+    for (let i = 0; i < sel.length; i++) {
+      if (!(v[i] >= sel[i].vmin && v[i] <= sel[i].vmax)) return false;
+    }
+    return true;
+  }
+
+  function draw() {
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (imgReady) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const conts = model.get("contours") || [];
+    let kept = 0;
+    for (const rec of conts) {
+      const pts = rec.points || [];
+      if (pts.length < 2) continue;
+      const k = keep(rec);
+      if (k) kept++;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0] * scale, pts[0][1] * scale);
+      for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i][0] * scale, pts[i][1] * scale);
+      }
+      ctx.closePath();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = k ? "#2ecc40" : "#ff4136";
+      ctx.fillStyle = k ? "rgba(46,204,64,0.25)" : "rgba(255,65,54,0.12)";
+      ctx.fill();
+      ctx.stroke();
+    }
+    count.textContent = "kept " + kept + " / " + conts.length;
+  }
+
+  function commit() {
+    model.set("selection", JSON.parse(JSON.stringify(sel)));
+    model.save_changes();
+    draw();
+  }
+
+  // build one control row per filter spec.
+  const specs = model.get("filter_specs") || [];
+  const rowHandlers = [];
+  specs.forEach((spec, i) => {
+    const row = document.createElement("div");
+    row.style.margin = "6px 0";
+
+    const label = document.createElement("div");
+    const unit = spec.unit ? " [" + spec.unit + "]" : "";
+    label.textContent = spec.name + unit;
+    label.style.fontWeight = "bold";
+    row.appendChild(label);
+
+    const mkSlider = () => {
+      const s = document.createElement("input");
+      s.type = "range";
+      s.min = String(spec.lo);
+      s.max = String(spec.hi);
+      s.step = String(spec.step || (spec.hi - spec.lo) / 200 || 1);
+      s.style.width = "240px";
+      return s;
+    };
+    const lo = mkSlider(); lo.value = String(sel[i].vmin);
+    const hi = mkSlider(); hi.value = String(sel[i].vmax);
+
+    const readout = document.createElement("span");
+    readout.style.marginLeft = "8px";
+
+    function refresh() {
+      let a = parseFloat(lo.value), b = parseFloat(hi.value);
+      if (a > b) {                         // keep min <= max
+        if (this === lo) { b = a; hi.value = String(b); }
+        else { a = b; lo.value = String(a); }
+      }
+      sel[i] = { vmin: a, vmax: b };
+      readout.textContent = "[" + fmt(a) + ", " + fmt(b) + "]";
+      commit();
+    }
+    lo.addEventListener("input", refresh);
+    hi.addEventListener("input", refresh);
+    rowHandlers.push([lo, hi, refresh]);
+
+    readout.textContent = "[" + fmt(sel[i].vmin) + ", " + fmt(sel[i].vmax) + "]";
+
+    row.appendChild(document.createElement("br"));
+    row.appendChild(lo);
+    row.appendChild(hi);
+    row.appendChild(readout);
+    controls.appendChild(row);
+  });
+
+  function onSelectionChange() {
+    sel = JSON.parse(JSON.stringify(model.get("selection") || []));
+    specs.forEach((spec, i) => {
+      const [lo, hi] = rowHandlers[i];
+      // Only rewrite a handle whose value actually changed, so a slider the
+      // user is dragging (already equal to sel[i]) is not snapped/reset by our
+      // own committed change:selection echo.
+      if (parseFloat(lo.value) !== sel[i].vmin) lo.value = String(sel[i].vmin);
+      if (parseFloat(hi.value) !== sel[i].vmax) hi.value = String(sel[i].vmax);
+    });
+    draw();
+  }
+  function onDataChange() { draw(); }
+  model.on("change:selection", onSelectionChange);
+  model.on("change:contours change:filter_specs", onDataChange);
+
+  layout();
+  const b64 = model.get("image_b64");
+  if (b64) { img.src = b64; }
+  draw();
+
+  return () => {
+    for (const [lo, hi, refresh] of rowHandlers) {
+      lo.removeEventListener("input", refresh);
+      hi.removeEventListener("input", refresh);
+    }
+    model.off("change:selection", onSelectionChange);
+    model.off("change:contours change:filter_specs", onDataChange);
+    if (wrap.parentNode) { wrap.parentNode.removeChild(wrap); }
+  };
+}
+export default { render };
+"""
+
+
 if _HAS_ANYWIDGET:
 
     class ROICropper(anywidget.AnyWidget):  # type: ignore[no-redef]
@@ -882,10 +1113,297 @@ if _HAS_ANYWIDGET:
                 "</p></div>"
             )
 
+    class FilterExplorer(anywidget.AnyWidget):  # type: ignore[no-redef]
+        """Interactive cell-filter threshold explorer with live mask preview.
+
+        Auto-builds **one (min, max) slider per filter** from the passed
+        ``filters`` list (modular -- add a :class:`~acia.segm.filter.CellFilter`
+        and it appears) and live-recolours the contour overlay (kept = green,
+        dropped = red) as the handles move. The live filtering runs **entirely
+        client-side**: each contour's value under each filter is precomputed once
+        in Python (reusing the goal-E ``value()`` calibration) and shipped to the
+        browser, so dragging a slider needs **no kernel round-trip** (the
+        workflow's "reactive, no observer wiring"). All control ranges/handles are
+        in each filter's **physical unit** (µm, µm², dimensionless).
+
+        The widget previews a **single frame** (``frame=0`` by default), drawing
+        only that frame's contours over that frame's image. :attr:`params` and
+        :meth:`configured_filters` emit/restore frame-independent thresholds;
+        :meth:`filtered_overlay` applies them across the **whole** overlay via
+        :func:`~acia.segm.filter.apply_cell_filters`.
+
+        Works in Jupyter/Colab and in marimo via ``mo.ui.anywidget(explorer)``.
+        The ESM JavaScript is best-effort, verified by the headless Playwright
+        suite (and a real notebook run), not by the pure-Python tests.
+        """
+
+        image_b64 = traitlets.Unicode("").tag(sync=True)
+        image_w = traitlets.Int(0).tag(sync=True)
+        image_h = traitlets.Int(0).tag(sync=True)
+        # one spec per filter: {name, unit, lo, hi, step, vmin, vmax}
+        filter_specs = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+        # one record per displayed contour: {points: [[x,y],...], values: [m0,m1,...]}
+        contours = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+        # live handle values, aligned with filter_specs: [{vmin, vmax}, ...]
+        selection = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+
+        _esm = _FILTER_EXPLORER_ESM
+
+        def __init__(
+            self,
+            overlay,
+            images,
+            filters,
+            *,
+            frame: int = 0,
+            channel: int | None = None,
+            **kwargs,
+        ) -> None:
+            """Build the explorer from an overlay, a calibrated source and filters.
+
+            Args:
+                overlay: The :class:`~acia.base.Overlay` to filter.
+                images: The calibrated :class:`~acia.base.ImageSequenceSource`
+                    (must expose a non-``None`` ``pixel_size``).
+                filters: A list of :class:`~acia.segm.filter.CellFilter` instances
+                    -- one slider control is built per filter.
+                frame: Frame to preview (image + its contours). Defaults to ``0``.
+                channel: Display channel for a multi-channel frame. Defaults to 0.
+                **kwargs: Forwarded to ``anywidget.AnyWidget``.
+
+            Raises:
+                ValueError: If ``images`` is ``None`` or its ``pixel_size`` is
+                    ``None`` (physical-unit thresholds need calibration).
+            """
+            if images is None or getattr(images, "pixel_size", None) is None:
+                raise ValueError(
+                    "FilterExplorer requires a calibrated source (pixel_size); "
+                    "physical-unit filtering cannot run on uncalibrated data."
+                )
+
+            self._overlay = overlay
+            self._images = images
+            self._filters = list(filters)
+            self._frame = frame
+
+            img_b64, frame_w, frame_h = _encode_frame_png(images, frame, channel)
+
+            # contours shown for this frame (default frame attr -> include it)
+            conts = [c for c in overlay.contours if getattr(c, "frame", frame) == frame]
+
+            records = [
+                {
+                    "points": np.asarray(c.coordinates, dtype=float).tolist(),
+                    "values": [],
+                }
+                for c in conts
+            ]
+
+            specs = []
+            for f in self._filters:
+                unit, mags = self._measure(f, conts)
+                for rec, m in zip(records, mags, strict=False):
+                    rec["values"].append(m)
+                lo, hi, vmin, vmax = self._axis(f, unit, mags)
+                step = (hi - lo) / 200.0 or 1.0
+                specs.append(
+                    {
+                        "name": f.name,
+                        "unit": unit,
+                        "lo": lo,
+                        "hi": hi,
+                        "step": step,
+                        "vmin": vmin,
+                        "vmax": vmax,
+                    }
+                )
+
+            selection = [{"vmin": s["vmin"], "vmax": s["vmax"]} for s in specs]
+
+            super().__init__(
+                image_b64=img_b64,
+                image_w=frame_w,
+                image_h=frame_h,
+                filter_specs=specs,
+                contours=records,
+                selection=selection,
+                **kwargs,
+            )
+
+        # --- construction helpers -------------------------------------------
+
+        def _measure(self, f, conts):
+            """Return ``(unit_str, [magnitude per contour])`` for filter ``f``.
+
+            Reuses the goal-E ``CellFilter.value()`` (calibrated from the source
+            ``pixel_size``); all contours of a filter share one unit. For an empty
+            overlay the unit is inferred from the filter's existing bound, else
+            falls back to dimensionless.
+            """
+            import math
+
+            unit = None
+            mags = []
+            for c in conts:
+                q = f.value(c, images=self._images)
+                if unit is None:
+                    unit = f"{q.units}"
+                m = float(q.to(unit).magnitude)
+                # a non-finite magnitude would serialize as invalid JSON (NaN /
+                # Infinity) and break the browser trait sync; coerce to 0, the
+                # same convention the built-in filters use for degenerate cells.
+                mags.append(m if math.isfinite(m) else 0.0)
+            if unit is None:
+                unit = self._unit_of(f.vmin) or self._unit_of(f.vmax) or ""
+            return unit, mags
+
+        @staticmethod
+        def _unit_of(bound) -> str | None:
+            """Unit string of a pint bound, or ``None`` for plain numbers/``None``."""
+            if bound is not None and hasattr(bound, "units"):
+                return f"{bound.units}"
+            return None
+
+        def _axis(self, f, unit: str, mags):
+            """Build a control axis: ``(lo, hi, vmin, vmax)`` for filter ``f``.
+
+            The track ``[lo, hi]`` spans the data, then is **widened to include
+            any explicitly-set bound** so seeding is lossless: a bound outside the
+            data range is preserved exactly instead of being clamped to the data
+            extreme (which would silently rewrite the threshold). A ``None`` bound
+            opens that side (handle parked at the track extreme: ``vmin`` at ``lo``,
+            ``vmax`` at ``hi``). An empty overlay falls back to a ``[0, 1]`` track.
+            """
+            raw_vmin = self._bound_magnitude(f.vmin, unit)
+            raw_vmax = self._bound_magnitude(f.vmax, unit)
+
+            bounds = [b for b in (raw_vmin, raw_vmax) if b is not None]
+            if mags:
+                lo, hi = float(min(mags)), float(max(mags))
+            elif bounds:
+                lo, hi = float(min(bounds)), float(max(bounds))
+            else:
+                lo, hi = 0.0, 1.0
+            # widen so an out-of-range seed sits inside the track (lossless).
+            for b in bounds:
+                lo, hi = min(lo, b), max(hi, b)
+            if hi <= lo:  # single-valued data / single bound -> non-zero width
+                hi = lo + 1.0
+
+            vmin = lo if raw_vmin is None else raw_vmin
+            vmax = hi if raw_vmax is None else raw_vmax
+            return lo, hi, vmin, vmax
+
+        @staticmethod
+        def _bound_magnitude(bound, unit: str):
+            """Magnitude of ``bound`` in ``unit`` (``None`` stays ``None``)."""
+            if bound is None:
+                return None
+            if hasattr(bound, "to") and hasattr(bound, "magnitude"):
+                target = unit if unit else "dimensionless"
+                return float(bound.to(target).magnitude)
+            return float(bound)
+
+        # --- outputs ---------------------------------------------------------
+
+        @property
+        def params(self):
+            """Current thresholds as ``[{name, vmin, vmax}]`` pint ``Quantity``\\s.
+
+            A handle parked at its track extreme is reported as ``None`` (open on
+            that side), so a one-sided filter round-trips faithfully.
+            """
+            result = []
+            for spec, sel in zip(self.filter_specs, self.selection, strict=False):
+                unit = spec["unit"]
+                vmin = self._as_quantity(sel["vmin"], spec["lo"], unit, lower=True)
+                vmax = self._as_quantity(sel["vmax"], spec["hi"], unit, lower=False)
+                result.append({"name": spec["name"], "vmin": vmin, "vmax": vmax})
+            return result
+
+        @staticmethod
+        def _as_quantity(value: float, extreme: float, unit: str, *, lower: bool):
+            """``Q_(value, unit)`` unless ``value`` is at the open extreme."""
+            from acia import Q_
+
+            if (lower and value <= extreme) or (not lower and value >= extreme):
+                return None
+            return Q_(value, unit) if unit else Q_(value)
+
+        def configured_filters(self):
+            """Update each passed filter's ``vmin``/``vmax`` from the sliders.
+
+            Mutates the filter instances supplied to ``__init__`` in place (a
+            handle at its extreme sets that bound to ``None``) and returns the
+            list, ready for :func:`~acia.segm.filter.apply_cell_filters` or the
+            scaled batch run.
+            """
+            for f, spec, sel in zip(
+                self._filters, self.filter_specs, self.selection, strict=False
+            ):
+                unit = spec["unit"]
+                f.vmin = self._as_quantity(sel["vmin"], spec["lo"], unit, lower=True)
+                f.vmax = self._as_quantity(sel["vmax"], spec["hi"], unit, lower=False)
+            return self._filters
+
+        def filtered_overlay(self):
+            """Return the whole overlay filtered by the current thresholds."""
+            from acia.segm.filter import apply_cell_filters
+
+            return apply_cell_filters(
+                self._overlay, self.configured_filters(), images=self._images
+            )
+
+        def save(self, path):
+            """Write the current thresholds to ``path`` as ``filter_params.json``.
+
+            Serializes ``[{name, unit, vmin, vmax}]`` (magnitudes; ``None`` for an
+            open side) -- a small spec the scaled batch run reloads to rebuild the
+            filters.
+
+            Args:
+                path: Destination JSON file path.
+
+            Returns:
+                list[dict]: The serialized filter parameters.
+            """
+            import json
+            from pathlib import Path
+
+            data = []
+            for spec, sel in zip(self.filter_specs, self.selection, strict=False):
+                lo, hi = spec["lo"], spec["hi"]
+                data.append(
+                    {
+                        "name": spec["name"],
+                        "unit": spec["unit"],
+                        "vmin": None if sel["vmin"] <= lo else sel["vmin"],
+                        "vmax": None if sel["vmax"] >= hi else sel["vmax"],
+                    }
+                )
+            Path(path).write_text(json.dumps({"filters": data}, indent=2))
+            return data
+
+        def _repr_html_(self) -> str:
+            """Static fallback so a non-executed/persisted notebook shows frame 0."""
+            return (
+                f'<div><img src="{self.image_b64}" '
+                'style="max-width: 100%; height: auto;" />'
+                "<p style='font:12px sans-serif;color:#666;'>"
+                "FilterExplorer (interactive widget renders when the notebook is run)."
+                "</p></div>"
+            )
+
 else:
 
     def ROICropper(*args, **kwargs):  # type: ignore[no-redef]
         """Stub raised when the optional ``widget`` extra is not installed."""
         raise ImportError(
             "ROICropper requires the optional dependency: pip install acia[widget]"
+        )
+
+    def FilterExplorer(*args, **kwargs):  # type: ignore[no-redef]
+        """Stub raised when the optional ``widget`` extra is not installed."""
+        raise ImportError(
+            "FilterExplorer requires the optional dependency: pip install acia[widget]"
         )
