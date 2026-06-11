@@ -10,7 +10,10 @@ from functools import reduce
 from itertools import starmap
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 import numpy as np
 import pandas as pd
@@ -20,6 +23,7 @@ from pint._typing import UnitLike
 from tqdm.auto import tqdm
 
 from acia import Q_, U_
+from acia.analysis.growth_rate import AggMode as AggMode
 from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
 from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
 from acia.analysis.units import UNIT_ATTR, units_in_header
@@ -894,3 +898,44 @@ def scale(
             logging.error("Such a high error rate is not acceptable!")
 
     return experiment_executions
+
+
+def extract_growth(
+    overlay: Overlay,
+    images: ImageSequenceSource,
+    *,
+    time_unit: str = "hour",
+    agg: AggMode = "sum",
+) -> tuple[pd.DataFrame, GrowthRateResult, Figure]:
+    """Single-cell table + log-linear growth-rate fit in one call.
+
+    Convenience wrapper combining single-cell extraction and the growth-rate fit
+    (the last two steps of a typical time-lapse pipeline). Builds a per-cell table
+    with ``frame`` + physical ``time`` (in ``time_unit``) + physical ``area``
+    columns via :class:`ExtractorExecutor`, then fits
+    ``area ~ exp(growth_rate * time)`` aggregated per timepoint by ``agg`` with
+    :func:`~acia.analysis.growth_rate.estimate_growth_rate`.
+
+    Args:
+        overlay: the (already filtered) contours to measure.
+        images: the calibrated image source (provides ``pixel_size`` for area and
+            ``timepoints`` for time).
+        time_unit: output unit for the time column and growth rate.
+        agg: per-timepoint aggregation of the value column (e.g. ``"sum"`` for
+            total area, ``"count"`` for cell number).
+
+    Returns:
+        ``(table, result, figure)`` -- the single-cell ``DataFrame``, the
+        :class:`~acia.analysis.growth_rate.GrowthRateResult`, and the fit
+        ``matplotlib`` figure.
+    """
+    table = ExtractorExecutor().execute(
+        overlay,
+        images,
+        [FrameEx(), TimeEx(output_unit=time_unit), AreaEx()],
+        units="none",
+    )
+    result, figure = estimate_growth_rate(
+        table, time_col="time", value_col="area", agg=agg
+    )
+    return table, result, figure
