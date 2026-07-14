@@ -5,13 +5,17 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
 
 if TYPE_CHECKING:
-    from acia.base import BaseImage
+    from acia.base import BaseImage, RotatedCropSpec
+    from acia.registration import FrameTransform
+    from acia.registration_persistence import RegistrationManifest, RegistrationRecord
 
 
 def normalize_to_uint8(image_array: np.ndarray) -> np.ndarray:
@@ -895,6 +899,1072 @@ export default { render };
 """
 
 
+def _fit_rotated_rect(points):
+    """Fit the tightest oriented rectangle to ``points`` -> ``RotatedCropSpec``.
+
+    Shared min-area-rectangle geometry (``cv2.minAreaRect``) used by the
+    :class:`SequenceDashboard` point-fit path. Angle normalized into ``(-45, 45]``
+    degrees (CCW / ``RotatedCropSpec`` convention), width/height swapped per
+    90-degree step. ``cv2`` is a core dependency (always available).
+
+    Raises:
+        ValueError: If fewer than 3 points, or the points are degenerate.
+    """
+    import cv2
+
+    from acia.base import RotatedCropSpec
+
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] != 2:
+        raise ValueError(f"fit requires at least 3 [x, y] points; got {pts.shape}.")
+    (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
+    if w == 0 or h == 0:
+        raise ValueError("degenerate rectangle (collinear/duplicate points)")
+    w = int(round(w))
+    h = int(round(h))
+    while angle > 45.0:
+        angle -= 90.0
+        w, h = h, w
+    while angle <= -45.0:
+        angle += 90.0
+        w, h = h, w
+    return RotatedCropSpec(
+        center=(float(cx), float(cy)), size=(max(1, w), max(1, h)), angle=float(angle)
+    )
+
+
+# The 5 acia.registration.RegistrationMethod subclass names, in the order they
+# appear in the RegistrationDashboard method picker. Kept as plain strings at
+# module level (no import) so both the traitlets validator and the ESM's
+# <select> options list can use them without touching acia.registration.
+_REGISTRATION_METHOD_NAMES: tuple[str, ...] = (
+    "PhaseCorrelationHighpass",
+    "MaskedTemplateCorrelation",
+    "HoughLineRigidFit",
+    "FeatureRANSACEuclidean",
+    "GradientECC",
+)
+
+
+def _registration_method_classes() -> dict[str, type]:
+    """Lazy import of the 5 :class:`~acia.registration.RegistrationMethod` subclasses.
+
+    Deliberately NOT a module-level import: ``acia.registration`` imports from
+    ``acia.base``, which itself imports this module (``acia.notebook``) at load
+    time for :class:`JupyterVisualizationMixin` -- a module-level import here
+    would be circular.
+    """
+    from acia.registration import (
+        FeatureRANSACEuclidean,
+        GradientECC,
+        HoughLineRigidFit,
+        MaskedTemplateCorrelation,
+        PhaseCorrelationHighpass,
+    )
+
+    return {
+        "PhaseCorrelationHighpass": PhaseCorrelationHighpass,
+        "MaskedTemplateCorrelation": MaskedTemplateCorrelation,
+        "HoughLineRigidFit": HoughLineRigidFit,
+        "FeatureRANSACEuclidean": FeatureRANSACEuclidean,
+        "GradientECC": GradientECC,
+    }
+
+
+# The SequenceDashboard CSS + ESM are ported near-verbatim from the approved
+# clickable mockup (three-pane curation UI). Like the other widgets here, the ESM
+# is UNVERIFIED by the headless Python suite and validated only by a real
+# Jupyter/marimo run (or the Playwright suite in the devcontainer). Images arrive
+# from Python as PNG bytes over anywidget's buffer channel; only single frames and
+# the small `selections` list cross the wire.
+_SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
+.acia-sd{--bg:#e9edf1;--panel:#fff;--panel-2:#f4f7f9;--panel-3:#eef2f5;--border:#d5dce2;
+  --border-strong:#c2ccd4;--text:#182028;--text-dim:#596a76;--text-faint:#8695a0;
+  --accent:#0f8f82;--accent-ink:#fff;--accent-soft:rgba(15,143,130,.12);
+  --roi-1:#e08a12;--roi-2:#d24d92;--roi-3:#2b7fd6;--roi-4:#25a06f;--roi-5:#8a6ef0;
+  --font-ui:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --font-mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  font-family:var(--font-ui);color:var(--text);font-size:14px;
+  border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--bg);
+  display:flex;flex-direction:column;height:640px;}
+.acia-sd:fullscreen{height:100vh;border-radius:0;}
+@media (prefers-color-scheme:dark){.acia-sd{--bg:#0c1216;--panel:#141c22;--panel-2:#1a232a;
+  --panel-3:#202b33;--border:#28333c;--border-strong:#34424c;--text:#e7eef3;--text-dim:#8b9aa6;
+  --text-faint:#657481;--accent:#2fd4c1;--accent-ink:#062521;--accent-soft:rgba(47,212,193,.14);
+  --roi-1:#f0a83a;--roi-2:#ec6fac;--roi-3:#5aa6f0;--roi-4:#3cc78d;--roi-5:#a78bfa;}}
+.acia-sd *{box-sizing:border-box}
+.acia-sd .sd-src{display:flex;gap:10px;align-items:center;padding:9px 12px;background:var(--panel-2);
+  border-bottom:1px solid var(--border);flex-wrap:wrap;font-family:var(--font-mono);font-size:11.5px;}
+.acia-sd .sd-src input{flex:1;min-width:160px;background:var(--panel);border:1px solid var(--border);
+  color:var(--text);border-radius:7px;padding:6px 9px;font-family:var(--font-mono);font-size:12px;}
+.acia-sd .sd-meta{color:var(--text-dim);width:100%;}
+.acia-sd .sd-meta b{color:var(--text)}
+.acia-sd .sd-main{flex:1;display:grid;grid-template-columns:var(--lw,190px) 5px minmax(0,1fr) 5px var(--rw,250px);
+  gap:0;background:var(--border);min-height:0;}
+.acia-sd .sd-pane{background:var(--panel);display:flex;flex-direction:column;min-height:0;min-width:0;}
+.acia-sd .sd-head{padding:8px 11px;border-bottom:1px solid var(--border);font-family:var(--font-mono);
+  font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--text-dim);display:flex;
+  justify-content:space-between;align-items:center;gap:8px;}
+.acia-sd .sd-rz{background:var(--border);cursor:col-resize;}
+.acia-sd .sd-rz:hover{background:var(--accent);}
+.acia-sd .sd-gal{overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:6px;}
+.acia-sd .sd-thumb{position:relative;height:44px;flex:none;border-radius:7px;overflow:hidden;cursor:pointer;
+  border:1.5px solid transparent;background:var(--panel-3);
+  transition:height .3s cubic-bezier(.2,.75,.2,1);}
+.acia-sd .sd-thumb:hover{height:var(--exp,300px);}
+.acia-sd .sd-thumb.sel{border-color:var(--accent);}
+.acia-sd .sd-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+.acia-sd .sd-thumb .ix{position:absolute;left:6px;bottom:4px;font-family:var(--font-mono);font-size:11px;
+  font-weight:600;color:#fff;text-shadow:0 1px 3px #000;}
+.acia-sd .sd-thumb .dot{position:absolute;right:6px;top:6px;width:8px;height:8px;border-radius:50%;
+  background:var(--accent);box-shadow:0 0 0 1.5px rgba(0,0,0,.4);}
+.acia-sd .sd-editor{display:flex;flex-direction:column;}
+.acia-sd .sd-ebody{flex:1;display:flex;gap:14px;padding:14px;overflow:auto;align-items:flex-start;}
+.acia-sd .sd-cwrap{position:relative;border-radius:8px;overflow:hidden;background:#9aa0a4;flex:none;touch-action:none;}
+.acia-sd .sd-cwrap.pick{cursor:crosshair;}
+.acia-sd .sd-cwrap img{display:block;width:100%;height:100%;}
+.acia-sd .sd-cstatus{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  text-align:center;padding:12px;font-family:var(--font-mono);font-size:12px;color:#fff;
+  background:rgba(0,0,0,.35);pointer-events:none;}
+.acia-sd .sd-cstatus.show{display:flex;}
+.acia-sd .sd-cstatus.err{background:rgba(140,30,20,.55);}
+.acia-sd .roi{position:absolute;border:2px solid var(--rc,#e08a12);cursor:move;
+  background:color-mix(in srgb,var(--rc,#e08a12) 12%,transparent);}
+.acia-sd .roi.active{box-shadow:0 0 0 3px color-mix(in srgb,var(--rc) 30%,transparent);}
+.acia-sd .roi .tag{position:absolute;left:0;top:-18px;font-family:var(--font-mono);font-size:10px;
+  background:var(--rc);color:#fff;padding:0 5px;border-radius:4px;white-space:nowrap;}
+.acia-sd .roi .knob{position:absolute;left:50%;top:-22px;width:11px;height:11px;margin-left:-5.5px;
+  border-radius:50%;background:var(--panel);border:2px solid var(--rc);cursor:grab;}
+.acia-sd .roi .rz{position:absolute;width:12px;height:12px;border-radius:3px;
+  background:var(--panel);border:2px solid var(--rc);}
+.acia-sd .roi .rz[data-c="tl"]{left:-6px;top:-6px;cursor:nwse-resize;}
+.acia-sd .roi .rz[data-c="tr"]{right:-6px;top:-6px;cursor:nesw-resize;}
+.acia-sd .roi .rz[data-c="bl"]{left:-6px;bottom:-6px;cursor:nesw-resize;}
+.acia-sd .roi .rz[data-c="br"]{right:-6px;bottom:-6px;cursor:nwse-resize;}
+.acia-sd .ptmark{position:absolute;width:11px;height:11px;margin:-5.5px;border-radius:50%;
+  background:var(--accent);border:2px solid #fff;pointer-events:none;}
+.acia-sd .sd-readout{flex:1;min-width:150px;display:flex;flex-direction:column;gap:12px;
+  position:sticky;right:0;background:var(--bg);padding-left:4px;}
+.acia-sd .sd-card{background:var(--panel-2);border:1px solid var(--border);border-radius:9px;padding:10px;
+  font-family:var(--font-mono);font-size:12px;}
+.acia-sd .sd-card h3{margin:0 0 7px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--text-faint);}
+.acia-sd .sd-frbar{display:flex;align-items:center;gap:8px;padding:7px 14px;flex:none;
+  border-top:1px solid var(--border);background:var(--panel-2);
+  font-family:var(--font-mono);font-size:11px;color:var(--text-dim);}
+.acia-sd .sd-frbar input[type=range]{vertical-align:middle;}
+.acia-sd .sd-tools{display:flex;gap:8px;align-items:center;padding:9px 12px;border-top:1px solid var(--border);
+  background:var(--panel-2);flex-wrap:wrap;}
+.acia-sd button{border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:7px;
+  padding:6px 10px;cursor:pointer;font-size:12.5px;}
+.acia-sd button.primary{border-color:var(--accent);color:var(--accent);}
+.acia-sd button.accent{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600;}
+.acia-sd .sd-list{flex:1;overflow-y:auto;padding:8px;}
+.acia-sd .sd-poshd{font-family:var(--font-mono);font-size:11px;color:var(--text-dim);padding:5px 8px;
+  cursor:pointer;border-radius:6px;user-select:none;}
+.acia-sd .sd-poshd:hover{background:var(--panel-3);color:var(--text);}
+.acia-sd .sd-row{display:flex;gap:8px;align-items:center;padding:6px 8px;border-radius:7px;cursor:pointer;}
+.acia-sd .sd-row.active{background:var(--accent-soft);}
+.acia-sd .sd-row .sw{width:11px;height:11px;border-radius:3px;flex:none;}
+.acia-sd .sd-row .nm{flex:1;font-size:13px;}
+.acia-sd .sd-foot{border-top:1px solid var(--border);padding:11px;display:flex;flex-direction:column;gap:9px;}
+.acia-sd .sd-mode{display:flex;background:var(--panel-3);border-radius:7px;padding:3px;gap:3px;}
+.acia-sd .sd-mode button{flex:1;border:0;background:none;font-family:var(--font-mono);font-size:12px;}
+.acia-sd .sd-mode button.on{background:var(--panel);box-shadow:0 1px 3px rgba(0,0,0,.15);font-weight:600;}
+.acia-sd .sd-saverow{display:flex;align-items:center;gap:10px;}
+.acia-sd .sd-saverow .sd-save{flex:1;}
+.acia-sd .sd-auto{display:flex;align-items:center;gap:5px;font-family:var(--font-mono);font-size:11px;
+  color:var(--text-dim);white-space:nowrap;cursor:pointer;}
+.acia-sd .sd-view{display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:10px;
+  color:var(--text-faint);}
+.acia-sd .sd-toast{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);background:var(--text);
+  color:var(--bg);padding:8px 14px;border-radius:8px;font-size:12.5px;opacity:0;transition:.25s;pointer-events:none;}
+.acia-sd .sd-toast.show{opacity:1;}
+"""
+
+_SEQUENCE_DASHBOARD_ESM = _SEQUENCE_DASHBOARD_ESM_TEXT = r"""
+// SequenceDashboard render() -- three-pane curation UI (accordion gallery,
+// resizable panes, ROI editor with draw + point-fit). Images arrive from Python
+// as PNG bytes (model.send/on). UNVERIFIED headless; validated by a real run.
+function render({ model, el }) {
+  el.innerHTML = "";
+  const root = document.createElement("div");
+  root.className = "acia-sd";
+  el.appendChild(root);
+
+  const md = model.get("metadata") || {};
+  const dims = (md.sizes && md.sizes.Y && md.sizes.X) ? [md.sizes.X, md.sizes.Y] : [1, 1];
+  const ASPECT = dims[1] / dims[0];
+  const NPOS = md.num_positions || (model.get("positions") || []).length || 1;
+  const NT = md.num_timepoints || 1;
+  const PX = md.pixel_size_um || null;
+  const COLORS = ["--roi-1","--roi-2","--roi-3","--roi-4","--roi-5"];
+  const cvar = (v) => getComputedStyle(root).getPropertyValue(v).trim();
+  const hexOf = (ci) => cvar(COLORS[((ci % 5) + 5) % 5]);
+
+  const metaLine =
+    NPOS + " positions · " + NT + " T · " + dims[0] + "×" + dims[1] +
+    " " + (md.dtype || "") + (PX ? " · " + PX.toFixed(4) + " µm/px" : "") +
+    " · " + ((md.channels || []).join(", "));
+
+  root.innerHTML =
+    "<div class='sd-src'><span>Source</span>" +
+    "<input class='sd-path' value='" + (md.path || "") + "' spellcheck='false'>" +
+    "<div class='sd-meta'>" + metaLine + "</div></div>" +
+    "<div class='sd-main'>" +
+      "<div class='sd-pane'><div class='sd-head'><span>Positions</span>" +
+        "<span class='sd-galn'>" + NPOS + "</span></div><div class='sd-gal'></div></div>" +
+      "<div class='sd-rz' data-side='l'></div>" +
+      "<div class='sd-pane sd-editor'><div class='sd-head'>" +
+        "<span class='sd-epos'>pos 000</span>" +
+        "<span style='display:flex;gap:10px;align-items:center'>" +
+        "<span class='sd-view'>size <input type='range' class='sd-vs' min='300' max='2400' value='" +
+          model.get("view_size") + "'></span>" +
+        "<button class='sd-full' title='Toggle fullscreen (Ctrl/Cmd+scroll over the image also zooms)'>⛶ Fullscreen</button>" +
+        "</span></div>" +
+        "<div class='sd-ebody'><div class='sd-cwrap'><div class='sd-cstatus'></div></div>" +
+        "<div class='sd-readout'><div class='sd-card'><h3>Active ROI → RotatedCropSpec</h3>" +
+        "<div class='sd-spec'>no ROI selected</div></div></div></div>" +
+        "<div class='sd-frbar'>frame <input type='range' class='sd-frame' min='0' max='" + (NT - 1) + "' value='0'>" +
+        " <span class='sd-frlbl'>0 / " + NT + "</span> (view only)</div>" +
+        "<div class='sd-tools'><button class='sd-draw'>✎ Draw ROI</button>" +
+        "<button class='sd-point primary' title='Click the 4 corners of the rectangle'>✛ Point-fit ROI</button>" +
+        "<button class='sd-del'>🗑 Delete</button>" +
+        "<span style='margin-left:auto;display:flex;gap:6px;align-items:center'>" +
+        "<span class='sd-sw' style='width:12px;height:12px;border-radius:3px'></span>" +
+        "<input class='sd-lbl' placeholder='label' style='width:120px'></span></div></div>" +
+      "<div class='sd-rz' data-side='r'></div>" +
+      "<div class='sd-pane'><div class='sd-head'><span>Selections</span>" +
+        "<span class='sd-seln'>0</span></div><div class='sd-list'></div>" +
+        "<div class='sd-foot'><div class='sd-mode'>" +
+          "<button data-m='single'>single</button><button data-m='multi'>multi</button></div>" +
+          "<div class='sd-saverow'>" +
+            "<button class='sd-save accent'>💾 Save selection.json</button>" +
+            "<label class='sd-auto' title='Automatically write selection.json a moment after each change'>" +
+              "<input type='checkbox' class='sd-autochk'> auto-save</label>" +
+          "</div></div></div>" +
+    "</div><div class='sd-toast'></div>";
+
+  const $ = (s) => root.querySelector(s);
+  const gal = $(".sd-gal"), wrap = $(".sd-cwrap"), main = $(".sd-main");
+  const cstatus = wrap.querySelector(".sd-cstatus");
+  function showStatus(text, isErr) {
+    cstatus.textContent = text;
+    cstatus.classList.toggle("err", !!isErr);
+    cstatus.classList.add("show");
+  }
+  function hideStatus() { cstatus.classList.remove("show", "err"); }
+
+  // editor geometry: ROIs stored in IMAGE px; s = display px per image px
+  let EH = model.get("view_size") || 430;
+  let EW = Math.round(EH / ASPECT), s = EW / dims[0];
+  wrap.style.width = EW + "px"; wrap.style.height = EH + "px";
+  const D = (v) => v * s, I = (v) => v / s;
+  // shared by the size slider, ctrl/cmd+scroll zoom, and fullscreen enter/exit
+  function applyViewSize(v) {
+    EH = Math.max(150, Math.round(v)); EW = Math.round(EH / ASPECT); s = EW / dims[0];
+    wrap.style.width = EW + "px"; wrap.style.height = EH + "px";
+    $(".sd-vs").value = EH;
+    renderEditor();
+  }
+
+  let selections = (model.get("selections") || []).map((x) => Object.assign({}, x));
+  let currentPos = 0, activeId = null, mode = model.get("roi_mode") || "single";
+  const collapsedPos = new Set(); // position headers collapsed in the selections list
+  // start past the highest id already present (e.g. resumed from a saved
+  // selection.json) so newly drawn/fitted ROIs never collide with those ids
+  let frame = 0, uid = selections.reduce((m, x) => Math.max(m, +x.id || 0), 0) + 1, picking = false, points = [];
+  const frameImg = new Image();
+  const roisAt = (p) => selections.filter((x) => x.position === p);
+
+  // ---- image requests over the wire ----
+  const pending = {};
+  model.on("msg:custom", (msg, buffers) => {
+    if (!msg) return;
+    if (msg.type === "thumb") {
+      const cb = pending["t" + msg.pos]; delete pending["t" + msg.pos];
+      if (cb && buffers && buffers[0]) cb(blobUrl(buffers[0]));
+      thumbInFlight--; pumpThumbQueue();
+    } else if (msg.type === "frame") {
+      clearTimeout(frameTimer);
+      if (buffers && buffers[0]) frameImg.src = blobUrl(buffers[0]);
+    } else if (msg.type === "error") {
+      if (msg.kind === "thumb") {
+        delete pending["t" + msg.pos];
+        thumbInFlight--; pumpThumbQueue();
+        return;
+      }
+      if (msg.kind === "frame" && msg.pos === currentPos) {
+        clearTimeout(frameTimer);
+        showStatus("Error loading pos " + String(msg.pos).padStart(3, "0") + ": " + (msg.message || "failed to load"), true);
+        return;
+      }
+      if (msg.kind === "fit" && picking) {
+        // surfaced persistently in the readout (not a fleeting toast) and
+        // reset for a fresh 4-point attempt, instead of leaving the counter
+        // stuck with no way forward.
+        fitting = false; points = []; drawPick();
+        pickError = msg.message || "fit failed"; renderSpec();
+        return;
+      }
+      toast("Error: " + (msg.message || "something went wrong"));
+    } else if (msg.type === "fit" && msg.roi) {
+      finishFit(msg.roi);
+    } else if (msg.type === "saved") {
+      toast("Saved " + (msg.path || "selection.json"));
+    }
+  });
+  function blobUrl(buf) {
+    const arr = buf instanceof DataView ? new Uint8Array(buf.buffer) : new Uint8Array(buf);
+    return URL.createObjectURL(new Blob([arr], { type: "image/png" }));
+  }
+  frameImg.onload = () => { wrap.style.backgroundImage = "url(" + frameImg.src + ")";
+    wrap.style.backgroundSize = "cover"; hideStatus(); };
+  frameImg.onerror = () => { clearTimeout(frameTimer); showStatus("Failed to decode frame image", true); };
+
+  // ---- gallery (accordion + lazy thumb) ----
+  // A Jupyter kernel processes comm messages one at a time on a single
+  // thread, and each thumb read is a blocking SMB call -- scrolling the
+  // gallery can bring many rows into view almost at once, and firing a
+  // request per row would queue dozens of slow reads ahead of anything else
+  // (e.g. a point-fit or Save the user triggers moments later). Throttle to a
+  // small number in flight so the wire queue stays short.
+  const MAX_THUMB_INFLIGHT = 2;
+  let thumbInFlight = 0;
+  const thumbQueue = [];
+  function pumpThumbQueue() {
+    while (thumbInFlight < MAX_THUMB_INFLIGHT && thumbQueue.length) {
+      const ix = thumbQueue.shift();
+      thumbInFlight++;
+      model.send({ type: "thumb", pos: ix, downscale: 8 });
+    }
+  }
+  const io = new IntersectionObserver((ents) => {
+    ents.forEach((e) => {
+      if (e.isIntersecting) {
+        const t = e.target, ix = +t.dataset.ix;
+        pending["t" + ix] = (url) => {
+          const img = document.createElement("img"); img.src = url; t.insertBefore(img, t.firstChild);
+        };
+        thumbQueue.push(ix);
+        io.unobserve(t);
+      }
+    });
+    pumpThumbQueue();
+  }, { root: gal, rootMargin: "150px" });
+  function computeExp() {
+    const w = gal.clientWidth - 16;
+    root.querySelectorAll(".sd-thumb").forEach((t) => t.style.setProperty("--exp", Math.max(150, Math.round(w * ASPECT)) + "px"));
+  }
+  function buildGallery() {
+    gal.innerHTML = "";
+    for (let i = 0; i < NPOS; i++) {
+      const d = document.createElement("div");
+      d.className = "sd-thumb" + (i === currentPos ? " sel" : "");
+      d.dataset.ix = i;
+      d.innerHTML = "<span class='ix'>pos " + String(i).padStart(3, "0") + "</span>" +
+        (roisAt(i).length ? "<span class='dot'></span>" : "");
+      d.onclick = () => selectPos(i);
+      gal.appendChild(d); io.observe(d);
+    }
+    computeExp();
+  }
+
+  // ---- editor ----
+  let frameTimer = null;
+  function requestFrame() {
+    clearTimeout(frameTimer);
+    hideStatus();
+    frameTimer = setTimeout(() => showStatus("Loading pos " + String(currentPos).padStart(3, "0") + "…", false), 150);
+    model.send({ type: "frame", pos: currentPos, t: frame });
+  }
+  function renderEditor() {
+    wrap.querySelectorAll(".roi:not(.preview)").forEach((n) => n.remove());
+    roisAt(currentPos).forEach((sel) => {
+      const eln = document.createElement("div");
+      eln.className = "roi" + (sel.id === activeId ? " active" : "");
+      eln.style.cssText = "--rc:" + hexOf(sel.ci) + ";left:" + D(sel.x) + "px;top:" + D(sel.y) +
+        "px;width:" + D(sel.w) + "px;height:" + D(sel.h) +
+        "px;transform:translate(-50%,-50%) rotate(" + sel.angle + "deg)";
+      eln.innerHTML = "<span class='tag'>" + sel.label + "</span><span class='knob'></span>" +
+        "<span class='rz' data-c='tl'></span><span class='rz' data-c='tr'></span>" +
+        "<span class='rz' data-c='bl'></span><span class='rz' data-c='br'></span>";
+      eln.addEventListener("pointerdown", (ev) => startDrag(ev, sel, "move", eln));
+      eln.querySelector(".knob").addEventListener("pointerdown", (ev) => startDrag(ev, sel, "rotate", eln));
+      eln.querySelectorAll(".rz").forEach((h) => h.addEventListener(
+        "pointerdown", (ev) => startDrag(ev, sel, "resize", eln, h.dataset.c)));
+      wrap.appendChild(eln);
+    });
+    $(".sd-epos").textContent = "pos " + String(currentPos).padStart(3, "0");
+    renderSpec(); renderLabel();
+  }
+  function renderSpec() {
+    const box = $(".sd-spec");
+    if (picking) { box.textContent = pickHint(); return; }
+    const sel = selections.find((x) => x.id === activeId);
+    if (!sel || sel.position !== currentPos) { box.textContent = "no ROI selected"; return; }
+    const um = PX ? " (" + (sel.w * PX).toFixed(1) + "×" + (sel.h * PX).toFixed(1) + " µm)" : "";
+    box.innerHTML = "center " + Math.round(sel.x) + ", " + Math.round(sel.y) + " px<br>" +
+      "size " + Math.round(sel.w) + "×" + Math.round(sel.h) + " px" + um + "<br>angle " + sel.angle.toFixed(1) + "°";
+  }
+  function renderLabel() {
+    const sel = selections.find((x) => x.id === activeId);
+    const inp = $(".sd-lbl"), sw = $(".sd-sw");
+    if (sel && sel.position === currentPos) { inp.value = sel.label; inp.disabled = false; sw.style.background = hexOf(sel.ci); }
+    else { inp.value = ""; inp.disabled = true; sw.style.background = "var(--border)"; }
+  }
+  function selectPos(p) {
+    if (picking) exitPick();
+    currentPos = p; const h = roisAt(p); activeId = h.length ? h[0].id : null;
+    root.querySelectorAll(".sd-thumb").forEach((t) => t.classList.toggle("sel", +t.dataset.ix === p));
+    frame = 0; $(".sd-frame").value = 0; $(".sd-frlbl").textContent = "0 / " + NT;
+    requestFrame(); renderEditor(); renderList();
+  }
+
+  // ---- selections ----
+  let autosave = false, autoSaveTimer = null;
+  function pushSelections() {
+    model.set("selections", selections.map((x) => ({
+      id: x.id, position: x.position, label: x.label, ci: x.ci,
+      roi: { center: [x.x, x.y], size: [Math.round(x.w), Math.round(x.h)], angle: x.angle },
+    })));
+    model.save_changes();
+    if (autosave) {
+      // debounced so rapid edits (dragging, typing a label) trigger one
+      // disk write shortly after things settle, not one per keystroke/pixel
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = setTimeout(() => model.send({ type: "save" }), 800);
+    }
+  }
+  function renderList() {
+    const list = $(".sd-list"); list.innerHTML = "";
+    const byPos = {}; selections.forEach((x) => { (byPos[x.position] = byPos[x.position] || []).push(x); });
+    Object.keys(byPos).map(Number).sort((a, b) => a - b).forEach((p) => {
+      const collapsed = collapsedPos.has(p);
+      const hd = document.createElement("div");
+      hd.className = "sd-poshd";
+      hd.textContent = (collapsed ? "▸" : "▾") + " pos " + String(p).padStart(3, "0") +
+        " (" + byPos[p].length + ")";
+      hd.onclick = () => {
+        if (collapsedPos.has(p)) collapsedPos.delete(p); else collapsedPos.add(p);
+        renderList();
+      };
+      list.appendChild(hd);
+      if (collapsed) return;
+      byPos[p].forEach((sel) => {
+        const row = document.createElement("div");
+        row.className = "sd-row" + (sel.id === activeId ? " active" : "");
+        row.innerHTML = "<span class='sw' style='background:" + hexOf(sel.ci) + "'></span>" +
+          "<span class='nm'>" + sel.label + "</span>" +
+          "<span style='font-family:var(--font-mono);font-size:10px;color:var(--text-faint)'>" +
+          Math.round(sel.w) + "×" + Math.round(sel.h) + "</span>";
+        row.onclick = () => { currentPos = sel.position; activeId = sel.id;
+          root.querySelectorAll(".sd-thumb").forEach((t) => t.classList.toggle("sel", +t.dataset.ix === currentPos));
+          requestFrame(); renderEditor(); renderList(); };
+        list.appendChild(row);
+      });
+    });
+    $(".sd-seln").textContent = selections.length;
+    root.querySelectorAll(".sd-thumb").forEach((t) => {
+      const has = roisAt(+t.dataset.ix).length;
+      let dot = t.querySelector(".dot");
+      if (has && !dot) { dot = document.createElement("span"); dot.className = "dot"; t.appendChild(dot); }
+      if (!has && dot) dot.remove();
+    });
+  }
+  function addRoi() {
+    if (mode === "single") selections = selections.filter((x) => x.position !== currentPos);
+    const h = roisAt(currentPos), ci = h.length ? Math.max.apply(null, h.map((x) => x.ci)) + 1 : 0;
+    const sel = { id: uid++, position: currentPos, x: dims[0] / 2, y: dims[1] / 2,
+      w: Math.round(dims[0] / 3), h: Math.round(dims[1] / 3), angle: 0,
+      label: "colony " + String.fromCharCode(65 + h.length), ci: ci };
+    selections.push(sel); activeId = sel.id;
+    renderEditor(); renderList(); pushSelections();
+  }
+  function removeSel(id) {
+    selections = selections.filter((x) => x.id !== id);
+    if (activeId === id) { const h = roisAt(currentPos); activeId = h.length ? h[0].id : null; }
+    renderEditor(); renderList(); pushSelections();
+  }
+
+  // ---- drag / rotate / resize ----
+  let drag = null;
+  function startDrag(ev, sel, kind, eln, corner) {
+    if (picking) return;
+    ev.preventDefault(); ev.stopPropagation();
+    if (activeId !== sel.id) { activeId = sel.id; renderEditor(); renderList(); }
+    drag = { sel, kind, eln, rect: wrap.getBoundingClientRect(),
+      px: ev.clientX, py: ev.clientY, ox: sel.x, oy: sel.y };
+    if (kind === "resize") {
+      // Anchor the corner diagonally opposite the one being dragged: it stays
+      // fixed in image space for the whole drag, so only the two dimensions
+      // toward the dragged corner change (w/h + the center shift that keeps
+      // the anchor put), instead of resizing symmetrically about the center.
+      const signX = (corner === "tr" || corner === "br") ? 1 : -1;
+      const signY = (corner === "bl" || corner === "br") ? 1 : -1;
+      const theta = sel.angle * Math.PI / 180, cos = Math.cos(theta), sin = Math.sin(theta);
+      const alx = -signX * sel.w / 2, aly = -signY * sel.h / 2;
+      drag.anchorX = sel.x + (alx * cos - aly * sin);
+      drag.anchorY = sel.y + (alx * sin + aly * cos);
+      drag.signX = signX; drag.signY = signY; drag.rAngle = theta;
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  }
+  function onMove(ev) {
+    if (!drag) return;
+    const { sel, kind, rect } = drag, mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    if (kind === "move") {
+      sel.x = Math.max(5, Math.min(dims[0] - 5, drag.ox + I(ev.clientX - drag.px)));
+      sel.y = Math.max(5, Math.min(dims[1] - 5, drag.oy + I(ev.clientY - drag.py)));
+    } else if (kind === "rotate") {
+      sel.angle = Math.round((Math.atan2(my - D(sel.y), mx - D(sel.x)) * 180 / Math.PI + 90) * 10) / 10;
+    } else if (kind === "resize") {
+      const cos = Math.cos(drag.rAngle), sin = Math.sin(drag.rAngle);
+      const vx = I(mx) - drag.anchorX, vy = I(my) - drag.anchorY;
+      // anchor->pointer vector, expressed in the box's own (unrotated) frame
+      const lx = vx * cos + vy * sin, ly = -vx * sin + vy * cos;
+      sel.w = Math.max(20, Math.round(Math.abs(lx)));
+      sel.h = Math.max(20, Math.round(Math.abs(ly)));
+      const hx = drag.signX * sel.w / 2, hy = drag.signY * sel.h / 2;
+      sel.x = drag.anchorX + (hx * cos - hy * sin);
+      sel.y = drag.anchorY + (hx * sin + hy * cos);
+    }
+    const eln = drag.eln;
+    eln.style.left = D(sel.x) + "px"; eln.style.top = D(sel.y) + "px";
+    eln.style.width = D(sel.w) + "px"; eln.style.height = D(sel.h) + "px";
+    eln.style.transform = "translate(-50%,-50%) rotate(" + sel.angle + "deg)";
+    renderSpec();
+  }
+  function onUp() { window.removeEventListener("pointermove", onMove); drag = null; renderList(); pushSelections(); }
+
+  // ---- point-fit (via Python cv2) ----
+  const FIT_POINTS = 4; // one click per corner of the intended rectangle
+  let fitting = false, pickError = null; // fitting: request in flight; pickError: last failure (persistent, not a fleeting toast)
+  function pickHint() {
+    if (fitting) return "Fitting…";
+    if (pickError) return "Error: " + pickError + " -- click " + FIT_POINTS + " corners again (0 / " + FIT_POINTS + ")";
+    return "Click the " + FIT_POINTS + " corners (" + points.length + " / " + FIT_POINTS + ")";
+  }
+  function enterPick() { picking = true; points = []; fitting = false; pickError = null; activeId = null;
+    wrap.classList.add("pick"); renderEditor(); drawPick(); $(".sd-point").classList.add("on"); }
+  function exitPick() { picking = false; points = []; fitting = false;
+    wrap.classList.remove("pick"); wrap.querySelectorAll(".ptmark").forEach((n) => n.remove());
+    $(".sd-point").classList.remove("on"); }
+  wrap.addEventListener("click", (ev) => {
+    if (!picking || fitting) return;
+    const r = wrap.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+    if (x < 0 || y < 0 || x > EW || y > EH) return;
+    pickError = null;
+    points.push([I(x), I(y)]); drawPick();
+    if (points.length >= FIT_POINTS) { fitting = true; model.send({ type: "fit", points: points }); }
+    renderSpec();
+  });
+  function drawPick() {
+    wrap.querySelectorAll(".ptmark").forEach((n) => n.remove());
+    points.forEach((p) => { const d = document.createElement("div"); d.className = "ptmark";
+      d.style.left = D(p[0]) + "px"; d.style.top = D(p[1]) + "px"; wrap.appendChild(d); });
+  }
+  function finishFit(roi) {
+    if (!picking) return;
+    // commit immediately as a normal, adjustable ROI -- renderEditor() below
+    // draws it with the usual drag/rotate/resize handles right away.
+    const cx = roi.center[0], cy = roi.center[1], w = roi.size[0], h = roi.size[1];
+    if (mode === "single") selections = selections.filter((x) => x.position !== currentPos);
+    const hh = roisAt(currentPos), ci = hh.length ? Math.max.apply(null, hh.map((x) => x.ci)) + 1 : 0;
+    const sel = { id: uid++, position: currentPos, x: cx, y: cy, w: w, h: h, angle: roi.angle,
+      label: "colony " + String.fromCharCode(65 + hh.length), ci: ci };
+    selections.push(sel); activeId = sel.id; exitPick();
+    renderEditor(); renderList(); pushSelections(); toast("Fitted ROI from points");
+  }
+
+  // ---- controls ----
+  $(".sd-vs").addEventListener("input", (e) => {
+    applyViewSize(+e.target.value); model.set("view_size", EH); model.save_changes();
+  });
+  // Ctrl/Cmd+scroll zooms the editor image; plain scroll passes through to pan
+  // the surrounding (overflow:auto) pane, so it never fights normal scrolling.
+  wrap.addEventListener("wheel", (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    e.preventDefault();
+    applyViewSize(EH * (e.deltaY < 0 ? 1.12 : 1 / 1.12));
+    model.set("view_size", EH); model.save_changes();
+  }, { passive: false });
+  // ---- fullscreen ----
+  let preFsViewSize = EH;
+  const fsBtn = $(".sd-full");
+  const requestFs = root.requestFullscreen || root.webkitRequestFullscreen;
+  const exitFs = document.exitFullscreen || document.webkitExitFullscreen;
+  fsBtn.onclick = () => {
+    if (!requestFs) { toast("Fullscreen not supported in this browser"); return; }
+    if (document.fullscreenElement === root) exitFs.call(document);
+    else requestFs.call(root);
+  };
+  function onFsChange() {
+    const isFs = document.fullscreenElement === root;
+    fsBtn.textContent = isFs ? "⤢ Exit fullscreen" : "⛶ Fullscreen";
+    if (isFs) { preFsViewSize = EH; applyViewSize(Math.round(window.innerHeight * 0.82)); }
+    else applyViewSize(preFsViewSize);
+  }
+  document.addEventListener("fullscreenchange", onFsChange);
+  $(".sd-frame").addEventListener("input", (e) => { frame = +e.target.value;
+    $(".sd-frlbl").textContent = frame + " / " + NT; requestFrame(); });
+  $(".sd-draw").onclick = () => { if (picking) exitPick(); addRoi(); };
+  $(".sd-point").onclick = () => { picking ? exitPick() : enterPick(); if (!picking) renderEditor(); };
+  $(".sd-del").onclick = () => { if (activeId) removeSel(activeId); };
+  $(".sd-lbl").addEventListener("input", (e) => { const sel = selections.find((x) => x.id === activeId);
+    if (sel) { sel.label = e.target.value; renderEditor(); renderList(); pushSelections(); } });
+  root.querySelectorAll(".sd-mode button").forEach((b) => { b.onclick = () => {
+    mode = b.dataset.m; model.set("roi_mode", mode); model.save_changes();
+    root.querySelectorAll(".sd-mode button").forEach((x) => x.classList.toggle("on", x === b));
+    if (mode === "single") { const seen = {}; selections = selections.filter((x) => {
+      if (seen[x.position]) return false; seen[x.position] = 1; return true; });
+      renderEditor(); renderList(); pushSelections(); } }; });
+  root.querySelectorAll(".sd-mode button").forEach((x) => x.classList.toggle("on", x.dataset.m === mode));
+  $(".sd-save").onclick = () => model.send({ type: "save" });
+  $(".sd-autochk").addEventListener("change", (e) => { autosave = e.target.checked; });
+
+  // ---- splitters ----
+  root.querySelectorAll(".sd-rz").forEach((rz) => {
+    rz.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      const side = rz.dataset.side, sx = e.clientX;
+      const pane = side === "l" ? main.children[0] : main.children[4];
+      const sw = pane.getBoundingClientRect().width;
+      const mv = (ev) => { const d = ev.clientX - sx;
+        if (side === "l") { main.style.setProperty("--lw", Math.max(140, Math.min(360, sw + d)) + "px"); computeExp(); }
+        else main.style.setProperty("--rw", Math.max(180, Math.min(420, sw - d)) + "px"); };
+      const up = () => { window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up); };
+      window.addEventListener("pointermove", mv); window.addEventListener("pointerup", up, { once: true });
+    });
+  });
+
+  let toastT;
+  function toast(m) { const t = root.querySelector(".sd-toast"); t.textContent = m; t.classList.add("show");
+    clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 2200); }
+
+  buildGallery(); selectPos(0); renderList();
+  return () => { io.disconnect(); document.removeEventListener("fullscreenchange", onFsChange); };
+}
+export default { render };
+"""
+
+
+# The RegistrationDashboard ESM: method/position picker, a verify view (drift
+# trajectory + before/after toggle), a mask-rect editor for
+# MaskedTemplateCorrelation (porting ROICropper's click-to-fit + drag/resize/
+# rotate interaction model -- same corner/rotate-handle math, own canvas/model
+# keys so ROICropper itself is untouched), and a batch-apply panel with a live
+# progress bar fed by the widget's "progress" messages. Like the other widgets
+# here, this is BEST-EFFORT JavaScript, unverified by the headless Python
+# suite -- validated only by a real Jupyter/Colab/marimo run (no ESM/Playwright
+# suite for this widget in v1, per the spec's Never section).
+_REGISTRATION_DASHBOARD_ESM = r"""
+// RegistrationDashboard render() -- method/position/verify controls, a mask-rect
+// editor (shown only for MaskedTemplateCorrelation), a drift-trajectory +
+// before/after verify view, and a batch-apply panel with a live progress bar.
+// UNVERIFIED in CI: validated by a real Jupyter/Colab/marimo run only.
+function render({ model, el }) {
+  el.innerHTML = "";
+  const root = document.createElement("div");
+  root.style.font = "13px sans-serif";
+  root.style.border = "1px solid #ccc";
+  root.style.borderRadius = "8px";
+  root.style.padding = "10px";
+  root.style.maxWidth = "720px";
+  el.appendChild(root);
+
+  const METHODS = [
+    "PhaseCorrelationHighpass",
+    "MaskedTemplateCorrelation",
+    "HoughLineRigidFit",
+    "FeatureRANSACEuclidean",
+    "GradientECC",
+  ];
+
+  const md = model.get("metadata") || {};
+  const numPositions = md.num_positions || (model.get("positions") || []).length || 1;
+
+  root.innerHTML =
+    "<div class='rd-head' style='display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:8px;'>" +
+      "<label>Method <select class='rd-method'>" +
+        METHODS.map((m) => "<option value='" + m + "'>" + m + "</option>").join("") +
+      "</select></label>" +
+      "<label>Position <input class='rd-pos' type='number' min='0' max='" + (numPositions - 1) +
+        "' value='0' style='width:60px'></label>" +
+      "<label>Samples <input class='rd-nsamp' type='number' min='1' value='" +
+        model.get("n_sample_frames") + "' style='width:50px'></label>" +
+      "<button class='rd-verify'>Verify</button>" +
+    "</div>" +
+    "<div class='rd-mask' style='display:none;margin-bottom:10px;'>" +
+      "<div style='font-size:11px;color:#666;margin-bottom:4px;'>Mask rect for " +
+      "MaskedTemplateCorrelation: click &ge;3 points around a static landmark " +
+      "(frame 0 of the position above), or drag the box / corners / rotate knob.</div>" +
+      "<canvas class='rd-mask-canvas' style='touch-action:none;border:1px solid #999;'></canvas>" +
+    "</div>" +
+    "<div class='rd-verify-out' style='display:none;margin-bottom:10px;'>" +
+      "<canvas class='rd-traj' width='640' height='140' style='border:1px solid #ddd;'></canvas>" +
+      "<div style='margin-top:8px;'>" +
+        "<label style='font-size:11px;color:#666;'><input type='checkbox' class='rd-toggle'> show corrected</label>" +
+        "<span class='rd-comp-label' style='font-size:11px;color:#666;margin-left:8px;'></span>" +
+        "<img class='rd-compare-img' style='max-width:320px;display:block;border:1px solid #ddd;margin-top:4px;'>" +
+      "</div>" +
+    "</div>" +
+    "<div class='rd-status' style='font-size:11px;color:#a33;margin-bottom:6px;'></div>" +
+    "<div class='rd-batch' style='border-top:1px solid #ddd;padding-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>" +
+      "<input class='rd-dir' placeholder='(current working directory)' style='flex:1;min-width:160px;'>" +
+      "<button class='rd-batch-btn'>Batch Apply</button>" +
+      "<button class='rd-save-btn'>Save</button>" +
+    "</div>" +
+    "<div class='rd-progress-wrap' style='display:none;margin-top:8px;'>" +
+      "<div style='background:#eee;border-radius:4px;height:10px;overflow:hidden;'>" +
+        "<div class='rd-progress-bar' style='background:#0f8f82;height:100%;width:0%;'></div>" +
+      "</div>" +
+      "<div class='rd-progress-label' style='font-size:11px;color:#666;margin-top:2px;'></div>" +
+    "</div>";
+
+  const $ = (s) => root.querySelector(s);
+  const methodSel = $(".rd-method"), posInput = $(".rd-pos"), nsampInput = $(".rd-nsamp");
+  const maskWrap = $(".rd-mask"), maskCanvas = $(".rd-mask-canvas");
+  const verifyOut = $(".rd-verify-out"), trajCanvas = $(".rd-traj");
+  const toggle = $(".rd-toggle"), compareImg = $(".rd-compare-img"), compLabel = $(".rd-comp-label");
+  const statusEl = $(".rd-status");
+  const dirInput = $(".rd-dir"), progWrap = $(".rd-progress-wrap");
+  const progBar = $(".rd-progress-bar"), progLabel = $(".rd-progress-label");
+
+  methodSel.value = model.get("method_name");
+
+  function updateMaskVisibility() {
+    maskWrap.style.display = methodSel.value === "MaskedTemplateCorrelation" ? "block" : "none";
+  }
+  updateMaskVisibility();
+
+  function requestMaskFrame() {
+    model.send({ type: "mask_frame", position: parseInt(posInput.value, 10) || 0 });
+  }
+
+  methodSel.addEventListener("change", () => {
+    model.set("method_name", methodSel.value);
+    model.save_changes();
+    updateMaskVisibility();
+    if (methodSel.value === "MaskedTemplateCorrelation") {
+      layoutMask();
+      requestMaskFrame();
+    }
+  });
+  nsampInput.addEventListener("change", () => {
+    model.set("n_sample_frames", Math.max(1, parseInt(nsampInput.value, 10) || 1));
+    model.save_changes();
+  });
+  posInput.addEventListener("change", () => {
+    if (methodSel.value === "MaskedTemplateCorrelation") requestMaskFrame();
+  });
+
+  function showStatus(msg, isErr) {
+    statusEl.textContent = msg || "";
+    statusEl.style.color = isErr ? "#a33" : "#666";
+  }
+
+  function blobUrl(buf) {
+    const arr = buf instanceof DataView ? new Uint8Array(buf.buffer) : new Uint8Array(buf);
+    return URL.createObjectURL(new Blob([arr], { type: "image/png" }));
+  }
+
+  // ---- mask-rect editor: click-to-fit + drag/resize/rotate, porting
+  // ROICropper's interaction model (same corner/rotate-handle geometry) onto
+  // this widget's own mask_* traits/canvas -- ROICropper itself is untouched.
+  const maskImg = new Image();
+  let maskReady = false;
+  maskImg.onload = () => { maskReady = true; layoutMask(); drawMask(); };
+  maskImg.onerror = () => { maskReady = false; drawMask(); };
+  let mscale = 1;
+  function maskImgW() { return model.get("mask_image_w") || 1; }
+  function maskImgH() { return model.get("mask_image_h") || 1; }
+  function layoutMask() {
+    const w = maskImgW(), h = maskImgH();
+    const MAX_W = 480;
+    mscale = Math.min(1, MAX_W / w);
+    maskCanvas.width = Math.round(w * mscale);
+    maskCanvas.height = Math.round(h * mscale);
+  }
+  function mToImg(px, py) { return [px / mscale, py / mscale]; }
+  function mToCanvas(ix, iy) { return [ix * mscale, iy * mscale]; }
+  function getMaskRect() {
+    return {
+      cx: model.get("mask_center_x"), cy: model.get("mask_center_y"),
+      w: model.get("mask_width"), h: model.get("mask_height"), angle: model.get("mask_angle"),
+    };
+  }
+  function maskCorners(r) {
+    const a = (r.angle * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+    const hw = r.w / 2, hh = r.h / 2;
+    const local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    return local.map(([lx, ly]) => [r.cx + lx * ca + ly * sa, r.cy - lx * sa + ly * ca]);
+  }
+  function maskLocalToImg(r, lx, ly) {
+    const a = (r.angle * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+    return [r.cx + lx * ca + ly * sa, r.cy - lx * sa + ly * ca];
+  }
+  function maskImgToLocal(r, ix, iy) {
+    const a = (r.angle * Math.PI) / 180, ca = Math.cos(a), sa = Math.sin(a);
+    const dx = ix - r.cx, dy = iy - r.cy;
+    return [dx * ca - dy * sa, dx * sa + dy * ca];
+  }
+  function maskRotateHandle(r) {
+    const off = r.h / 2 + 24 / mscale;
+    return maskLocalToImg(r, 0, -off);
+  }
+  function drawMask() {
+    const ctx = maskCanvas.getContext("2d");
+    ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    if (maskReady) ctx.drawImage(maskImg, 0, 0, maskCanvas.width, maskCanvas.height);
+    const pts = model.get("mask_points") || [];
+    ctx.fillStyle = "#00e5ff";
+    for (const [ix, iy] of pts) {
+      const [px, py] = mToCanvas(ix, iy);
+      ctx.beginPath(); ctx.arc(px, py, 3, 0, 2 * Math.PI); ctx.fill();
+    }
+    const r = getMaskRect();
+    if (r.w > 0 && r.h > 0) {
+      const cs = maskCorners(r).map(([ix, iy]) => mToCanvas(ix, iy));
+      ctx.strokeStyle = "#ffeb3b"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(cs[0][0], cs[0][1]);
+      for (let i = 1; i < cs.length; i++) ctx.lineTo(cs[i][0], cs[i][1]);
+      ctx.closePath(); ctx.stroke();
+      ctx.fillStyle = "#ffeb3b";
+      for (const [px, py] of cs) ctx.fillRect(px - 4, py - 4, 8, 8);
+      const [rx, ry] = mToCanvas(...maskRotateHandle(r));
+      const [ccx, ccy] = mToCanvas(r.cx, r.cy);
+      ctx.strokeStyle = "#ff5252";
+      ctx.beginPath(); ctx.moveTo(ccx, ccy); ctx.lineTo(rx, ry); ctx.stroke();
+      ctx.fillStyle = "#ff5252";
+      ctx.beginPath(); ctx.arc(rx, ry, 5, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+  let mdrag = null;
+  const MOVE_THRESHOLD = 4;
+  function maskLocalPos(ev) {
+    const rect = maskCanvas.getBoundingClientRect();
+    const sx = rect.width ? maskCanvas.width / rect.width : 1;
+    const sy = rect.height ? maskCanvas.height / rect.height : 1;
+    return [(ev.clientX - rect.left) * sx, (ev.clientY - rect.top) * sy];
+  }
+  function maskHit(px, py) {
+    const r = getMaskRect();
+    if (r.w > 0 && r.h > 0) {
+      const cs = maskCorners(r).map(([ix, iy]) => mToCanvas(ix, iy));
+      for (let i = 0; i < cs.length; i++) {
+        if (Math.hypot(px - cs[i][0], py - cs[i][1]) <= 8) return { mode: "resize", cornerIndex: i };
+      }
+      const [rx, ry] = mToCanvas(...maskRotateHandle(r));
+      if (Math.hypot(px - rx, py - ry) <= 8) return { mode: "rotate" };
+      const [ix, iy] = mToImg(px, py);
+      const [lx, ly] = maskImgToLocal(r, ix, iy);
+      if (Math.abs(lx) <= r.w / 2 && Math.abs(ly) <= r.h / 2) return { mode: "move" };
+    }
+    return null;
+  }
+  function addMaskPoint(px, py) {
+    const [ix, iy] = mToImg(px, py);
+    const pts = (model.get("mask_points") || []).slice();
+    pts.push([ix, iy]);
+    model.set("mask_points", pts);
+    model.save_changes();
+    drawMask();
+  }
+  function onMaskDown(ev) {
+    const [px, py] = maskLocalPos(ev);
+    const h = maskHit(px, py);
+    const r = getMaskRect();
+    const [ix, iy] = mToImg(px, py);
+    mdrag = {
+      ...(h || {}), candidateMode: h ? h.mode : null, mode: null,
+      r, ix, iy, startPx: px, startPy: py, moved: false,
+    };
+    try { maskCanvas.setPointerCapture(ev.pointerId); } catch (e) {}
+  }
+  function onMaskMove(ev) {
+    if (!mdrag) return;
+    const [px, py] = maskLocalPos(ev);
+    if (!mdrag.moved) {
+      if (Math.hypot(px - mdrag.startPx, py - mdrag.startPy) < MOVE_THRESHOLD) return;
+      mdrag.moved = true;
+      mdrag.mode = mdrag.candidateMode;
+    }
+    if (!mdrag.mode) return;
+    const [ix, iy] = mToImg(px, py);
+    const r = mdrag.r;
+    if (mdrag.mode === "move") {
+      model.set("mask_center_x", r.cx + (ix - mdrag.ix));
+      model.set("mask_center_y", r.cy + (iy - mdrag.iy));
+    } else if (mdrag.mode === "rotate") {
+      const angle = Math.atan2(-(ix - r.cx), -(iy - r.cy)) * 180 / Math.PI;
+      model.set("mask_angle", angle);
+    } else if (mdrag.mode === "resize") {
+      const hw = r.w / 2, hh = r.h / 2;
+      const localCorners = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+      const i = mdrag.cornerIndex;
+      const opp = localCorners[(i + 2) % 4];
+      const [ox, oy] = maskLocalToImg(r, opp[0], opp[1]);
+      const ncx = (ix + ox) / 2, ncy = (iy + oy) / 2;
+      const rAxes = { ...r, cx: ncx, cy: ncy };
+      const [lx, ly] = maskImgToLocal(rAxes, ix, iy);
+      const oLocal = maskImgToLocal(rAxes, ox, oy);
+      const nw = Math.max(1, Math.round(Math.abs(lx - oLocal[0])));
+      const nh = Math.max(1, Math.round(Math.abs(ly - oLocal[1])));
+      model.set("mask_center_x", ncx); model.set("mask_center_y", ncy);
+      model.set("mask_width", nw); model.set("mask_height", nh);
+    }
+    model.save_changes();
+    drawMask();
+  }
+  function onMaskUp(ev) {
+    if (!mdrag) return;
+    if (!mdrag.moved) addMaskPoint(mdrag.startPx, mdrag.startPy);
+    try { maskCanvas.releasePointerCapture(ev.pointerId); } catch (e) {}
+    mdrag = null;
+  }
+  maskCanvas.addEventListener("pointerdown", onMaskDown);
+  maskCanvas.addEventListener("pointermove", onMaskMove);
+  maskCanvas.addEventListener("pointerup", onMaskUp);
+  maskCanvas.addEventListener("pointercancel", onMaskUp);
+
+  function onMaskImageChange() {
+    const b64 = model.get("mask_image_b64");
+    if (b64) { maskImg.src = b64; }
+  }
+  function onMaskGeomChange() { drawMask(); }
+  model.on("change:mask_image_b64", onMaskImageChange);
+  model.on(
+    "change:mask_center_x change:mask_center_y change:mask_width change:mask_height " +
+      "change:mask_angle change:mask_points",
+    onMaskGeomChange,
+  );
+
+  // ---- verify: drift trajectory (dx/dy/theta) + before/after toggle ----
+  $(".rd-verify").addEventListener("click", () => {
+    showStatus("");
+    model.send({
+      type: "verify",
+      position: parseInt(posInput.value, 10) || 0,
+      method: methodSel.value,
+    });
+  });
+
+  let lastVerify = null;
+  function drawTrajectory(frameIndices, transforms) {
+    const ctx = trajCanvas.getContext("2d");
+    ctx.clearRect(0, 0, trajCanvas.width, trajCanvas.height);
+    const n = frameIndices.length;
+    if (n === 0) return;
+    const dx = transforms.map((t) => (t ? t.dx : null));
+    const dy = transforms.map((t) => (t ? t.dy : null));
+    const theta = transforms.map((t) => (t ? t.theta : null));
+    const nums = [].concat(dx, dy).filter((v) => v !== null && v !== undefined);
+    const maxAbs = Math.max(1, ...nums.map((v) => Math.abs(v)));
+    const midY = trajCanvas.height / 2;
+    const scaleY = (trajCanvas.height / 2 - 10) / maxAbs;
+    const stepX = n > 1 ? (trajCanvas.width - 20) / (n - 1) : 0;
+    function plot(series, color) {
+      ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.5;
+      let started = false, prevX = 0, prevY = 0;
+      series.forEach((v, i) => {
+        const x = 10 + i * stepX;
+        if (v === null || v === undefined) { started = false; return; }
+        const y = midY - v * scaleY;
+        ctx.beginPath();
+        if (started) ctx.moveTo(prevX, prevY);
+        else ctx.moveTo(x, y);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+        ctx.beginPath(); ctx.arc(x, y, 2, 0, 2 * Math.PI); ctx.fill();
+        started = true; prevX = x; prevY = y;
+      });
+    }
+    ctx.strokeStyle = "#ccc"; ctx.beginPath();
+    ctx.moveTo(0, midY); ctx.lineTo(trajCanvas.width, midY); ctx.stroke();
+    plot(dx, "#2b7fd6");
+    plot(dy, "#d24d92");
+    plot(theta, "#25a06f");
+    ctx.fillStyle = "#555"; ctx.font = "10px sans-serif";
+    ctx.fillText("dx (blue)   dy (pink)   theta (green)", 10, 12);
+  }
+
+  model.on("msg:custom", (msg, buffers) => {
+    if (!msg) return;
+    if (msg.type === "verify_result") {
+      verifyOut.style.display = "block";
+      drawTrajectory(msg.frame_indices, msg.transforms);
+      const refUrl = buffers && buffers[0] ? blobUrl(buffers[0]) : null;
+      const uncorrUrl = buffers && buffers[1] ? blobUrl(buffers[1]) : null;
+      const corrUrl = msg.before_after_available && buffers && buffers[2] ? blobUrl(buffers[2]) : null;
+      lastVerify = { refUrl, uncorrUrl, corrUrl };
+      toggle.checked = false;
+      toggle.disabled = !corrUrl;
+      compLabel.textContent = "compare frame " + msg.compare_frame +
+        (corrUrl ? "" : " (no correction available for this frame)");
+      compareImg.src = uncorrUrl || "";
+    } else if (msg.type === "progress") {
+      progWrap.style.display = "block";
+      const frac = msg.num_frames ? msg.frame / msg.num_frames : 0;
+      const posFrac = msg.num_positions ? (msg.position + frac) / msg.num_positions : 0;
+      progBar.style.width = Math.min(100, Math.round(posFrac * 100)) + "%";
+      progLabel.textContent = "position " + msg.position + "/" + msg.num_positions +
+        " · frame " + msg.frame + "/" + msg.num_frames;
+    } else if (msg.type === "batch_done") {
+      progBar.style.width = "100%";
+      const nFailed = msg.failed_positions ? msg.failed_positions.length : 0;
+      progLabel.textContent = "done: " + msg.completed.length + " completed, " +
+        msg.skipped.length + " skipped, " + nFailed + " failed -- saved to " + msg.path;
+      showStatus("");
+    } else if (msg.type === "saved") {
+      showStatus("saved " + msg.path);
+    } else if (msg.type === "error") {
+      showStatus("Error (" + msg.kind + "): " + msg.message, true);
+    }
+  });
+
+  toggle.addEventListener("change", () => {
+    if (!lastVerify) return;
+    compareImg.src = (toggle.checked ? lastVerify.corrUrl : lastVerify.uncorrUrl) || "";
+  });
+
+  // ---- batch-apply ----
+  $(".rd-batch-btn").addEventListener("click", () => {
+    showStatus("");
+    progWrap.style.display = "block";
+    progBar.style.width = "0%";
+    progLabel.textContent = "starting...";
+    model.send({ type: "batch_apply", directory: dirInput.value || null });
+  });
+  $(".rd-save-btn").addEventListener("click", () => {
+    model.send({ type: "save" });
+  });
+
+  if (methodSel.value === "MaskedTemplateCorrelation") {
+    layoutMask();
+    const initB64 = model.get("mask_image_b64");
+    if (initB64) { maskImg.src = initB64; } else { requestMaskFrame(); }
+  }
+  drawMask();
+
+  return () => {
+    maskCanvas.removeEventListener("pointerdown", onMaskDown);
+    maskCanvas.removeEventListener("pointermove", onMaskMove);
+    maskCanvas.removeEventListener("pointerup", onMaskUp);
+    maskCanvas.removeEventListener("pointercancel", onMaskUp);
+    model.off("change:mask_image_b64", onMaskImageChange);
+    model.off(
+      "change:mask_center_x change:mask_center_y change:mask_width change:mask_height " +
+        "change:mask_angle change:mask_points",
+      onMaskGeomChange,
+    );
+  };
+}
+export default { render };
+"""
+
+
 if _HAS_ANYWIDGET:
 
     class ROICropper(anywidget.AnyWidget):  # type: ignore[no-redef]
@@ -1394,6 +2464,740 @@ if _HAS_ANYWIDGET:
                 "</p></div>"
             )
 
+    class SequenceDashboard(anywidget.AnyWidget):  # type: ignore[no-redef]
+        """Curate positions + ROIs across a multi-position acquisition (anywidget).
+
+        A three-pane UI (position gallery / ROI editor / selection list) over a
+        :class:`~acia.segm.open.SequenceFile`. Browse positions, mark ROIs (draw or
+        point-fit), and emit a :class:`~acia.selection.SelectionManifest`. Frames
+        are read lazily from the source and pushed to the browser as PNG bytes; the
+        widget never loads the whole (possibly hundreds-of-GB) file.
+
+        Works in Jupyter/Colab and in marimo via ``mo.ui.anywidget(dash)``. The ESM
+        is best-effort and verified only by a real notebook run (or the Playwright
+        suite in the devcontainer), not by the headless Python test-suite.
+        """
+
+        metadata = traitlets.Dict().tag(sync=True)  # type: ignore[var-annotated]
+        positions = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+        selections = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+        roi_mode = traitlets.Unicode("single").tag(sync=True)
+        view_size = traitlets.Int(430).tag(sync=True)
+
+        _esm = _SEQUENCE_DASHBOARD_ESM
+        _css = _SEQUENCE_DASHBOARD_CSS
+
+        def __init__(self, source, *, roi_mode: str = "single", **kwargs) -> None:
+            """Build the dashboard from a source (no pixel reads at construction).
+
+            Args:
+                source: A :class:`~acia.segm.open.SequenceFile`, or a path/str that
+                    is opened via :func:`~acia.segm.open.open_sequence`.
+                roi_mode: ``"single"`` (<=1 ROI/position) or ``"multi"``.
+                **kwargs: Forwarded to ``anywidget.AnyWidget``.
+            """
+            from acia.segm.open import open_sequence
+
+            if isinstance(source, (str, os.PathLike)):
+                source = open_sequence(source)
+            self._file = source
+
+            meta = source.metadata
+            positions = [
+                {"index": p.index, "name": p.name, "has_roi": False}
+                for p in source.positions
+            ]
+            super().__init__(
+                metadata=meta.to_dict(),
+                positions=positions,
+                selections=[],
+                roi_mode=roi_mode,
+                **kwargs,
+            )
+            self.on_msg(self._on_custom_msg)
+
+        def _on_custom_msg(self, _widget, content, buffers) -> None:
+            """Serve lazy frames/thumbnails and run point-fit for the ESM.
+
+            Named to avoid colliding with ``ipywidgets.Widget._handle_msg``,
+            the internal method the base class uses to dispatch comm
+            messages to callbacks registered via ``on_msg`` -- reusing that
+            name here silently shadowed the real dispatcher and broke every
+            custom message (frame/thumb/fit/save) for this widget.
+            """
+            kind = content.get("type") if isinstance(content, dict) else None
+            # Diagnostic timing (temporary): a "fit" request appearing to hang
+            # has been reported repeatedly against real SMB data; these lines
+            # print to the kernel's terminal so it's visible whether a given
+            # message is received promptly and how long its handler took --
+            # the two things needed to tell "queued behind a slow read" apart
+            # from "stuck inside the handler itself".
+            t0 = time.time()
+            logging.warning(
+                "SequenceDashboard: received %r at %.3f (content=%s)",
+                kind,
+                t0,
+                {k: v for k, v in content.items() if k != "points"}
+                if isinstance(content, dict)
+                else content,
+            )
+            if kind == "thumb":
+                pos = int(content["pos"])
+                try:
+                    png = self._file.thumbnail_png(
+                        pos, downscale=int(content.get("downscale", 8))
+                    )
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send(
+                        {"type": "error", "kind": kind, "pos": pos, "message": str(exc)}
+                    )
+                    return
+                self.send({"type": "thumb", "pos": pos}, buffers=[png])
+                logging.warning(
+                    "SequenceDashboard: thumb %d done in %.3fs", pos, time.time() - t0
+                )
+            elif kind == "frame":
+                pos, t = int(content["pos"]), int(content.get("t", 0))
+                try:
+                    png = self._frame_png(pos, t)
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send(
+                        {"type": "error", "kind": kind, "pos": pos, "message": str(exc)}
+                    )
+                    return
+                self.send({"type": "frame", "pos": pos, "t": t}, buffers=[png])
+                logging.warning(
+                    "SequenceDashboard: frame %d/%d done in %.3fs",
+                    pos,
+                    t,
+                    time.time() - t0,
+                )
+            elif kind == "fit":
+                try:
+                    spec = _fit_rotated_rect(content["points"])
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    # too-few / degenerate points, or anything else -- the UI
+                    # always sends exactly 4 points, so any failure here is
+                    # unexpected and must be visible, never swallowed silently.
+                    self.send({"type": "error", "kind": "fit", "message": str(exc)})
+                    return
+                self.send({"type": "fit", "roi": spec.to_dict()})
+                logging.warning(
+                    "SequenceDashboard: fit done in %.3fs", time.time() - t0
+                )
+            elif kind == "save":
+                try:
+                    path = self.save()
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send({"type": "error", "kind": "save", "message": str(exc)})
+                    return
+                self.send({"type": "saved", "path": path})
+                logging.warning(
+                    "SequenceDashboard: save done in %.3fs", time.time() - t0
+                )
+
+        def _frame_png(self, pos: int, t: int) -> bytes:
+            """PNG bytes of one lazily-read frame (display channel, normalized)."""
+            raw = np.asarray(self._file.position(pos).get_frame(t).raw)
+            plane = raw[..., 0] if raw.ndim == 3 else raw
+            rgb = np.repeat(normalize_to_uint8(plane)[:, :, np.newaxis], 3, axis=-1)
+            buffer = io.BytesIO()
+            Image.fromarray(rgb).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        @property
+        def manifest(self):
+            """Build a :class:`~acia.selection.SelectionManifest` from current state."""
+            from acia.base import RotatedCropSpec
+            from acia.selection import (
+                RoiSelection,
+                SelectionManifest,
+                make_source_block,
+            )
+
+            sels = []
+            for item in self.selections:
+                roi = item["roi"]
+                spec = RotatedCropSpec(
+                    center=(float(roi["center"][0]), float(roi["center"][1])),
+                    size=(int(roi["size"][0]), int(roi["size"][1])),
+                    angle=float(roi["angle"]),
+                )
+                sels.append(
+                    RoiSelection(
+                        position=int(item["position"]),
+                        roi=spec,
+                        label=item.get("label", ""),
+                        id=str(item.get("id", "")),
+                    )
+                )
+            return SelectionManifest(
+                source=make_source_block(self._file),
+                selections=sels,
+                roi_mode=self.roi_mode,
+            )
+
+        def save(self, directory=None) -> str:
+            """Write ``selection.json`` (+ previews) via :func:`save_selection`.
+
+            Args:
+                directory: Output dir; defaults to the current working directory
+                    (the notebook's dir at run time).
+
+            Returns:
+                The path to the written ``selection.json``.
+            """
+            from acia.selection import save_selection
+
+            directory = os.getcwd() if directory is None else directory
+            return save_selection(self.manifest, directory)
+
+        @classmethod
+        def resume(cls, manifest_or_path, source=None, **kwargs) -> SequenceDashboard:
+            """Reopen a dashboard pre-populated from a saved ``selection.json``.
+
+            Lets a curation session be saved with :meth:`save` and continued
+            later in a fresh dashboard, instead of starting over.
+
+            Args:
+                manifest_or_path: A path to a ``selection.json`` file (or its
+                    containing directory), or an already-loaded
+                    :class:`~acia.selection.SelectionManifest`.
+                source: ``None`` to reopen the manifest's own source path, a
+                    path/str to apply the selections to a *different* file, or
+                    an already-open :class:`~acia.segm.open.SequenceFile` --
+                    same convention as :func:`~acia.selection.load_selection`.
+                **kwargs: Forwarded to the constructor (e.g. ``roi_mode`` to
+                    override the manifest's saved mode).
+
+            Returns:
+                A :class:`SequenceDashboard` with ``.selections`` restored.
+
+            Raises:
+                ValueError: If a selection's position is out of range for
+                    ``source``.
+            """
+            from acia.segm.open import open_sequence
+            from acia.selection import SelectionManifest
+
+            if isinstance(manifest_or_path, SelectionManifest):
+                manifest = manifest_or_path
+            else:
+                path = os.fspath(manifest_or_path)
+                if os.path.isdir(path):
+                    path = os.path.join(path, "selection.json")
+                manifest = SelectionManifest.load(path)
+
+            if source is None:
+                source = open_sequence(manifest.source_path)
+            elif isinstance(source, (str, os.PathLike)):
+                source = open_sequence(source)
+
+            kwargs.setdefault("roi_mode", manifest.roi_mode)
+            dash = cls(source, **kwargs)
+
+            num_positions = dash.metadata.get("num_positions", 0)
+            next_ci: dict[int, int] = {}
+            restored = []
+            for i, sel in enumerate(manifest.selections):
+                if not 0 <= sel.position < num_positions:
+                    raise ValueError(
+                        f"selection position {sel.position} out of range "
+                        f"for source with {num_positions} positions"
+                    )
+                ci = next_ci.get(sel.position, 0)
+                next_ci[sel.position] = ci + 1
+                restored.append(
+                    {
+                        "id": i + 1,
+                        "position": sel.position,
+                        "label": sel.label,
+                        "ci": ci,
+                        "roi": sel.roi.to_dict(),
+                    }
+                )
+            dash.selections = restored
+            return dash
+
+        def _repr_html_(self) -> str:
+            """Static fallback for a non-executed/persisted notebook."""
+            n = self.metadata.get("num_positions", "?")
+            return (
+                "<div style='font:12px sans-serif;color:#666;'>"
+                f"SequenceDashboard — {n} positions "
+                "(interactive widget renders when the notebook is run).</div>"
+            )
+
+    class RegistrationDashboard(anywidget.AnyWidget):  # type: ignore[no-redef]
+        """Pick + verify + batch-apply a drift-correction method (anywidget).
+
+        Pick one of the 5 :class:`~acia.registration.RegistrationMethod`
+        implementations (default ``"GradientECC"``), verify it on sampled
+        frames of a single position (drift trajectory + before/after), then
+        batch-apply it across every position/frame of the acquisition with
+        live progress and resumability. Frames are read lazily from the
+        source; the widget never loads a whole (possibly hundreds-of-GB) file,
+        and batch-apply holds at most one position's frames in memory at a
+        time.
+
+        ``MaskedTemplateCorrelation`` additionally needs a ``mask_rect``
+        (:class:`~acia.base.RotatedCropSpec`): the ``mask_*`` traits and the
+        ESM's mask editor port :class:`ROICropper`'s click-to-fit +
+        drag/resize/rotate interaction model (:func:`_fit_rotated_rect` is the
+        same geometry helper ``SequenceDashboard``'s point-fit tool uses) --
+        ``ROICropper`` itself is not touched.
+
+        Works in Jupyter/Colab and in marimo via ``mo.ui.anywidget(dash)``. The
+        ESM is best-effort and verified only by a real notebook run, not by
+        the headless Python test-suite (no ESM/Playwright suite for this
+        widget in v1, per the spec).
+        """
+
+        metadata = traitlets.Dict().tag(sync=True)  # type: ignore[var-annotated]
+        positions = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+        method_name = traitlets.Unicode("GradientECC").tag(sync=True)
+        n_sample_frames = traitlets.Int(8).tag(sync=True)
+
+        mask_center_x = traitlets.Float(0.0).tag(sync=True)
+        mask_center_y = traitlets.Float(0.0).tag(sync=True)
+        mask_width = traitlets.Int(0).tag(sync=True)
+        mask_height = traitlets.Int(0).tag(sync=True)
+        mask_angle = traitlets.Float(0.0).tag(sync=True)
+        mask_points = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
+        mask_image_b64 = traitlets.Unicode("").tag(sync=True)
+        mask_image_w = traitlets.Int(0).tag(sync=True)
+        mask_image_h = traitlets.Int(0).tag(sync=True)
+
+        batch_running = traitlets.Bool(False).tag(sync=True)
+
+        _esm = _REGISTRATION_DASHBOARD_ESM
+
+        def __init__(
+            self, source, *, method_name: str = "GradientECC", **kwargs
+        ) -> None:
+            """Build the dashboard from a source (no pixel reads at construction).
+
+            Args:
+                source: A :class:`~acia.segm.open.SequenceFile`, or a path/str
+                    that is opened via :func:`~acia.segm.open.open_sequence`.
+                method_name: The initially-selected
+                    :class:`~acia.registration.RegistrationMethod` name; one of
+                    :data:`_REGISTRATION_METHOD_NAMES`.
+                **kwargs: Forwarded to ``anywidget.AnyWidget``.
+            """
+            from acia.segm.open import open_sequence
+
+            if isinstance(source, (str, os.PathLike)):
+                source = open_sequence(source)
+            self._file = source
+            self._records: dict[int, RegistrationRecord] = {}
+
+            meta = source.metadata
+            positions = [{"index": p.index, "name": p.name} for p in source.positions]
+            super().__init__(
+                metadata=meta.to_dict(),
+                positions=positions,
+                method_name=method_name,
+                **kwargs,
+            )
+            self.on_msg(self._on_custom_msg)
+
+        @traitlets.validate("method_name")
+        def _validate_method_name(self, proposal):
+            value = proposal["value"]
+            if value not in _REGISTRATION_METHOD_NAMES:
+                raise traitlets.TraitError(
+                    f"method_name must be one of {_REGISTRATION_METHOD_NAMES}, "
+                    f"got {value!r}"
+                )
+            return value
+
+        @traitlets.validate("n_sample_frames")
+        def _validate_n_sample_frames(self, proposal):
+            value = int(proposal["value"])
+            if value < 1:
+                raise traitlets.TraitError(
+                    f"n_sample_frames must be >= 1, got {value}."
+                )
+            return value
+
+        @traitlets.observe("mask_points")
+        def _on_mask_points(self, change) -> None:
+            """Re-fit the mask box whenever >=3 points are present.
+
+            Mirrors :meth:`ROICropper._on_points` exactly (same
+            :func:`_fit_rotated_rect` geometry helper); degenerate/too-few-point
+            states during interactive clicking are ignored.
+            """
+            import cv2
+
+            pts = change.get("new") if isinstance(change, dict) else change.new
+            try:
+                if pts is not None and len(pts) >= 3:
+                    spec = _fit_rotated_rect(pts)
+                    self.mask_center_x, self.mask_center_y = spec.center
+                    self.mask_width, self.mask_height = spec.size
+                    self.mask_angle = spec.angle
+            except (ValueError, cv2.error):
+                # Only swallow the expected degenerate/too-few-point states;
+                # a real bug such as an ImportError must not be silently
+                # dropped.
+                pass
+
+        def _on_custom_msg(self, _widget, content, buffers) -> None:
+            """Serve the mask frame, run verify, and drive batch-apply/save.
+
+            Named to avoid colliding with ``ipywidgets.Widget._handle_msg``,
+            same reasoning as ``SequenceDashboard._on_custom_msg``.
+            """
+            kind = content.get("type") if isinstance(content, dict) else None
+            if kind == "mask_frame":
+                pos = int(content.get("position", 0))
+                try:
+                    data_url, w, h = _encode_frame_png(
+                        self._file.position(pos), frame=0
+                    )
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send({"type": "error", "kind": kind, "message": str(exc)})
+                    return
+                self.mask_image_b64 = data_url
+                self.mask_image_w = w
+                self.mask_image_h = h
+                self.send({"type": "mask_frame", "position": pos})
+            elif kind == "verify":
+                pos = int(content.get("position", 0))
+                method_name = str(content.get("method", self.method_name))
+                try:
+                    payload, verify_buffers = self._run_verify(pos, method_name)
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send({"type": "error", "kind": kind, "message": str(exc)})
+                    return
+                self.send(payload, buffers=verify_buffers)
+            elif kind == "batch_apply":
+                directory = content.get("directory") or None
+                subset = content.get("positions")
+                try:
+                    summary = self.batch_apply(directory=directory, positions=subset)
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send({"type": "error", "kind": kind, "message": str(exc)})
+                    return
+                self.send({"type": "batch_done", **summary})
+            elif kind == "save":
+                try:
+                    path = self.save()
+                except Exception as exc:  # noqa: BLE001 - report to the frontend
+                    self.send({"type": "error", "kind": kind, "message": str(exc)})
+                    return
+                self.send({"type": "saved", "path": path})
+
+        def _build_method(
+            self, method_name: str, mask_rect: RotatedCropSpec | None = None
+        ):
+            """Construct a fresh :class:`~acia.registration.RegistrationMethod`.
+
+            Args:
+                method_name: One of :data:`_REGISTRATION_METHOD_NAMES`.
+                mask_rect: The mask rect to use for ``MaskedTemplateCorrelation``;
+                    defaults to :attr:`mask_rect` when ``None``. Ignored for the
+                    other 4 methods, which run directly on raw frame pairs.
+
+            Raises:
+                ValueError: If ``method_name`` is unknown, or if
+                    ``MaskedTemplateCorrelation`` is requested without a mask
+                    rect available.
+            """
+            classes = _registration_method_classes()
+            cls = classes[method_name]
+            if method_name == "MaskedTemplateCorrelation":
+                rect = mask_rect if mask_rect is not None else self.mask_rect
+                if rect is None:
+                    raise ValueError(
+                        "MaskedTemplateCorrelation requires a mask rect -- draw "
+                        "one (click >=3 points on the mask editor) first."
+                    )
+                return cls(mask_rect=rect)
+            return cls()
+
+        @property
+        def mask_rect(self) -> RotatedCropSpec | None:
+            """The current mask rect, or ``None`` if none has been drawn yet."""
+            from acia.base import RotatedCropSpec
+
+            if self.mask_width <= 0 or self.mask_height <= 0:
+                return None
+            return RotatedCropSpec(
+                center=(self.mask_center_x, self.mask_center_y),
+                size=(int(self.mask_width), int(self.mask_height)),
+                angle=self.mask_angle,
+            )
+
+        @staticmethod
+        def _array_png_bytes(raw: np.ndarray) -> bytes:
+            """PNG-encode a single in-memory frame array (channel 0, normalized).
+
+            Sibling of ``SequenceDashboard._frame_png``, but for a frame that
+            already lives in memory (e.g. an :func:`~acia.registration.apply_correction`
+            result) rather than one read fresh from a source -- ``_encode_frame_png``
+            only accepts the latter.
+            """
+            plane = raw[..., 0] if raw.ndim == 3 else raw
+            rgb = np.repeat(normalize_to_uint8(plane)[:, :, np.newaxis], 3, axis=-1)
+            buffer = io.BytesIO()
+            Image.fromarray(rgb).save(buffer, format="PNG")
+            return buffer.getvalue()
+
+        def _run_verify(self, pos: int, method_name: str):
+            """Run verify for one position: drift trajectory + before/after.
+
+            Returns:
+                tuple[dict, list[bytes]]: The ``"verify_result"`` message
+                content and its PNG buffers (``[reference, uncorrected]`` or
+                ``[reference, uncorrected, corrected]`` when a correction is
+                available for the chosen compare frame).
+            """
+            from acia.registration import (
+                apply_correction,
+                build_sample_frame_indices,
+                run_comparison,
+            )
+
+            method = self._build_method(method_name)
+            source = self._file.position(pos)
+            frame_indices = build_sample_frame_indices(
+                source.size_t, 0, self.n_sample_frames
+            )
+            reference = np.asarray(source.get_frame(0).raw)
+
+            def get_frame(t: int) -> np.ndarray:
+                return np.asarray(source.get_frame(t).raw)
+
+            results = run_comparison(
+                {method_name: method}, reference, get_frame, frame_indices
+            )
+            transforms = results[method_name]
+
+            compare_t, compare_transform = frame_indices[-1], None
+            for t, transform in zip(frame_indices, transforms, strict=True):
+                if transform is not None:
+                    compare_t, compare_transform = t, transform
+
+            compare_frame = get_frame(compare_t)
+            buffers = [
+                self._array_png_bytes(reference),
+                self._array_png_bytes(compare_frame),
+            ]
+            if compare_transform is not None:
+                corrected = apply_correction(compare_frame, compare_transform)
+                buffers.append(self._array_png_bytes(corrected))
+
+            payload = {
+                "type": "verify_result",
+                "position": pos,
+                "method": method_name,
+                "reference_frame": 0,
+                "frame_indices": frame_indices,
+                "transforms": [t.to_dict() if t else None for t in transforms],
+                "compare_frame": compare_t,
+                "before_after_available": compare_transform is not None,
+            }
+            return payload, buffers
+
+        def _register_position(
+            self,
+            pos: int,
+            method_name: str,
+            mask_rect: RotatedCropSpec | None,
+            num_positions: int,
+        ) -> RegistrationRecord:
+            """Estimate a per-frame transform for every frame of one position.
+
+            Reads (and releases) exactly one frame at a time -- never more than
+            one position's frames in memory at once. A per-frame failure is
+            caught and recorded in ``failed_frames``; it never aborts the rest
+            of the position. Sends a ``"progress"`` message after every frame.
+            """
+            from acia.registration_persistence import RegistrationRecord
+
+            method = self._build_method(method_name, mask_rect)
+            source = self._file.position(pos)
+            num_frames = source.size_t
+            reference = np.asarray(source.get_frame(0).raw)
+            transforms: dict[int, FrameTransform] = {}
+            failed: dict[int, str] = {}
+            for t in range(num_frames):
+                try:
+                    frame = np.asarray(source.get_frame(t).raw)
+                    transforms[t] = method.estimate(reference, frame)
+                except Exception as exc:  # noqa: BLE001 -- isolate per-frame failures
+                    failed[t] = f"{type(exc).__name__}: {exc}"
+                self.send(
+                    {
+                        "type": "progress",
+                        "position": pos,
+                        "num_positions": num_positions,
+                        "frame": t,
+                        "num_frames": num_frames,
+                    }
+                )
+            return RegistrationRecord(
+                position=pos,
+                method=method_name,
+                transforms=transforms,
+                reference_frame=0,
+                failed_frames=failed,
+            )
+
+        def batch_apply(self, directory=None, positions=None) -> dict:
+            """Estimate transforms for every (or a subset of) position, live.
+
+            For the currently-selected :attr:`method_name`, processes every
+            position in ``positions`` (default: all), one at a time, estimating
+            a :class:`~acia.registration.FrameTransform` per frame against that
+            position's own frame 0. Sends a ``"progress"`` message after every
+            frame and persists the manifest after every position, so an
+            interrupted run can be resumed.
+
+            Args:
+                directory: Output directory for ``registration_transforms.json``;
+                    defaults to the current working directory. Also the path
+                    consulted for already-completed positions to skip.
+                positions: Optional subset of position indices to process;
+                    defaults to every position in the acquisition.
+
+            Returns:
+                dict: ``{"num_positions", "completed", "skipped",
+                "failed_positions", "path"}``.
+
+            Raises:
+                RuntimeError: If a batch-apply run is already in progress.
+                ValueError: If ``method_name`` is unknown, or
+                    ``MaskedTemplateCorrelation`` is selected without a mask
+                    rect.
+            """
+            if self.batch_running:
+                raise RuntimeError("batch-apply is already running")
+            method_name = self.method_name
+            if method_name not in _REGISTRATION_METHOD_NAMES:
+                raise ValueError(f"unknown method_name {method_name!r}")
+
+            mask_rect = None
+            if method_name == "MaskedTemplateCorrelation":
+                mask_rect = self.mask_rect
+                if mask_rect is None:
+                    raise ValueError(
+                        "MaskedTemplateCorrelation requires a mask rect -- draw "
+                        "one (click >=3 points on the mask editor) before "
+                        "running batch-apply."
+                    )
+
+            from acia.registration_persistence import (
+                RegistrationManifest,
+                save_registration,
+            )
+
+            directory = os.getcwd() if directory is None else os.fspath(directory)
+            target_path = os.path.join(directory, "registration_transforms.json")
+
+            records: dict[int, RegistrationRecord] = dict(self._records)
+            if os.path.exists(target_path):
+                try:
+                    existing = RegistrationManifest.load(target_path)
+                except Exception:  # noqa: BLE001 - a corrupt manifest must not block a run
+                    existing = None
+                if existing is not None:
+                    for rec in existing.records:
+                        records.setdefault(rec.position, rec)
+
+            num_positions = int(self.metadata.get("num_positions", len(self.positions)))
+            target_positions = (
+                list(range(num_positions))
+                if positions is None
+                else [int(p) for p in positions]
+            )
+
+            self.batch_running = True
+            completed: list[int] = []
+            skipped: list[int] = []
+            failed_positions: list[int] = []
+            try:
+                for i in target_positions:
+                    existing_record = records.get(i)
+                    if existing_record is not None and existing_record.transforms:
+                        skipped.append(i)
+                        continue
+                    try:
+                        record = self._register_position(
+                            i, method_name, mask_rect, num_positions
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- isolate whole-position failures
+                        from acia.registration_persistence import RegistrationRecord
+
+                        record = RegistrationRecord(
+                            position=i,
+                            method=method_name,
+                            transforms={},
+                            reference_frame=0,
+                            notes=f"position failed: {type(exc).__name__}: {exc}",
+                        )
+                        failed_positions.append(i)
+                    records[i] = record
+                    completed.append(i)
+                    self._records = records
+                    save_registration(self.manifest, directory)
+            finally:
+                self.batch_running = False
+
+            self._records = records
+            saved_path = save_registration(self.manifest, directory)
+            return {
+                "num_positions": num_positions,
+                "completed": completed,
+                "skipped": skipped,
+                "failed_positions": failed_positions,
+                "path": saved_path,
+            }
+
+        @property
+        def manifest(self) -> RegistrationManifest:
+            """Build a :class:`~acia.registration_persistence.RegistrationManifest`
+            from the accumulated :class:`~acia.registration_persistence.RegistrationRecord`
+            results (mirrors ``SequenceDashboard.manifest`` building a
+            ``SelectionManifest``).
+            """
+            from acia.registration_persistence import RegistrationManifest
+            from acia.selection import make_source_block
+
+            return RegistrationManifest(
+                source=make_source_block(self._file),
+                records=sorted(self._records.values(), key=lambda r: r.position),
+                method=self.method_name,
+            )
+
+        def save(self, directory=None) -> str:
+            """Write ``registration_transforms.json`` via :func:`save_registration`.
+
+            Args:
+                directory: Output dir; defaults to the current working
+                    directory (the notebook's dir at run time).
+
+            Returns:
+                The path to the written ``registration_transforms.json``.
+            """
+            from acia.registration_persistence import save_registration
+
+            directory = os.getcwd() if directory is None else directory
+            return save_registration(self.manifest, directory)
+
+        def _repr_html_(self) -> str:
+            """Static fallback for a non-executed/persisted notebook."""
+            n = self.metadata.get("num_positions", "?")
+            return (
+                "<div style='font:12px sans-serif;color:#666;'>"
+                f"RegistrationDashboard — {n} positions, method="
+                f"{self.method_name} (interactive widget renders when the "
+                "notebook is run).</div>"
+            )
+
 else:
 
     def ROICropper(*args, **kwargs):  # type: ignore[no-redef]
@@ -1406,4 +3210,16 @@ else:
         """Stub raised when the optional ``widget`` extra is not installed."""
         raise ImportError(
             "FilterExplorer requires the optional dependency: pip install acia[widget]"
+        )
+
+    def SequenceDashboard(*args, **kwargs):  # type: ignore[no-redef]
+        """Stub raised when the optional ``widget`` extra is not installed."""
+        raise ImportError(
+            "SequenceDashboard requires the optional dependency: pip install acia[widget]"
+        )
+
+    def RegistrationDashboard(*args, **kwargs):  # type: ignore[no-redef]
+        """Stub raised when the optional ``widget`` extra is not installed."""
+        raise ImportError(
+            "RegistrationDashboard requires the optional dependency: pip install acia[widget]"
         )

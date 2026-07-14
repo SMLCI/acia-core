@@ -48,6 +48,8 @@ def test_import_safe_without_anywidget():
             notebook.ROICropper(object())
         with pytest.raises(ImportError, match=r"acia\[widget\]"):
             notebook.FilterExplorer(object(), object(), [])
+        with pytest.raises(ImportError, match=r"acia\[widget\]"):
+            notebook.SequenceDashboard(object())
     finally:
         builtins.__import__ = real_import
         # Restore the original modules so other tests see a normal import state.
