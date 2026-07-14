@@ -78,6 +78,7 @@ omero = ["omero-py>=5.9.3"]
 notebook = ["ipywidgets>=8.0.0"]
 remote = ["smbprotocol>=1.10.0", "keyring>=24.0.0"]
 nd2 = ["nd2>=0.10"]
+czi = ["aicspylibczi>=3.1"]
 widget = ["anywidget>=0.9"]
 
 # --- segmentation backends -------------------------------------------------

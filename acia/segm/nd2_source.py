@@ -188,6 +188,24 @@ class ND2SequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         self._ensure_reader()
         return ImageSequenceSource.timepoints.fget(self)
 
+    @property
+    def dtype(self) -> str:
+        """Numpy dtype string of the pixel data (from metadata, no pixel read)."""
+        self._ensure_reader()
+        assert self._reader is not None
+        return str(np.dtype(self._reader.dtype))
+
+    @property
+    def channel_names(self) -> list[str]:
+        """Channel names from ND2 metadata (best-effort; empty if unavailable)."""
+        self._ensure_reader()
+        assert self._reader is not None
+        try:
+            channels = self._reader.metadata.channels or []
+            return [c.channel.name for c in channels]
+        except Exception:  # noqa: BLE001 - metadata is best-effort
+            return []
+
     # --- ImageSequenceSource contract -----------------------------------------
 
     @property
