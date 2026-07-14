@@ -29,6 +29,7 @@ from acia.registration import (
     PhaseCorrelationHighpass,
     RegistrationError,
     _parabolic_refine,
+    apply_correction,
 )
 
 SIZE = 200
@@ -479,6 +480,70 @@ class TestParabolicRefine(unittest.TestCase):
         self.assertEqual(_parabolic_refine(float("nan"), 1.0, 0.5), 0.0)
         self.assertEqual(_parabolic_refine(0.5, float("inf"), 1.0), 0.0)
         self.assertEqual(_parabolic_refine(0.5, 1.0, float("-inf")), 0.0)
+
+
+class TestApplyCorrection(unittest.TestCase):
+    """Direct unit tests for the shared inverse-warp helper -- the single
+    place :class:`~acia.base.RegisteredSequenceSource`, the verify view, and
+    batch-apply all correct a frame."""
+
+    def test_undoes_a_known_drift(self):
+        reference = _textured_frame(seed=0, size=SIZE)
+        drifted = _warp(reference, dx=4.0, dy=-3.0, theta=2.0)
+        transform = FrameTransform(dx=4.0, dy=-3.0, theta=2.0)
+
+        corrected = apply_correction(drifted, transform)
+
+        self.assertLess(
+            np.abs(corrected.astype(np.float32) - reference.astype(np.float32)).mean(),
+            np.abs(drifted.astype(np.float32) - reference.astype(np.float32)).mean(),
+        )
+
+    def test_grayscale_2d_shape_preserved(self):
+        frame = _textured_frame(seed=0, size=SIZE)
+        self.assertEqual(frame.ndim, 2)
+
+        corrected = apply_correction(frame, FrameTransform(dx=1.0, dy=1.0, theta=0.0))
+
+        self.assertEqual(corrected.shape, frame.shape)
+
+    def test_single_channel_axis_not_collapsed(self):
+        # Regression test: cv2.warpAffine silently drops a trailing (H, W, 1)
+        # channel axis, turning it into a 2D (H, W) array -- the same bug
+        # RotatedCropSequenceSource._warp already guards against. A
+        # RegisteredSequenceSource wrapping single-channel microscopy data
+        # must not silently violate this codebase's (H, W, C) convention.
+        frame = _textured_frame(seed=0, size=SIZE)[..., None]
+        self.assertEqual(frame.shape, (SIZE, SIZE, 1))
+
+        corrected = apply_correction(frame, FrameTransform(dx=1.0, dy=1.0, theta=0.0))
+
+        self.assertEqual(corrected.shape, (SIZE, SIZE, 1))
+
+    def test_multi_channel_shape_preserved(self):
+        gray = _textured_frame(seed=0, size=SIZE)
+        frame = np.stack([gray, gray, gray], axis=-1)
+
+        corrected = apply_correction(frame, FrameTransform(dx=2.0, dy=0.0, theta=5.0))
+
+        self.assertEqual(corrected.shape, frame.shape)
+
+    def test_more_than_four_channels_shape_preserved(self):
+        gray = _textured_frame(seed=0, size=SIZE)
+        frame = np.stack([gray] * 6, axis=-1)
+
+        corrected = apply_correction(frame, FrameTransform(dx=1.0, dy=-1.0, theta=3.0))
+
+        self.assertEqual(corrected.shape, frame.shape)
+
+    def test_zero_transform_is_near_identity(self):
+        frame = _textured_frame(seed=0, size=SIZE)
+
+        corrected = apply_correction(frame, FrameTransform(dx=0.0, dy=0.0, theta=0.0))
+
+        np.testing.assert_allclose(
+            corrected.astype(np.float32), frame.astype(np.float32), atol=1.0
+        )
 
 
 if __name__ == "__main__":

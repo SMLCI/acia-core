@@ -6,12 +6,14 @@ import contextlib
 import copy
 import logging
 import multiprocessing
+import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from acia.registration import FrameTransform
     from acia.segm.local import THWCSequenceSource
 
 import cv2
@@ -777,6 +779,27 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
         """
         return RotatedCropSequenceSource(self, spec)
 
+    def register(
+        self, transforms: dict[int, FrameTransform]
+    ) -> RegisteredSequenceSource:
+        """Return a lazy drift-corrected view of this source.
+
+        Each frame is corrected on demand via
+        :func:`acia.registration.apply_correction` using the transform stored
+        for that frame index; a frame missing from ``transforms`` is returned
+        uncorrected with a printed warning.
+
+        Args:
+            transforms: Frame index -> :class:`~acia.registration.FrameTransform`
+                (within this source), as estimated by a
+                :class:`~acia.registration.RegistrationMethod` and persisted via
+                :mod:`acia.registration_persistence`.
+
+        Returns:
+            RegisteredSequenceSource: A lazy corrected view of this source.
+        """
+        return RegisteredSequenceSource(self, transforms)
+
     def materialize(self) -> THWCSequenceSource:
         """Eagerly freeze this (possibly lazy) source into an in-memory source.
 
@@ -949,6 +972,75 @@ class RotatedCropSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         own = getattr(self, "_pixel_size", None)
         if own is not None:
             return own
+        return self.parent.pixel_size
+
+
+class RegisteredSequenceSource(ImageSequenceSource):
+    """A lazy drift-corrected view over a parent sequence.
+
+    Each frame is corrected on demand via
+    :func:`acia.registration.apply_correction`, using the
+    :class:`~acia.registration.FrameTransform` stored for that frame index (a
+    per-position transform dict, as produced by batch-apply and persisted via
+    :mod:`acia.registration_persistence`). A registration correction does not
+    change frame dimensions, unlike a crop, so ``size_h``/``size_w``/``size_c``/
+    ``num_channels`` simply delegate straight to the parent -- no dimension
+    recomputation.
+
+    A frame missing from ``transforms`` (e.g. one that failed during
+    batch-apply) is returned unchanged, with a warning -- never a hard crash,
+    so a segmentation/tracking notebook consuming this source can keep going
+    even if a handful of frames never got a stored correction.
+    """
+
+    def __init__(
+        self, parent: ImageSequenceSource, transforms: dict[int, FrameTransform]
+    ):
+        self.parent = parent
+        self.transforms = transforms
+
+    def get_frame(self, frame: int) -> BaseImage:
+        idx = self._resolve_t_index(frame)
+        if idx not in self.transforms:
+            warnings.warn(
+                f"RegisteredSequenceSource: no stored correction for frame "
+                f"{idx}; returning it uncorrected.",
+                stacklevel=2,
+            )
+            return self.parent.get_frame(idx)
+
+        from acia.registration import apply_correction
+
+        raw = np.asarray(self.parent.get_frame(idx).raw)
+        corrected = apply_correction(raw, self.transforms[idx])
+        return ArrayImage(corrected, frame=idx)
+
+    @property
+    def size_t(self) -> int:
+        return self.parent.size_t
+
+    @property
+    def size_h(self) -> int:
+        return self.parent.size_h
+
+    @property
+    def size_w(self) -> int:
+        return self.parent.size_w
+
+    @property
+    def size_c(self) -> int:
+        return self.parent.size_c
+
+    @property
+    def num_channels(self) -> int:
+        return self.parent.num_channels
+
+    @property
+    def timepoints(self):
+        return self.parent.timepoints
+
+    @property
+    def pixel_size(self):
         return self.parent.pixel_size
 
 

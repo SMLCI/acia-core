@@ -19,6 +19,7 @@ scope for this module.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -85,6 +86,55 @@ class FrameTransform:
         )
 
 
+def apply_correction(frame: np.ndarray, transform: FrameTransform) -> np.ndarray:
+    """Undo an estimated drift by inverting and applying its forward transform.
+
+    ``transform`` is the :class:`FrameTransform` estimated as reference->frame;
+    inverting it and warping ``frame`` maps it back onto the reference frame's
+    coordinate system. Same convention as the rotation-about-center + explicit
+    translation used throughout this module (and mirrored by
+    :class:`~acia.base.RotatedCropSequenceSource`'s own warp matrix).
+
+    This is the single place this warp math lives -- the verify view, the
+    batch-apply step, and :class:`~acia.base.RegisteredSequenceSource` all call
+    this one implementation.
+
+    Args:
+        frame: The frame to correct, grayscale ``(H, W)`` or multi-channel
+            ``(H, W, C)``.
+        transform: The ``(dx, dy, theta)`` estimated as reference->``frame``.
+
+    Returns:
+        np.ndarray: ``frame`` warped back onto the reference frame's coordinate
+            system, same shape as ``frame``.
+    """
+    h, w = frame.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, transform.theta, 1.0)
+    matrix[0, 2] += transform.dx
+    matrix[1, 2] += transform.dy
+    inverse = cv2.invertAffineTransform(matrix)
+
+    if frame.ndim == 2:
+        # grayscale (H, W): warpAffine handles directly
+        return cv2.warpAffine(frame, inverse, (w, h), flags=cv2.INTER_LINEAR)
+
+    if frame.shape[2] <= 4:
+        # up to 4 channels: warpAffine handles directly, but it collapses a
+        # trailing singleton channel -- restore the (H, W, C) axis so a
+        # (H, W, 1) frame does not silently become a 2D frame (same fix as
+        # RotatedCropSequenceSource._warp in acia.base).
+        out = cv2.warpAffine(frame, inverse, (w, h), flags=cv2.INTER_LINEAR)
+        return out if out.ndim == 3 else out[..., None]
+
+    # cv2.warpAffine only supports <= 4 channels: warp per-channel and re-stack
+    channels = [
+        cv2.warpAffine(frame[..., c], inverse, (w, h), flags=cv2.INTER_LINEAR)
+        for c in range(frame.shape[2])
+    ]
+    return np.stack(channels, axis=-1)
+
+
 class RegistrationMethod(ABC):
     """Base class for a pluggable frame-to-frame registration method.
 
@@ -110,6 +160,108 @@ class RegistrationMethod(ABC):
         Raises:
             RegistrationError: If no confident estimate can be produced.
         """
+
+
+def build_sample_frame_indices(
+    size_t: int, reference_index: int, n_sample_frames: int
+) -> list[int]:
+    """Evenly-spaced comparison-frame indices across ``[0, size_t)``.
+
+    Shared by the synthetic and real-data sections of the comparison notebook
+    and by the dashboard's verify step -- a bug here is caught once, before
+    real data is ever touched.
+
+    - Raises ``ValueError`` if ``n_sample_frames < 1``: a silently empty/
+      degenerate sample list would be worse than a loud, immediate failure.
+    - Deduplicates (``sorted(set(...))``) since ``np.linspace(...).round()``
+      can produce repeated indices once ``n_sample_frames`` approaches or
+      exceeds ``size_t``; if that dedup drops below the requested count, a
+      one-line note is printed so the shortfall isn't silently misleading.
+    - Excludes ``reference_index`` where present: comparing the reference
+      frame against itself is a trivial identity case that wastes a sample
+      and inflates success/drift-magnitude statistics -- unless doing so
+      would leave zero frames, in which case ``reference_index`` is kept and
+      a note is printed that it's a trivial self-comparison.
+
+    Args:
+        size_t: Number of frames in the sequence.
+        reference_index: The reference frame index to exclude where possible.
+        n_sample_frames: Requested number of sample indices (``>= 1``).
+
+    Returns:
+        list[int]: Sorted, deduplicated sample frame indices.
+
+    Raises:
+        ValueError: If ``n_sample_frames < 1``.
+    """
+    if n_sample_frames < 1:
+        raise ValueError(f"n_sample_frames must be >= 1, got {n_sample_frames}.")
+
+    indices = sorted(
+        {int(t) for t in np.linspace(0, size_t - 1, n_sample_frames).round()}
+    )
+    if len(indices) < n_sample_frames:
+        print(
+            f"note: only {len(indices)} unique frame indices sampled "
+            f"(requested {n_sample_frames}) -- np.linspace produced duplicates "
+            f"given size_t={size_t}."
+        )
+
+    without_reference = [t for t in indices if t != reference_index]
+    if not without_reference:
+        print(
+            f"note: reference_index={reference_index} is the only sampled "
+            "frame -- keeping it, but estimate(reference, reference) is a "
+            "trivial self-comparison (identity transform expected)."
+        )
+        return indices
+
+    return without_reference
+
+
+def run_comparison(
+    methods: Mapping[str, RegistrationMethod],
+    reference_frame: np.ndarray,
+    get_frame: Callable[[int], np.ndarray],
+    frame_indices: list[int],
+) -> dict[str, list[FrameTransform | None]]:
+    """Run every method in ``methods`` against every frame in ``frame_indices``.
+
+    ``get_frame(t)`` fetches the comparison frame for index ``t`` (a real
+    ``source.get_frame(t).raw`` or a synthetic in-memory lookup -- the same
+    function drives both the synthetic and real-data sections, and the
+    dashboard's verify step). A failure in one ``(method, frame)`` pair is
+    caught and recorded as ``None`` without ever stopping the other methods or
+    frames: broadened from :class:`RegistrationError` to ``Exception`` so a
+    genuinely unanticipated error can't silently abort the whole run, and
+    every ``results[name]`` list ends up with exactly one entry per entry in
+    ``frame_indices`` (never ragged).
+
+    Args:
+        methods: Mapping of method name -> :class:`RegistrationMethod`
+            instance.
+        reference_frame: The reference frame passed to every ``estimate`` call.
+        get_frame: Callable returning the comparison frame for a given frame
+            index.
+        frame_indices: Frame indices to compare against ``reference_frame``.
+
+    Returns:
+        dict[str, list]: method name -> list of ``FrameTransform | None``, one
+            entry per ``frame_indices`` entry, in the same order.
+    """
+    results: dict[str, list[FrameTransform | None]] = {name: [] for name in methods}
+    for t in frame_indices:
+        comparison_frame = get_frame(t)
+        for name, method in methods.items():
+            try:
+                transform: FrameTransform | None = method.estimate(
+                    reference_frame, comparison_frame
+                )
+            except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring
+                print(f"frame {t}: {name} failed -- {type(e).__name__}: {e}")
+                transform = None
+            results[name].append(transform)
+    return results
 
 
 def _to_grayscale_f32(image: np.ndarray) -> np.ndarray:
