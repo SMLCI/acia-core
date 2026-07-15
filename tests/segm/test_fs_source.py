@@ -17,6 +17,11 @@ def _make_stack(num_frames=3, h=8, w=8):
     return rng.integers(0, 255, size=(num_frames, h, w), dtype=np.uint8)
 
 
+def _make_uint16_stack(num_frames=3, h=8, w=8):
+    rng = np.random.default_rng(0)
+    return rng.integers(0, 65535, size=(num_frames, h, w), dtype=np.uint16)
+
+
 def test_local_path_backward_compat(tmp_path):
     """Reading a local TIFF through fsspec matches the original behavior."""
     stack = _make_stack()
@@ -45,6 +50,32 @@ def test_local_path_to_channel(tmp_path):
     frame = single.get_frame(0)
     assert frame.raw.shape == (8, 8)
     np.testing.assert_array_equal(frame.raw, src.get_frame(0).raw[..., 0])
+
+
+def test_local_path_normalize_image_false_preserves_raw_dtype_and_channel(tmp_path):
+    """normalize_image=False: get_frame/indexing return true dtype, (H, W, 1) shape.
+
+    Regression test for a bug where get_frame() ignored self.normalize_image
+    (unlike __iter__), and where the 2D->3-channel duplication was unconditional
+    -- both are now gated by normalize_image.
+    """
+    stack = _make_uint16_stack()
+    path = tmp_path / "stack16.tif"
+    tifffile.imwrite(str(path), stack)
+
+    src = LocalSequenceSource(str(path), normalize_image=False)
+
+    frame = src.get_frame(0)
+    assert frame.raw.dtype == np.uint16
+    assert frame.raw.shape == (8, 8, 1)
+    np.testing.assert_array_equal(frame.raw[..., 0], stack[0])
+
+    # __getitem__ (backed by get_frame) matches
+    indexed = src[0]
+    assert indexed.raw.dtype == np.uint16
+    assert indexed.raw.shape == (8, 8, 1)
+
+    assert src.num_channels == 1
 
 
 def test_memory_backend_end_to_end():

@@ -72,23 +72,30 @@ def list_sequence_sources(
 
 
 def prepare_image(image, normalize_image=True):
-    """Normalize and convert image to RGB.
+    """Normalize and convert image to RGB, or preserve it as raw data.
 
     Args:
         image ([type]): [description]
-        normalize_image (bool, optional): Whether to normalize the image into uint8 domain (0-255). Defaults to True.
+        normalize_image (bool, optional): Whether to normalize the image into uint8
+            domain (0-255) and (for a 2D frame) artificially triplicate it to 3
+            channels for display. Defaults to True. When False, the original
+            dtype/intensity is preserved; a genuinely 2D frame only gains a
+            trailing singleton channel axis (matching the raw-frame convention
+            used by ND2SequenceSource/CZISequenceSource), no triplication.
     Returns:
-        [np.array]: RGB image (Width, height, 3 color channels)
+        [np.array]: RGB image (Width, height, 3 color channels) if normalize_image,
+            otherwise the original data with a channel axis.
     """
-    # normalize image space
     if normalize_image:
         min_val = np.min(image)
         max_val = np.max(image)
         image = np.floor((image - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-
-    if len(image.shape) == 2:
-        # make it artificially rgb
-        image = np.repeat(image[:, :, None], 3, axis=-1)
+        if len(image.shape) == 2:
+            # make it artificially rgb
+            image = np.repeat(image[:, :, None], 3, axis=-1)
+    elif len(image.shape) == 2:
+        # keep raw dtype/intensity; just add a trailing channel axis
+        image = image[:, :, None]
 
     return image
 
@@ -454,7 +461,7 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         images = self._read_images()
         assert frame < len(images)
 
-        return LocalImage(prepare_image(images[frame]))
+        return LocalImage(prepare_image(images[frame], self.normalize_image))
 
     @property
     def size_t(self):

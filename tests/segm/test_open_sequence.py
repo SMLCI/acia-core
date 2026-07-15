@@ -340,6 +340,15 @@ class TestTiffBackend(unittest.TestCase):
             self.assertEqual(md.num_timepoints, 3)
             self.assertEqual(md.sizes["Y"], 8)
             self.assertEqual(md.sizes["X"], 10)
+            # true dtype/channel count, not the visualization-normalized uint8/RGB
+            # LocalSequenceSource's default construction would otherwise produce
+            self.assertEqual(md.dtype, "uint16")
+            self.assertEqual(md.sizes["C"], 1)
+
+            source = f.position(0)
+            frame = source.get_frame(0)
+            self.assertEqual(frame.raw.dtype, np.uint16)
+            np.testing.assert_array_equal(frame.raw[..., 0], stack[0])
 
             thumb = f.thumbnail(0, downscale=2)
             self.assertEqual(thumb.shape[2], 3)

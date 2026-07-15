@@ -37,6 +37,15 @@ section to a dated version entry automatically.
 - Migrated CI/CD to GitHub Actions with automated, OIDC-based PyPI releases and
   GitHub Pages documentation.
 
+### Fixed
+- `LocalSequenceSource.get_frame()`/indexing now honor `normalize_image` (previously
+  only `__iter__` did), and the 2D-frame-to-3-channel duplication in `prepare_image`
+  is gated by it too. TIFFs opened via `open_sequence` (which already requests
+  `normalize_image=False`) now return their true dtype/channel data instead of
+  silently-normalized, artificially-3-channel uint8 — this also fixes previously
+  wrong `dtype`/channel-count metadata, and affects any quantitative analysis
+  (registration, fluorescence/area extraction) run on `open_sequence`-opened TIFFs.
+
 ## [0.1.0] - 2021-07-30
 
 ### Added
