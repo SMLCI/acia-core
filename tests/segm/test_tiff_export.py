@@ -7,6 +7,7 @@ one-frame-at-a-time writing (peak memory ~ one frame).
 
 from __future__ import annotations
 
+import re
 import tempfile
 import types
 import unittest
@@ -110,6 +111,61 @@ class TestSaveTiffStack(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = save_tiff_stack(src, Path(d) / "new" / "sub" / "out.tif")
             self.assertTrue(Path(path).exists())
+
+    def test_ome_calibration_and_channel_names(self):
+        stack = (np.random.rand(4, 8, 8, 1) * 1000).astype(np.uint16)
+        tps = ureg.Quantity(np.arange(4) * 300.0, "second")
+        src = THWCSequenceSource(
+            stack, pixel_size=ureg.Quantity(0.0733, "micrometer"), timepoints=tps
+        )
+        with tempfile.TemporaryDirectory() as d:
+            path = save_tiff_stack(
+                src, Path(d) / "ome.tif", ome=True, channel_names=["100x PH"]
+            )
+            with tifffile.TiffFile(path) as tf:
+                ome_xml = tf.ome_metadata
+                arr = tf.asarray()
+            self.assertIsNotNone(ome_xml)
+            self.assertIn('PhysicalSizeX="0.0733', ome_xml)
+            self.assertIn('TimeIncrement="300.0"', ome_xml)
+            self.assertIn('Name="100x PH"', ome_xml)
+            self.assertEqual(arr.shape, (4, 8, 8))
+
+    def test_ome_no_calibration_or_channels_omits_tags(self):
+        stack = (np.random.rand(2, 5, 5, 1) * 1000).astype(np.uint16)
+        src = THWCSequenceSource(stack)  # no pixel_size / timepoints
+        with tempfile.TemporaryDirectory() as d:
+            path = save_tiff_stack(src, Path(d) / "ome_raw.tif", ome=True)
+            with tifffile.TiffFile(path) as tf:
+                ome_xml = tf.ome_metadata
+            self.assertNotIn("PhysicalSizeX", ome_xml)
+            self.assertNotIn("TimeIncrement", ome_xml)
+            channel_tag = re.search(r"<Channel\b[^>]*>", ome_xml).group(0)
+            self.assertNotIn("Name=", channel_tag)  # no channel name fabricated
+
+    def test_compression_roundtrip_and_smaller(self):
+        # A synthetic gradient (not noise) compresses meaningfully with zlib.
+        row = np.linspace(0, 65535, 200, dtype=np.uint16)
+        stack = np.tile(row, (10, 200, 1))[..., None]
+        src = THWCSequenceSource(stack)
+        with tempfile.TemporaryDirectory() as d:
+            uncompressed = save_tiff_stack(src, Path(d) / "raw.tif")
+            compressed = save_tiff_stack(src, Path(d) / "zlib.tif", compression="zlib")
+            self.assertTrue(
+                np.array_equal(
+                    tifffile.imread(uncompressed), tifffile.imread(compressed)
+                )
+            )
+            self.assertLess(
+                Path(compressed).stat().st_size, Path(uncompressed).stat().st_size
+            )
+
+    def test_lazy_one_frame_at_a_time_under_ome_and_compression(self):
+        stack = (np.random.rand(6, 5, 5, 1) * 1000).astype(np.uint16)
+        rec = _RecordingSource(stack)
+        with tempfile.TemporaryDirectory() as d:
+            save_tiff_stack(rec, Path(d) / "lazy_ome.tif", ome=True, compression="zlib")
+        self.assertEqual(rec.reads, list(range(6)))
 
 
 if __name__ == "__main__":

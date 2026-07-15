@@ -23,7 +23,10 @@ def save_tiff_stack(
     path: str | os.PathLike,
     *,
     imagej: bool = True,
+    ome: bool = False,
     dtype=None,
+    compression: str | int | None = None,
+    channel_names: list[str] | None = None,
 ) -> str:
     """Write ``source`` to a TIFF stack lazily (one frame at a time).
 
@@ -32,9 +35,23 @@ def save_tiff_stack(
         path: Output ``.tif`` path (parent dirs are created).
         imagej: Write an ImageJ hyperstack (default) — matches how
             ``acia-workflows`` consumes TIFFs. Calibration goes into ImageJ
-            metadata + TIFF resolution tags.
+            metadata + TIFF resolution tags. Ignored when ``ome=True``.
+        ome: Write an OME-TIFF instead of an ImageJ hyperstack — carries
+            richer, standard-schema metadata (``PhysicalSizeX/Y``,
+            ``TimeIncrement``, channel names) that a cropped/registered
+            export would otherwise lose. Takes precedence over ``imagej``
+            when both are set. As with the ImageJ path, missing calibration
+            is simply omitted, never fabricated.
         dtype: Optional numpy dtype to cast each frame to (default: keep source
             dtype).
+        compression: Optional codec name/level forwarded to ``tifffile``
+            (e.g. ``"zlib"``, ``"lzw"``); ``None`` (default) writes
+            uncompressed, matching prior behavior.
+        channel_names: Optional per-channel names to embed (OME
+            ``Channel/Name``); ignored when ``ome=False``. Crops don't carry
+            channel metadata themselves, so callers pass this through
+            explicitly (e.g. from a selection manifest's baked-in
+            ``source["channels"]``).
 
     Returns:
         The written path.
@@ -64,11 +81,14 @@ def save_tiff_stack(
         for i in range(1, n):
             yield _prepare_frame(source.get_frame(i).raw, dtype)
 
-    metadata = {**ij_meta, "axes": axes} if imagej else None
-
-    if imagej:
+    if ome:
+        metadata = {**_ome_calibration_tags(source, channel_names), "axes": axes}
+        writer = tifffile.TiffWriter(path, ome=True, bigtiff=est_bytes > 3_900_000_000)
+    elif imagej:
+        metadata = {**ij_meta, "axes": axes}
         writer = tifffile.TiffWriter(path, imagej=True)
     else:
+        metadata = None
         writer = tifffile.TiffWriter(path, bigtiff=est_bytes > 3_900_000_000)
 
     with writer as tw:
@@ -81,6 +101,7 @@ def save_tiff_stack(
             metadata=metadata,
             resolution=resolution,
             resolutionunit=resunit,
+            compression=compression,
         )
     return path
 
@@ -126,6 +147,37 @@ def _calibration_tags(source):
             ij_meta["fps"] = 1.0 / interval_s
 
     return resolution, resunit, ij_meta
+
+
+def _ome_calibration_tags(source, channel_names: list[str] | None) -> dict:
+    """Build an OME ``metadata`` dict from source calibration + explicit channel names.
+
+    Missing calibration/channel names are simply omitted (no fabricated tags) --
+    same discipline as :func:`_calibration_tags`.
+    """
+    ome_meta: dict = {}
+
+    pixel_size = getattr(source, "pixel_size", None)
+    if pixel_size is not None:
+        try:
+            um = float(pixel_size.to("micrometer").magnitude)
+            if um > 0:
+                ome_meta["PhysicalSizeX"] = um
+                ome_meta["PhysicalSizeXUnit"] = "um"
+                ome_meta["PhysicalSizeY"] = um
+                ome_meta["PhysicalSizeYUnit"] = "um"
+        except Exception:  # noqa: BLE001 - calibration is best-effort
+            pass
+
+    interval_s = _frame_interval_seconds(source)
+    if interval_s is not None:
+        ome_meta["TimeIncrement"] = interval_s
+        ome_meta["TimeIncrementUnit"] = "s"
+
+    if channel_names:
+        ome_meta["Channel"] = {"Name": list(channel_names)}
+
+    return ome_meta
 
 
 def _frame_interval_seconds(source):

@@ -1479,7 +1479,7 @@ function render({ model, el }) {
     const h = roisAt(currentPos), ci = h.length ? Math.max.apply(null, h.map((x) => x.ci)) + 1 : 0;
     const sel = { id: uid++, position: currentPos, x: dims[0] / 2, y: dims[1] / 2,
       w: Math.round(dims[0] / 3), h: Math.round(dims[1] / 3), angle: 0,
-      label: "colony " + String.fromCharCode(65 + h.length), ci: ci };
+      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci };
     selections.push(sel); activeId = sel.id;
     renderEditor(); renderList(); pushSelections();
   }
@@ -1575,7 +1575,7 @@ function render({ model, el }) {
     if (mode === "single") selections = selections.filter((x) => x.position !== currentPos);
     const hh = roisAt(currentPos), ci = hh.length ? Math.max.apply(null, hh.map((x) => x.ci)) + 1 : 0;
     const sel = { id: uid++, position: currentPos, x: cx, y: cy, w: w, h: h, angle: roi.angle,
-      label: "colony " + String.fromCharCode(65 + hh.length), ci: ci };
+      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci };
     selections.push(sel); activeId = sel.id; exitPick();
     renderEditor(); renderList(); pushSelections(); toast("Fitted ROI from points");
   }
