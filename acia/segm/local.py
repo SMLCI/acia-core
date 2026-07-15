@@ -20,6 +20,7 @@ from acia.base import (
 )
 from acia.config import resolve_storage_options
 from acia.notebook import JupyterVisualizationMixin
+from acia.segm.tiff_metadata import read_tiff_calibration
 
 
 def list_sequence_sources(
@@ -345,17 +346,73 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
                 credentials) for remote URLs. Merged on top of any matching entry
                 in the acia credentials config (see :mod:`acia.config`).
             frame_interval: scalar time between frames (pint Quantity or str like
-                ``"15 minute"``) defining the imaging interval at load.
-            timepoints: explicit per-frame timepoints (pint Quantity array).
+                ``"15 minute"``); overrides any value read from the file's own
+                OME-XML/ImageJ metadata. ``None`` (default) resolves it from
+                the file lazily, on first access to a calibration property.
+            timepoints: explicit per-frame timepoints (pint Quantity array);
+                same override-vs-auto-detect behavior as ``frame_interval``.
             pixel_size: physical pixel size (pint length per pixel) for spatial
-                calibration; extractors pull this for their units.
+                calibration; same override-vs-auto-detect behavior.
         """
         self.filename = tif_file
         self.normalize_image = normalize_image
         self.luts = luts
         self.channel_index = channel_index
         self.storage_options = storage_options
+        # user-supplied calibration overrides (metadata is auto-read otherwise,
+        # lazily -- construction itself must do no I/O, see _ensure_calibration)
+        self._user_pixel_size = pixel_size
+        self._user_frame_interval = frame_interval
+        self._user_timepoints = timepoints
+        self._calibration_resolved = False
+        self._calibration_source: str | None = None
+
+    def _ensure_calibration(self) -> None:
+        """Resolve calibration once: user override > file metadata > None.
+
+        Only reads the file if at least one of pixel_size/frame_interval/
+        timepoints was not explicitly supplied -- if the caller gave all three,
+        no metadata read happens at all.
+        """
+        if self._calibration_resolved:
+            return
+
+        pixel_size = self._user_pixel_size
+        frame_interval = self._user_frame_interval
+        timepoints = self._user_timepoints
+
+        if pixel_size is None or frame_interval is None or timepoints is None:
+            cal = read_tiff_calibration(self.filename, self.storage_options)
+            if pixel_size is None:
+                pixel_size = cal.pixel_size
+            if frame_interval is None:
+                frame_interval = cal.frame_interval
+            if timepoints is None:
+                timepoints = cal.timepoints
+            self._calibration_source = cal.source
+
         self._init_calibration(frame_interval, timepoints, pixel_size)
+        self._calibration_resolved = True
+
+    @property
+    def pixel_size(self):
+        """Pint length per pixel: user override, else auto-read, else ``None``."""
+        self._ensure_calibration()
+        return ImageSequenceSource.pixel_size.fget(self)
+
+    @property
+    def timepoints(self):
+        """Per-frame pint timepoints: user override, else auto-read, else ``None``."""
+        self._ensure_calibration()
+        return ImageSequenceSource.timepoints.fget(self)
+
+    @property
+    def calibration_source(self) -> str | None:
+        """Where auto-detected calibration came from: ``"ome"``, ``"imagej"``, or
+        ``None`` (either nothing was auto-detected, or every field was
+        user-supplied so no file read happened)."""
+        self._ensure_calibration()
+        return self._calibration_source
 
     def _read_images(self):
         """Read the image stack via fsspec (works for local and remote URLs)."""

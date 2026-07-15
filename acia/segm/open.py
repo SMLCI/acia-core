@@ -28,6 +28,20 @@ from acia.notebook import normalize_to_uint8
 _SUFFIX_FORMAT = {"nd2": "nd2", "czi": "czi", "tif": "tiff", "tiff": "tiff"}
 
 
+def _scalar_frame_interval(source):
+    """Derive the scalar time-between-frames from a source's timepoints, if any.
+
+    There is no public per-scalar ``frame_interval`` on ``ImageSequenceSource``
+    (only ``timepoints``, the canonical per-frame calibration), so this mirrors
+    :func:`acia.segm.tiff_export._frame_interval_seconds`, returning a pint
+    ``Quantity`` instead of a bare seconds float.
+    """
+    tps = source.timepoints
+    if tps is None or len(tps) < 2:
+        return None
+    return tps[1] - tps[0]
+
+
 @dataclass(frozen=True)
 class SequenceMetadata:
     """File-level metadata, unified across formats. JSON-safe via :meth:`to_dict`."""
@@ -182,7 +196,7 @@ class SequenceFile:
             return SequenceMetadata(
                 sizes=sizes,
                 pixel_size=probe.pixel_size,
-                frame_interval=self._frame_interval,
+                frame_interval=_scalar_frame_interval(probe),
                 channels=[f"ch{i}" for i in range(c)],
                 dtype=str(frame0.dtype),
                 num_positions=1,
