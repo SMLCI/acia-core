@@ -224,6 +224,7 @@ def run_comparison(
     reference_frame: np.ndarray,
     get_frame: Callable[[int], np.ndarray],
     frame_indices: list[int],
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, list[FrameTransform | None]]:
     """Run every method in ``methods`` against every frame in ``frame_indices``.
 
@@ -244,13 +245,22 @@ def run_comparison(
         get_frame: Callable returning the comparison frame for a given frame
             index.
         frame_indices: Frame indices to compare against ``reference_frame``.
+        on_progress: Optional callback invoked as ``on_progress(i, total)``
+            after every ``frame_indices[i]`` has been compared against every
+            method (``total = len(frame_indices)``) -- lets a caller (e.g. the
+            dashboard's verify step) report per-frame progress without this
+            function knowing anything about UI. Defaults to ``None`` so
+            existing callers are unaffected. A failure raised by the callback
+            itself is caught and printed the same way a per-method failure
+            is, rather than aborting the rest of the comparison.
 
     Returns:
         dict[str, list]: method name -> list of ``FrameTransform | None``, one
             entry per ``frame_indices`` entry, in the same order.
     """
     results: dict[str, list[FrameTransform | None]] = {name: [] for name in methods}
-    for t in frame_indices:
+    total = len(frame_indices)
+    for i, t in enumerate(frame_indices):
         comparison_frame = get_frame(t)
         for name, method in methods.items():
             try:
@@ -261,6 +271,13 @@ def run_comparison(
                 print(f"frame {t}: {name} failed -- {type(e).__name__}: {e}")
                 transform = None
             results[name].append(transform)
+        if on_progress is not None:
+            try:
+                on_progress(i, total)
+            except Exception as e:  # noqa: BLE001 -- isolate: a broken progress
+                # callback (e.g. RegistrationDashboard.send on a closed comm
+                # channel) must not abort the rest of the comparison.
+                print(f"frame {t}: on_progress failed -- {type(e).__name__}: {e}")
     return results
 
 

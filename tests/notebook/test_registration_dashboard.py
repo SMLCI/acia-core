@@ -182,7 +182,12 @@ class TestMaskFrameMessage(unittest.TestCase):
 
 
 class TestVerifyMessage(unittest.TestCase):
-    def test_verify_reports_before_after_when_available(self):
+    def test_verify_reports_progress_and_full_frame_buffers(self):
+        """verify sends a per-frame "progress" message (phase="verify") via
+        run_comparison's on_progress callback, then a final verify_result
+        carrying one uncorrected PNG buffer per sampled frame plus a
+        corrected one wherever has_correction[i] is true (the comparison
+        player's data source)."""
         with tempfile.TemporaryDirectory() as d:
             path = _tif_translating(d)
             dash = RegistrationDashboard(
@@ -196,13 +201,29 @@ class TestVerifyMessage(unittest.TestCase):
                 {"type": "verify", "position": 0, "method": "PhaseCorrelationHighpass"},
                 None,
             )
-            content, buffers = rec.sent[0]
+
+            progress = [c for c, _ in rec.sent if c.get("type") == "progress"]
+            content, buffers = rec.sent[-1]
             self.assertEqual(content["type"], "verify_result")
+
+            num_frames = len(content["frame_indices"])
+            self.assertEqual(len(progress), num_frames)
+            for i, msg in enumerate(progress):
+                self.assertEqual(msg["phase"], "verify")
+                self.assertEqual(msg["frame"], i)
+                self.assertEqual(msg["num_frames"], num_frames)
+
             self.assertEqual(content["position"], 0)
             self.assertEqual(content["reference_frame"], 0)
             self.assertEqual(len(content["frame_indices"]), len(content["transforms"]))
-            self.assertTrue(content["before_after_available"])
-            self.assertEqual(len(buffers), 3)
+            self.assertEqual(len(content["has_correction"]), num_frames)
+            # a translating stack must converge for at least one sampled frame
+            self.assertTrue(any(content["has_correction"]))
+
+            expected_buffers = 1 + sum(
+                2 if available else 1 for available in content["has_correction"]
+            )
+            self.assertEqual(len(buffers), expected_buffers)
             for png in buffers:
                 self.assertTrue(png.startswith(b"\x89PNG"))
             # transforms are plain JSON-safe dicts (dx/dy/theta), not objects
@@ -215,7 +236,8 @@ class TestVerifyMessage(unittest.TestCase):
             rec = _Recorder()
             dash.send = rec
             dash._on_custom_msg(dash, {"type": "verify"}, None)
-            content, _buffers = rec.sent[0]
+            content, _buffers = rec.sent[-1]
+            self.assertEqual(content["type"], "verify_result")
             self.assertEqual(content["method"], "GradientECC")
             self.assertEqual(content["position"], 0)
 
@@ -253,8 +275,18 @@ class TestBatchApply(unittest.TestCase):
 
             progress = [c for c, _ in rec.sent if c.get("type") == "progress"]
             self.assertEqual(len(progress), 3)  # one per frame (0, 1, 2)
+            first = progress[0]
             self.assertEqual(
-                progress[0],
+                {
+                    k: first[k]
+                    for k in (
+                        "type",
+                        "position",
+                        "num_positions",
+                        "frame",
+                        "num_frames",
+                    )
+                },
                 {
                     "type": "progress",
                     "position": 0,
@@ -263,6 +295,13 @@ class TestBatchApply(unittest.TestCase):
                     "num_frames": 3,
                 },
             )
+            # best-effort elapsed/ETA fields (ETA may be None early on, before
+            # a rate can be estimated)
+            self.assertIsInstance(first["elapsed_seconds"], float)
+            self.assertGreaterEqual(first["elapsed_seconds"], 0)
+            self.assertIn("eta_seconds", first)
+            last = progress[-1]
+            self.assertIsInstance(last["elapsed_seconds"], float)
 
             manifest = RegistrationManifest.load(summary["path"])
             self.assertEqual(len(manifest.records), 1)
@@ -311,6 +350,102 @@ class TestBatchApply(unittest.TestCase):
             # no progress messages -- the position was skipped, never touched
             self.assertFalse(any(c.get("type") == "progress" for c, _ in rec2.sent))
 
+    def test_batch_apply_resumes_partial_position_from_first_uncomputed_frame(self):
+        """A partial checkpoint (some but not all frames done) must resume
+        from the first uncomputed frame -- not be wrongly fully skipped
+        (today's bug once partial checkpoints exist) and not be fully redone.
+        """
+        from acia.registration import FrameTransform
+        from acia.registration_persistence import RegistrationRecord, save_registration
+
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=5)
+            out = Path(d) / "out"
+
+            dash = RegistrationDashboard(
+                open_sequence(path), method_name="PhaseCorrelationHighpass"
+            )
+
+            # Seed a manifest as if a prior run got through frames 0-1 of a
+            # 5-frame position before being interrupted. A sentinel transform
+            # value that a real estimate() would never produce, so recompute
+            # vs. preserve is unambiguous.
+            sentinel = FrameTransform(dx=999.0, dy=999.0, theta=0.0)
+            partial = RegistrationRecord(
+                position=0,
+                method="PhaseCorrelationHighpass",
+                transforms={0: sentinel, 1: sentinel},
+                reference_frame=0,
+                failed_frames={},
+            )
+            manifest = RegistrationManifest(
+                source=dash.manifest.source,
+                records=[partial],
+                method="PhaseCorrelationHighpass",
+            )
+            save_registration(manifest, out)
+
+            rec = _Recorder()
+            dash.send = rec
+            summary = dash.batch_apply(directory=out)
+
+            self.assertEqual(summary["completed"], [0])
+            self.assertEqual(summary["skipped"], [])
+
+            progress = [c for c, _ in rec.sent if c.get("type") == "progress"]
+            # only the previously-uncomputed frames (2, 3, 4) are processed
+            self.assertEqual([p["frame"] for p in progress], [2, 3, 4])
+
+            final = RegistrationManifest.load(summary["path"]).records[0]
+            self.assertEqual(
+                set(final.transforms) | set(final.failed_frames), {0, 1, 2, 3, 4}
+            )
+            # frames 0/1 were not recomputed -- the sentinel survives untouched
+            self.assertEqual(final.transforms[0].dx, 999.0)
+            self.assertEqual(final.transforms[1].dx, 999.0)
+
+    def test_batch_apply_checkpoints_within_a_position(self):
+        """The manifest is persisted every CHECKPOINT_INTERVAL frames within a
+        position, not only after it fully completes."""
+        from unittest import mock
+
+        import acia.registration_persistence as reg_persistence
+        from acia.notebook import CHECKPOINT_INTERVAL
+
+        with tempfile.TemporaryDirectory() as d:
+            n_frames = CHECKPOINT_INTERVAL + 5
+            path = _tif_translating(d, t=n_frames)
+            dash = RegistrationDashboard(
+                open_sequence(path), method_name="PhaseCorrelationHighpass"
+            )
+            dash.send = _Recorder()
+            out = Path(d) / "out"
+
+            real_save = reg_persistence.save_registration
+            calls = []
+
+            def _wrapped(manifest, directory):
+                if manifest.records:
+                    rec0 = manifest.records[0]
+                    calls.append(len(rec0.transforms) + len(rec0.failed_frames))
+                else:
+                    calls.append(0)
+                return real_save(manifest, directory)
+
+            with mock.patch.object(
+                reg_persistence, "save_registration", side_effect=_wrapped
+            ):
+                summary = dash.batch_apply(directory=out)
+
+            self.assertEqual(summary["completed"], [0])
+            # a from-scratch single-position run without mid-position
+            # checkpointing would only ever call save_registration twice (once
+            # right after the position finishes inside the loop, once more
+            # after the loop) -- a 3rd call proves a mid-position checkpoint
+            # fired at CHECKPOINT_INTERVAL frames.
+            self.assertGreater(len(calls), 2)
+            self.assertIn(CHECKPOINT_INTERVAL, calls)
+
     def test_batch_apply_isolates_per_frame_failures(self):
         """One frame raising during estimate() must not abort the position."""
         with tempfile.TemporaryDirectory() as d:
@@ -341,7 +476,7 @@ class TestBatchApply(unittest.TestCase):
             )
             dash.send = _Recorder()
 
-            def _boom(self, pos, method_name, mask_rect, num_positions):
+            def _boom(self, pos, method_name, mask_rect, num_positions, **kwargs):
                 raise RuntimeError("simulated read failure")
 
             dash._register_position = _boom.__get__(dash, RegistrationDashboard)
@@ -352,6 +487,177 @@ class TestBatchApply(unittest.TestCase):
             manifest = RegistrationManifest.load(summary["path"])
             self.assertEqual(manifest.records[0].transforms, {})
             self.assertIn("simulated read failure", manifest.records[0].notes)
+
+    def test_batch_apply_failure_after_checkpoint_preserves_progress(self):
+        """A whole-position failure that happens *after* a checkpoint fired
+        for the resumed attempt must not wipe out the checkpointed progress
+        -- the persisted manifest must still contain those frames, not an
+        empty record clobbering the checkpoint.
+        """
+        from unittest import mock
+
+        from acia.registration import FrameTransform
+        from acia.registration_persistence import RegistrationRecord, save_registration
+
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=6)
+            out = Path(d) / "out"
+
+            dash = RegistrationDashboard(
+                open_sequence(path), method_name="PhaseCorrelationHighpass"
+            )
+
+            # Seed a manifest as if a prior run got through frames 0-1 of a
+            # 6-frame position before being interrupted.
+            sentinel = FrameTransform(dx=999.0, dy=999.0, theta=0.0)
+            partial = RegistrationRecord(
+                position=0,
+                method="PhaseCorrelationHighpass",
+                transforms={0: sentinel, 1: sentinel},
+                reference_frame=0,
+                failed_frames={},
+            )
+            manifest = RegistrationManifest(
+                source=dash.manifest.source,
+                records=[partial],
+                method="PhaseCorrelationHighpass",
+            )
+            save_registration(manifest, out)
+
+            # A `send` that blows up right after the frame-3 progress message
+            # -- with CHECKPOINT_INTERVAL patched to 2, a checkpoint for
+            # frames {0, 1, 2, 3} fires (inside the resumed attempt, which
+            # starts at frame 2) just before that same message is sent, so
+            # the failure lands strictly after the checkpoint.
+            class _RaiseAfterFrame:
+                def __init__(self, boom_on_frame):
+                    self.sent = []
+                    self.boom_on_frame = boom_on_frame
+
+                def __call__(self, content, buffers=None):
+                    self.sent.append((content, buffers))
+                    if (
+                        content.get("type") == "progress"
+                        and content.get("frame") == self.boom_on_frame
+                    ):
+                        raise RuntimeError("simulated send failure after checkpoint")
+
+            dash.send = _RaiseAfterFrame(boom_on_frame=3)
+
+            with mock.patch("acia.notebook.CHECKPOINT_INTERVAL", 2):
+                summary = dash.batch_apply(directory=out)  # must not raise
+
+            self.assertEqual(summary["failed_positions"], [0])
+            self.assertEqual(summary["completed"], [0])
+
+            final = RegistrationManifest.load(summary["path"]).records[0]
+            # frames 0-3 (checkpointed before the simulated failure) survive
+            # -- not wiped to an empty record.
+            self.assertEqual(
+                set(final.transforms) | set(final.failed_frames), {0, 1, 2, 3}
+            )
+            self.assertEqual(final.transforms[0].dx, 999.0)
+            self.assertEqual(final.transforms[1].dx, 999.0)
+            self.assertIn("simulated send failure after checkpoint", final.notes)
+
+    def test_batch_apply_isolates_size_t_lookup_failure(self):
+        """A resume/skip ``size_t`` lookup raising for one position must not
+        abort the whole batch-apply run -- it falls through to the existing
+        per-position failure path instead."""
+        from acia.registration import FrameTransform
+        from acia.registration_persistence import RegistrationRecord, save_registration
+
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=4)
+            out = Path(d) / "out"
+
+            dash = RegistrationDashboard(
+                open_sequence(path), method_name="PhaseCorrelationHighpass"
+            )
+
+            # A partial (not complete) prior record so batch_apply's
+            # resume/skip logic actually performs a size_t lookup.
+            sentinel = FrameTransform(dx=999.0, dy=999.0, theta=0.0)
+            partial = RegistrationRecord(
+                position=0,
+                method="PhaseCorrelationHighpass",
+                transforms={0: sentinel},
+                reference_frame=0,
+                failed_frames={},
+            )
+            manifest = RegistrationManifest(
+                source=dash.manifest.source,
+                records=[partial],
+                method="PhaseCorrelationHighpass",
+            )
+            save_registration(manifest, out)
+
+            class _BoomSource:
+                @property
+                def size_t(self):
+                    raise RuntimeError("simulated size_t failure")
+
+            real_position = dash._file.position
+            dash._file.position = lambda i: (
+                _BoomSource() if i == 0 else real_position(i)
+            )
+
+            dash.send = _Recorder()
+            summary = dash.batch_apply(directory=out)  # must not raise
+
+            self.assertEqual(summary["failed_positions"], [0])
+            self.assertEqual(summary["completed"], [0])
+            final = RegistrationManifest.load(summary["path"]).records[0]
+            # the previously-checkpointed frame survives the size_t failure
+            self.assertEqual(final.transforms[0].dx, 999.0)
+            self.assertIn("simulated size_t failure", final.notes)
+
+    def test_batch_apply_ignores_existing_record_from_different_method(self):
+        """A prior record computed under a different method must not be
+        treated as resume/skip data for the newly-selected method -- the
+        position is processed from scratch instead of merging across
+        methods."""
+        from acia.registration import FrameTransform
+        from acia.registration_persistence import RegistrationRecord, save_registration
+
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=3)
+            out = Path(d) / "out"
+
+            dash = RegistrationDashboard(
+                open_sequence(path), method_name="PhaseCorrelationHighpass"
+            )
+
+            # A *complete* record, but recorded under a different method.
+            sentinel = FrameTransform(dx=999.0, dy=999.0, theta=0.0)
+            old_method_record = RegistrationRecord(
+                position=0,
+                method="GradientECC",
+                transforms={0: sentinel, 1: sentinel, 2: sentinel},
+                reference_frame=0,
+                failed_frames={},
+            )
+            manifest = RegistrationManifest(
+                source=dash.manifest.source,
+                records=[old_method_record],
+                method="GradientECC",
+            )
+            save_registration(manifest, out)
+
+            rec = _Recorder()
+            dash.send = rec
+            summary = dash.batch_apply(directory=out)
+
+            # not skipped -- reprocessed from scratch under the new method
+            self.assertEqual(summary["skipped"], [])
+            self.assertEqual(summary["completed"], [0])
+            progress = [c for c, _ in rec.sent if c.get("type") == "progress"]
+            self.assertEqual([p["frame"] for p in progress], [0, 1, 2])
+
+            final = RegistrationManifest.load(summary["path"]).records[0]
+            self.assertEqual(final.method, "PhaseCorrelationHighpass")
+            # sentinel values from the old method are gone -- real estimates
+            self.assertNotEqual(final.transforms[0].dx, 999.0)
 
     def test_batch_apply_blocked_for_masked_template_without_mask(self):
         with tempfile.TemporaryDirectory() as d:

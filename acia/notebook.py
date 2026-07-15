@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import logging
 import os
@@ -13,6 +14,8 @@ import numpy as np
 from PIL import Image
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from acia.base import BaseImage, RotatedCropSpec
     from acia.registration import FrameTransform
     from acia.registration_persistence import RegistrationManifest, RegistrationRecord
@@ -946,6 +949,67 @@ _REGISTRATION_METHOD_NAMES: tuple[str, ...] = (
 )
 
 
+# batch_apply's checkpoint cadence: the manifest is persisted after every this
+# many newly-estimated frames *within* a position (not only after the
+# position fully completes), bounding worst-case lost progress on interrupt
+# to this many frames without rewriting the whole manifest every single frame
+# across a long, multi-position run. See the
+# registration-dashboard-progress-video spec's Design Notes.
+CHECKPOINT_INTERVAL = 20
+
+
+def _estimate_eta(
+    *,
+    elapsed: float,
+    frames_done: int,
+    frames_left_in_position: int,
+    positions_remaining_after: int,
+    position_frame_counts: list[int],
+    current_position_num_frames: int,
+) -> float | None:
+    """Best-effort ETA (seconds) for the remainder of a batch-apply run.
+
+    Returns ``None`` when there isn't yet enough signal (no elapsed time or no
+    completed frames) to produce a rate -- the ESM only renders an ETA once
+    this is non-``None``.
+
+    Heuristic (approximate, not exact -- see the spec's Design Notes):
+    ``rate = frames_done / elapsed``; ``remaining = frames_left_in_position +
+    positions_remaining_after * average_frames_per_position`` where the
+    average is over positions *completed so far in this run*
+    (``position_frame_counts``), falling back to the current position's own
+    frame count when no position has completed yet; ``eta = remaining / rate``.
+
+    Args:
+        elapsed: Seconds elapsed since the batch-apply run started.
+        frames_done: Total frames estimated so far across the whole run.
+        frames_left_in_position: Frames remaining in the position currently
+            being processed.
+        positions_remaining_after: Number of positions still to process after
+            the current one.
+        position_frame_counts: Frame counts of positions already fully
+            completed in this run (for averaging).
+        current_position_num_frames: Frame count of the position currently
+            being processed (fallback average when nothing has completed yet).
+
+    Returns:
+        float | None: Estimated remaining seconds, or ``None`` if no rate can
+            be computed yet.
+    """
+    if elapsed <= 0 or frames_done <= 0:
+        return None
+    rate = frames_done / elapsed
+    avg_frames_per_position = (
+        sum(position_frame_counts) / len(position_frame_counts)
+        if position_frame_counts
+        else current_position_num_frames
+    )
+    remaining = (
+        frames_left_in_position + positions_remaining_after * avg_frames_per_position
+    )
+    return remaining / rate
+
+
 def _registration_method_classes() -> dict[str, type]:
     """Lazy import of the 5 :class:`~acia.registration.RegistrationMethod` subclasses.
 
@@ -1642,10 +1706,16 @@ function render({ model, el }) {
     "</div>" +
     "<div class='rd-verify-out' style='display:none;margin-bottom:10px;'>" +
       "<canvas class='rd-traj' width='640' height='140' style='border:1px solid #ddd;'></canvas>" +
-      "<div style='margin-top:8px;'>" +
-        "<label style='font-size:11px;color:#666;'><input type='checkbox' class='rd-toggle'> show corrected</label>" +
-        "<span class='rd-comp-label' style='font-size:11px;color:#666;margin-left:8px;'></span>" +
-        "<img class='rd-compare-img' style='max-width:320px;display:block;border:1px solid #ddd;margin-top:4px;'>" +
+      "<div class='rd-player' style='margin-top:8px;'>" +
+        "<div style='display:flex;gap:8px;'>" +
+          "<canvas class='rd-player-before' width='260' height='260' style='border:1px solid #ddd;max-width:48%;background:#111;'></canvas>" +
+          "<canvas class='rd-player-after' width='260' height='260' style='border:1px solid #ddd;max-width:48%;background:#111;'></canvas>" +
+        "</div>" +
+        "<div style='display:flex;gap:8px;align-items:center;margin-top:4px;'>" +
+          "<button type='button' class='rd-play-btn'>Play</button>" +
+          "<input type='range' class='rd-scrubber' min='0' max='0' value='0' step='1' style='flex:1;'>" +
+          "<span class='rd-player-label' style='font-size:11px;color:#666;white-space:nowrap;'></span>" +
+        "</div>" +
       "</div>" +
     "</div>" +
     "<div class='rd-status' style='font-size:11px;color:#a33;margin-bottom:6px;'></div>" +
@@ -1665,7 +1735,8 @@ function render({ model, el }) {
   const methodSel = $(".rd-method"), posInput = $(".rd-pos"), nsampInput = $(".rd-nsamp");
   const maskWrap = $(".rd-mask"), maskCanvas = $(".rd-mask-canvas");
   const verifyOut = $(".rd-verify-out"), trajCanvas = $(".rd-traj");
-  const toggle = $(".rd-toggle"), compareImg = $(".rd-compare-img"), compLabel = $(".rd-comp-label");
+  const playerBeforeCanvas = $(".rd-player-before"), playerAfterCanvas = $(".rd-player-after");
+  const playBtn = $(".rd-play-btn"), scrubber = $(".rd-scrubber"), playerLabel = $(".rd-player-label");
   const statusEl = $(".rd-status");
   const dirInput = $(".rd-dir"), progWrap = $(".rd-progress-wrap");
   const progBar = $(".rd-progress-bar"), progLabel = $(".rd-progress-label");
@@ -1879,9 +1950,13 @@ function render({ model, el }) {
     onMaskGeomChange,
   );
 
-  // ---- verify: drift trajectory (dx/dy/theta) + before/after toggle ----
+  // ---- verify: drift trajectory (dx/dy/theta) + a play/pause+scrubber
+  // side-by-side comparison player over every sampled frame ----
   $(".rd-verify").addEventListener("click", () => {
     showStatus("");
+    progWrap.style.display = "block";
+    progBar.style.width = "0%";
+    progLabel.textContent = "starting verify...";
     model.send({
       type: "verify",
       position: parseInt(posInput.value, 10) || 0,
@@ -1889,7 +1964,103 @@ function render({ model, el }) {
     });
   });
 
-  let lastVerify = null;
+  function fmtDuration(seconds) {
+    const s = Math.max(0, Math.round(seconds));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m + "m " + r + "s";
+  }
+
+  // ---- comparison player: preloads each sampled frame's uncorrected/
+  // corrected PNGs as Image objects from blob URLs (same blobUrl() helper
+  // used elsewhere), then a scrubber + optional setInterval-driven autoplay
+  // redraws the two side-by-side canvases per tick -- no new dependency, same
+  // PNG-over-comm-buffer delivery mechanism already in use.
+  let player = [];
+  let playTimer = null;
+
+  // loadImage() creates one object URL per PNG (via blobUrl()) that stays
+  // alive until explicitly revoked -- each frame keeps its uncorrImgUrl/
+  // corrImgUrl alongside the decoded Image so revokePlayerUrls() can release
+  // them once a player array is no longer displayed (superseded by a new
+  // verify_result, or the widget itself is torn down).
+  function loadImage(buf) {
+    return new Promise((resolve) => {
+      if (!buf) { resolve({ img: null, url: null }); return; }
+      const url = blobUrl(buf);
+      const img = new Image();
+      img.onload = () => resolve({ img, url });
+      img.onerror = () => resolve({ img: null, url });
+      img.src = url;
+    });
+  }
+
+  function revokePlayerUrls(frames) {
+    (frames || []).forEach((f) => {
+      if (f.uncorrImgUrl) URL.revokeObjectURL(f.uncorrImgUrl);
+      if (f.corrImgUrl) URL.revokeObjectURL(f.corrImgUrl);
+    });
+  }
+
+  async function buildPlayer(msg, buffers) {
+    const frameIndices = msg.frame_indices || [];
+    const hasCorrection = msg.has_correction || [];
+    const bufs = buffers || [];
+    let cursor = 1; // bufs[0] is the reference frame, not part of the player
+    const frames = [];
+    for (let i = 0; i < frameIndices.length; i++) {
+      const uncorr = await loadImage(bufs[cursor++]);
+      let corr = { img: null, url: null };
+      if (hasCorrection[i]) corr = await loadImage(bufs[cursor++]);
+      frames.push({
+        frameIndex: frameIndices[i],
+        uncorrImg: uncorr.img,
+        uncorrImgUrl: uncorr.url,
+        corrImg: corr.img,
+        corrImgUrl: corr.url,
+        hasCorrection: !!hasCorrection[i],
+      });
+    }
+    return frames;
+  }
+
+  function drawHalf(canvas, img) {
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (img) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  }
+
+  function drawPlayerFrame(idx) {
+    const f = player[idx];
+    if (!f) return;
+    drawHalf(playerBeforeCanvas, f.uncorrImg);
+    drawHalf(playerAfterCanvas, f.hasCorrection ? f.corrImg : f.uncorrImg);
+    playerLabel.textContent = "frame " + f.frameIndex + " (" + (idx + 1) + "/" + player.length + ")" +
+      (f.hasCorrection ? "" : " -- no correction available");
+  }
+
+  function stopPlayback() {
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    playBtn.textContent = "Play";
+  }
+  function startPlayback() {
+    if (player.length < 2) return;
+    playBtn.textContent = "Pause";
+    playTimer = setInterval(() => {
+      let idx = (parseInt(scrubber.value, 10) || 0) + 1;
+      if (idx >= player.length) idx = 0;
+      scrubber.value = String(idx);
+      drawPlayerFrame(idx);
+    }, 500);
+  }
+  playBtn.addEventListener("click", () => {
+    if (playTimer) stopPlayback(); else startPlayback();
+  });
+  scrubber.addEventListener("input", () => {
+    stopPlayback();
+    drawPlayerFrame(parseInt(scrubber.value, 10) || 0);
+  });
+
   function drawTrajectory(frameIndices, transforms) {
     const ctx = trajCanvas.getContext("2d");
     ctx.clearRect(0, 0, trajCanvas.width, trajCanvas.height);
@@ -1933,22 +2104,34 @@ function render({ model, el }) {
     if (msg.type === "verify_result") {
       verifyOut.style.display = "block";
       drawTrajectory(msg.frame_indices, msg.transforms);
-      const refUrl = buffers && buffers[0] ? blobUrl(buffers[0]) : null;
-      const uncorrUrl = buffers && buffers[1] ? blobUrl(buffers[1]) : null;
-      const corrUrl = msg.before_after_available && buffers && buffers[2] ? blobUrl(buffers[2]) : null;
-      lastVerify = { refUrl, uncorrUrl, corrUrl };
-      toggle.checked = false;
-      toggle.disabled = !corrUrl;
-      compLabel.textContent = "compare frame " + msg.compare_frame +
-        (corrUrl ? "" : " (no correction available for this frame)");
-      compareImg.src = uncorrUrl || "";
+      stopPlayback();
+      buildPlayer(msg, buffers).then((frames) => {
+        revokePlayerUrls(player);
+        player = frames;
+        scrubber.max = String(Math.max(0, frames.length - 1));
+        scrubber.value = "0";
+        drawPlayerFrame(0);
+      });
     } else if (msg.type === "progress") {
       progWrap.style.display = "block";
-      const frac = msg.num_frames ? msg.frame / msg.num_frames : 0;
-      const posFrac = msg.num_positions ? (msg.position + frac) / msg.num_positions : 0;
-      progBar.style.width = Math.min(100, Math.round(posFrac * 100)) + "%";
-      progLabel.textContent = "position " + msg.position + "/" + msg.num_positions +
-        " · frame " + msg.frame + "/" + msg.num_frames;
+      if (msg.phase === "verify") {
+        const frac = msg.num_frames ? (msg.frame + 1) / msg.num_frames : 0;
+        progBar.style.width = Math.min(100, Math.round(frac * 100)) + "%";
+        progLabel.textContent = "verify: frame " + (msg.frame + 1) + "/" + msg.num_frames;
+      } else {
+        const frac = msg.num_frames ? msg.frame / msg.num_frames : 0;
+        const posFrac = msg.num_positions ? (msg.position + frac) / msg.num_positions : 0;
+        progBar.style.width = Math.min(100, Math.round(posFrac * 100)) + "%";
+        let label = "position " + msg.position + "/" + msg.num_positions +
+          " · frame " + msg.frame + "/" + msg.num_frames;
+        if (msg.elapsed_seconds !== undefined && msg.elapsed_seconds !== null) {
+          label += " · elapsed " + fmtDuration(msg.elapsed_seconds);
+          if (msg.eta_seconds !== undefined && msg.eta_seconds !== null) {
+            label += " · ETA ~" + fmtDuration(msg.eta_seconds);
+          }
+        }
+        progLabel.textContent = label;
+      }
     } else if (msg.type === "batch_done") {
       progBar.style.width = "100%";
       const nFailed = msg.failed_positions ? msg.failed_positions.length : 0;
@@ -1960,11 +2143,6 @@ function render({ model, el }) {
     } else if (msg.type === "error") {
       showStatus("Error (" + msg.kind + "): " + msg.message, true);
     }
-  });
-
-  toggle.addEventListener("change", () => {
-    if (!lastVerify) return;
-    compareImg.src = (toggle.checked ? lastVerify.corrUrl : lastVerify.uncorrUrl) || "";
   });
 
   // ---- batch-apply ----
@@ -1987,6 +2165,8 @@ function render({ model, el }) {
   drawMask();
 
   return () => {
+    stopPlayback();
+    revokePlayerUrls(player);
     maskCanvas.removeEventListener("pointerdown", onMaskDown);
     maskCanvas.removeEventListener("pointermove", onMaskMove);
     maskCanvas.removeEventListener("pointerup", onMaskUp);
@@ -2985,13 +3165,28 @@ if _HAS_ANYWIDGET:
             return buffer.getvalue()
 
         def _run_verify(self, pos: int, method_name: str):
-            """Run verify for one position: drift trajectory + before/after.
+            """Run verify for one position: drift trajectory + full-range before/after.
+
+            Sends a ``"progress"`` message (``phase="verify"``) via
+            :meth:`send` after each sampled frame is compared (wired through
+            :func:`~acia.registration.run_comparison`'s ``on_progress``
+            callback), so the widget shows visible progress while verify
+            runs -- previously this method computed silently.
+
+            Every sampled ``frame_indices`` entry gets an uncorrected PNG
+            buffer, plus a corrected one when a transform estimate is
+            available for it (mirrors, per-frame, what the single compare
+            frame used to do) -- the ESM's comparison player cycles through
+            all of them instead of showing one static toggle image.
 
             Returns:
                 tuple[dict, list[bytes]]: The ``"verify_result"`` message
-                content and its PNG buffers (``[reference, uncorrected]`` or
-                ``[reference, uncorrected, corrected]`` when a correction is
-                available for the chosen compare frame).
+                content and its PNG buffers: ``[reference, uncorrected_0,
+                (corrected_0)?, uncorrected_1, (corrected_1)?, ...]`` -- one
+                uncorrected buffer per sampled frame, plus a corrected buffer
+                only where ``has_correction[i]`` is true, so the ESM can walk
+                the flat buffer array in lock-step with ``frame_indices``/
+                ``has_correction``.
             """
             from acia.registration import (
                 apply_correction,
@@ -3006,27 +3201,47 @@ if _HAS_ANYWIDGET:
             )
             reference = np.asarray(source.get_frame(0).raw)
 
+            # Cache each comparison frame as it's read during run_comparison
+            # so the buffer-encoding pass below doesn't re-read it from the
+            # (possibly slow) source a second time.
+            frame_cache: dict[int, np.ndarray] = {}
+
             def get_frame(t: int) -> np.ndarray:
-                return np.asarray(source.get_frame(t).raw)
+                frame = np.asarray(source.get_frame(t).raw)
+                frame_cache[t] = frame
+                return frame
+
+            total = len(frame_indices)
+
+            def on_progress(i: int, _total: int) -> None:
+                self.send(
+                    {
+                        "type": "progress",
+                        "phase": "verify",
+                        "frame": i,
+                        "num_frames": total,
+                    }
+                )
 
             results = run_comparison(
-                {method_name: method}, reference, get_frame, frame_indices
+                {method_name: method},
+                reference,
+                get_frame,
+                frame_indices,
+                on_progress=on_progress,
             )
             transforms = results[method_name]
 
-            compare_t, compare_transform = frame_indices[-1], None
+            buffers = [self._array_png_bytes(reference)]
+            has_correction: list[bool] = []
             for t, transform in zip(frame_indices, transforms, strict=True):
+                frame = frame_cache[t]
+                buffers.append(self._array_png_bytes(frame))
+                available = transform is not None
+                has_correction.append(available)
                 if transform is not None:
-                    compare_t, compare_transform = t, transform
-
-            compare_frame = get_frame(compare_t)
-            buffers = [
-                self._array_png_bytes(reference),
-                self._array_png_bytes(compare_frame),
-            ]
-            if compare_transform is not None:
-                corrected = apply_correction(compare_frame, compare_transform)
-                buffers.append(self._array_png_bytes(corrected))
+                    corrected = apply_correction(frame, transform)
+                    buffers.append(self._array_png_bytes(corrected))
 
             payload = {
                 "type": "verify_result",
@@ -3035,8 +3250,7 @@ if _HAS_ANYWIDGET:
                 "reference_frame": 0,
                 "frame_indices": frame_indices,
                 "transforms": [t.to_dict() if t else None for t in transforms],
-                "compare_frame": compare_t,
-                "before_after_available": compare_transform is not None,
+                "has_correction": has_correction,
             }
             return payload, buffers
 
@@ -3046,13 +3260,51 @@ if _HAS_ANYWIDGET:
             method_name: str,
             mask_rect: RotatedCropSpec | None,
             num_positions: int,
+            *,
+            existing_record: RegistrationRecord | None = None,
+            positions_remaining_after: int = 0,
+            progress_state: dict | None = None,
+            on_checkpoint: Callable[[RegistrationRecord], None] | None = None,
         ) -> RegistrationRecord:
-            """Estimate a per-frame transform for every frame of one position.
+            """Estimate a per-frame transform for every not-yet-computed frame.
+
+            Resumable: frames are always processed in order (``0, 1, 2, ...``)
+            and checkpointed periodically, so "how many frames are already in
+            ``existing_record``" is always the index of the first uncomputed
+            frame -- ``existing_record`` (when given) seeds ``transforms``/
+            ``failed_frames`` and estimation resumes right after it instead of
+            redoing the whole position.
 
             Reads (and releases) exactly one frame at a time -- never more than
             one position's frames in memory at once. A per-frame failure is
             caught and recorded in ``failed_frames``; it never aborts the rest
-            of the position. Sends a ``"progress"`` message after every frame.
+            of the position. Sends a ``"progress"`` message (with best-effort
+            ``elapsed_seconds``/``eta_seconds``, see :func:`_estimate_eta`)
+            after every frame, and invokes ``on_checkpoint`` with the
+            record-so-far every :data:`CHECKPOINT_INTERVAL` newly-estimated
+            frames so an interrupted run loses at most that many.
+
+            Args:
+                pos: Position index to register.
+                method_name: One of :data:`_REGISTRATION_METHOD_NAMES`.
+                mask_rect: Mask rect for ``MaskedTemplateCorrelation``; ignored
+                    otherwise.
+                num_positions: Total position count, forwarded into progress
+                    messages unchanged.
+                existing_record: A partial (or empty) prior result to resume
+                    from; ``None`` is equivalent to a from-scratch position.
+                    Assumed to already be for ``method_name`` -- callers
+                    (e.g. :meth:`batch_apply`) are responsible for not
+                    passing a record recorded under a different method.
+                positions_remaining_after: Positions still to process after
+                    this one in the current batch-apply run (for the ETA
+                    heuristic).
+                progress_state: Mutable dict shared across the whole
+                    batch-apply run (``batch_start``, ``frames_done``,
+                    ``position_frame_counts``) driving :func:`_estimate_eta`;
+                    a fresh one is created if ``None`` (single-position use).
+                on_checkpoint: Optional callback invoked with the
+                    record-so-far every ``CHECKPOINT_INTERVAL`` frames.
             """
             from acia.registration_persistence import RegistrationRecord
 
@@ -3060,14 +3312,57 @@ if _HAS_ANYWIDGET:
             source = self._file.position(pos)
             num_frames = source.size_t
             reference = np.asarray(source.get_frame(0).raw)
-            transforms: dict[int, FrameTransform] = {}
-            failed: dict[int, str] = {}
-            for t in range(num_frames):
+
+            transforms: dict[int, FrameTransform] = (
+                dict(existing_record.transforms) if existing_record else {}
+            )
+            failed: dict[int, str] = (
+                dict(existing_record.failed_frames) if existing_record else {}
+            )
+            start_frame = len(transforms) + len(failed)
+
+            state = (
+                progress_state
+                if progress_state is not None
+                else {"batch_start": time.monotonic(), "position_frame_counts": []}
+            )
+            state.setdefault("frames_done", 0)
+
+            since_checkpoint = 0
+            for t in range(start_frame, num_frames):
                 try:
                     frame = np.asarray(source.get_frame(t).raw)
                     transforms[t] = method.estimate(reference, frame)
                 except Exception as exc:  # noqa: BLE001 -- isolate per-frame failures
                     failed[t] = f"{type(exc).__name__}: {exc}"
+
+                state["frames_done"] += 1
+                since_checkpoint += 1
+
+                if (
+                    on_checkpoint is not None
+                    and since_checkpoint >= CHECKPOINT_INTERVAL
+                ):
+                    on_checkpoint(
+                        RegistrationRecord(
+                            position=pos,
+                            method=method_name,
+                            transforms=dict(transforms),
+                            reference_frame=0,
+                            failed_frames=dict(failed),
+                        )
+                    )
+                    since_checkpoint = 0
+
+                elapsed = time.monotonic() - state["batch_start"]
+                eta = _estimate_eta(
+                    elapsed=elapsed,
+                    frames_done=state["frames_done"],
+                    frames_left_in_position=num_frames - (t + 1),
+                    positions_remaining_after=positions_remaining_after,
+                    position_frame_counts=state["position_frame_counts"],
+                    current_position_num_frames=num_frames,
+                )
                 self.send(
                     {
                         "type": "progress",
@@ -3075,8 +3370,13 @@ if _HAS_ANYWIDGET:
                         "num_positions": num_positions,
                         "frame": t,
                         "num_frames": num_frames,
+                        "elapsed_seconds": elapsed,
+                        "eta_seconds": eta,
                     }
                 )
+
+            state["position_frame_counts"].append(num_frames)
+
             return RegistrationRecord(
                 position=pos,
                 method=method_name,
@@ -3091,9 +3391,25 @@ if _HAS_ANYWIDGET:
             For the currently-selected :attr:`method_name`, processes every
             position in ``positions`` (default: all), one at a time, estimating
             a :class:`~acia.registration.FrameTransform` per frame against that
-            position's own frame 0. Sends a ``"progress"`` message after every
-            frame and persists the manifest after every position, so an
-            interrupted run can be resumed.
+            position's own frame 0. Sends a ``"progress"`` message (with
+            best-effort ``elapsed_seconds``/``eta_seconds``) after every frame,
+            and persists the manifest both after every position *and*
+            periodically within a position (every :data:`CHECKPOINT_INTERVAL`
+            newly-estimated frames), so an interrupted run can be resumed. A
+            position already fully complete (every frame accounted for in
+            ``transforms``/``failed_frames``) is skipped; a partial one
+            resumes from its first uncomputed frame instead of being
+            re-skipped or fully redone. A prior record recorded under a
+            *different* ``method_name`` is never treated as resume/skip data
+            for the currently-selected method -- the position is processed
+            from scratch instead of silently merging frames across methods.
+            A whole-position failure (whether from ``_register_position``
+            itself or from the resume/skip bookkeeping above it, e.g. a
+            ``size_t`` lookup) never aborts the rest of the run, and never
+            discards progress already checkpointed for that position in this
+            or a prior run -- the failure is recorded as a note on top of
+            whatever record (checkpointed or pre-existing) is already known,
+            not as a fresh empty one.
 
             Args:
                 directory: Output directory for ``registration_transforms.json``;
@@ -3157,25 +3473,85 @@ if _HAS_ANYWIDGET:
             completed: list[int] = []
             skipped: list[int] = []
             failed_positions: list[int] = []
+            progress_state: dict = {
+                "batch_start": time.monotonic(),
+                "frames_done": 0,
+                "position_frame_counts": [],
+            }
             try:
-                for i in target_positions:
+                for idx, i in enumerate(target_positions):
                     existing_record = records.get(i)
-                    if existing_record is not None and existing_record.transforms:
-                        skipped.append(i)
-                        continue
+                    if (
+                        existing_record is not None
+                        and existing_record.method != method_name
+                    ):
+                        # Progress recorded under a different method is not valid
+                        # resume/skip data for the currently-selected method --
+                        # treat the position as if it had no prior record at all
+                        # rather than silently merging frames across methods.
+                        existing_record = None
+                    if existing_record is not None:
+                        # A failure looking up size_t must not abort the whole
+                        # batch-apply run -- fall through to "not complete" so
+                        # this position is attempted below, where the
+                        # per-position try/except (which re-derives num_frames
+                        # via _register_position) records it as a per-position
+                        # failure instead.
+                        try:
+                            num_frames_i = self._file.position(i).size_t
+                            already_done = len(existing_record.transforms) + len(
+                                existing_record.failed_frames
+                            )
+                            already_complete = (
+                                num_frames_i > 0 and already_done >= num_frames_i
+                            )
+                        except Exception:  # noqa: BLE001 -- see comment above
+                            already_complete = False
+                        if already_complete:
+                            skipped.append(i)
+                            continue
+
+                    positions_remaining_after = len(target_positions) - idx - 1
+
+                    def _checkpoint(record: RegistrationRecord, _pos: int = i) -> None:
+                        records[_pos] = record
+                        self._records = records
+                        save_registration(self.manifest, directory)
+
                     try:
                         record = self._register_position(
-                            i, method_name, mask_rect, num_positions
+                            i,
+                            method_name,
+                            mask_rect,
+                            num_positions,
+                            existing_record=existing_record,
+                            positions_remaining_after=positions_remaining_after,
+                            progress_state=progress_state,
+                            on_checkpoint=_checkpoint,
                         )
                     except Exception as exc:  # noqa: BLE001 -- isolate whole-position failures
                         from acia.registration_persistence import RegistrationRecord
 
-                        record = RegistrationRecord(
-                            position=i,
-                            method=method_name,
-                            transforms={},
-                            reference_frame=0,
-                            notes=f"position failed: {type(exc).__name__}: {exc}",
+                        note = f"position failed: {type(exc).__name__}: {exc}"
+                        # `_register_position`'s on_checkpoint callback (above) may
+                        # already have persisted a partial record into records[i]
+                        # (and to disk) before this exception fired; records.get(i)
+                        # also reflects the original existing_record when no
+                        # checkpoint fired yet this run. Preserve whatever progress
+                        # is already there instead of clobbering it with an empty
+                        # record -- only synthesize an empty one when there's truly
+                        # no prior record at all.
+                        prior = records.get(i)
+                        record = (
+                            dataclasses.replace(prior, notes=note)
+                            if prior is not None
+                            else RegistrationRecord(
+                                position=i,
+                                method=method_name,
+                                transforms={},
+                                reference_frame=0,
+                                notes=note,
+                            )
                         )
                         failed_positions.append(i)
                     records[i] = record

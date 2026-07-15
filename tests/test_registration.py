@@ -30,6 +30,7 @@ from acia.registration import (
     RegistrationError,
     _parabolic_refine,
     apply_correction,
+    run_comparison,
 )
 
 SIZE = 200
@@ -544,6 +545,101 @@ class TestApplyCorrection(unittest.TestCase):
         np.testing.assert_allclose(
             corrected.astype(np.float32), frame.astype(np.float32), atol=1.0
         )
+
+
+class TestRunComparisonProgress(unittest.TestCase):
+    """``run_comparison``'s optional ``on_progress`` callback -- shared by the
+    comparison notebooks (unaffected, defaults to ``None``) and
+    ``RegistrationDashboard._run_verify``, which wires a callback to report
+    per-frame progress to the widget."""
+
+    def test_on_progress_called_once_per_frame_in_order(self):
+        reference = _textured_frame(seed=0, size=SIZE)
+        frames = {
+            0: _warp(reference, dx=1.0, dy=0.0, theta=0.0),
+            1: _warp(reference, dx=2.0, dy=0.0, theta=0.0),
+            2: _warp(reference, dx=3.0, dy=0.0, theta=0.0),
+        }
+        calls = []
+        run_comparison(
+            {"GradientECC": GradientECC()},
+            reference,
+            lambda t: frames[t],
+            [0, 1, 2],
+            on_progress=lambda i, total: calls.append((i, total)),
+        )
+        self.assertEqual(calls, [(0, 3), (1, 3), (2, 3)])
+
+    def test_on_progress_fires_after_every_method_for_that_frame(self):
+        """The callback for frame i fires only once *all* methods have been
+        run against ``frame_indices[i]`` -- not interleaved per-method."""
+        reference = _textured_frame(seed=0, size=SIZE)
+        frame = _warp(reference, dx=1.0, dy=0.0, theta=0.0)
+
+        class _CountingMethod(GradientECC):
+            def __init__(self):
+                super().__init__()
+                self.count = 0
+
+            def estimate(self, reference, frame):
+                self.count += 1
+                return super().estimate(reference, frame)
+
+        m1, m2 = _CountingMethod(), _CountingMethod()
+        counts_at_progress = []
+
+        def on_progress(i, total):
+            counts_at_progress.append((m1.count, m2.count))
+
+        run_comparison(
+            {"a": m1, "b": m2},
+            reference,
+            lambda t: frame,
+            [0],
+            on_progress=on_progress,
+        )
+        self.assertEqual(counts_at_progress, [(1, 1)])
+
+    def test_on_progress_defaults_to_none_and_is_backward_compatible(self):
+        """Existing callers (both notebooks) pass no ``on_progress`` at all --
+        must behave exactly as before."""
+        reference = _textured_frame(seed=0, size=SIZE)
+        frame = _warp(reference, dx=1.0, dy=0.0, theta=0.0)
+        results = run_comparison(
+            {"GradientECC": GradientECC()}, reference, lambda t: frame, [0]
+        )
+        self.assertEqual(len(results["GradientECC"]), 1)
+
+    def test_on_progress_failure_does_not_abort_the_comparison(self):
+        """A broken ``on_progress`` callback (e.g. a dashboard's ``send`` on a
+        closed comm channel) must be isolated the same way a per-method
+        failure is -- it must not abort the rest of the comparison, and every
+        frame must still get a result."""
+        reference = _textured_frame(seed=0, size=SIZE)
+        frames = {
+            0: _warp(reference, dx=1.0, dy=0.0, theta=0.0),
+            1: _warp(reference, dx=2.0, dy=0.0, theta=0.0),
+            2: _warp(reference, dx=3.0, dy=0.0, theta=0.0),
+        }
+        calls = []
+
+        def on_progress(i, total):
+            calls.append((i, total))
+            raise RuntimeError("simulated broken callback")
+
+        results = run_comparison(
+            {"GradientECC": GradientECC()},
+            reference,
+            lambda t: frames[t],
+            [0, 1, 2],
+            on_progress=on_progress,
+        )
+        # the callback still fired for every frame (it just failed each time)
+        self.assertEqual(calls, [(0, 3), (1, 3), (2, 3)])
+        # every frame still produced a result entry -- not aborted partway
+        # through (a ragged/short list would mean the callback's exception
+        # propagated out of the loop).
+        self.assertEqual(len(results["GradientECC"]), 3)
 
 
 if __name__ == "__main__":
