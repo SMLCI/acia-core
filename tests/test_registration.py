@@ -15,6 +15,7 @@ across cases where the spec allows.
 from __future__ import annotations
 
 import unittest
+from itertools import pairwise
 
 import cv2
 import numpy as np
@@ -28,6 +29,7 @@ from acia.registration import (
     MaskedTemplateCorrelation,
     PhaseCorrelationHighpass,
     RegistrationError,
+    _build_gray_pyramid,
     _parabolic_refine,
     apply_correction,
     run_comparison,
@@ -439,6 +441,56 @@ class TestGradientECC(unittest.TestCase):
         frame[50, 50] = np.nan
         with self.assertRaises(RegistrationError):
             GradientECC().estimate(reference, frame)
+
+    def test_rigid_happy_path_multi_level_pyramid(self):
+        """Same happy-path recovery, but on a large enough frame (800x800)
+        that the default ``max_pyramid_levels``/``min_pyramid_size`` produce
+        multiple coarse-to-fine levels (800 -> 400 -> 200, stopped short of
+        a 4th by ``min_pyramid_size=128``) -- exercising the pyramid loop
+        end-to-end, not just its single-level degenerate case."""
+        reference = _structured_frame(seed=2, size=800)
+        dx_true, dy_true, theta_true = 3.0, 2.0, 2.5
+        frame = _warp(reference, dx_true, dy_true, theta_true)
+
+        transform = GradientECC().estimate(reference, frame)
+
+        self.assertAlmostEqual(transform.dx, dx_true, delta=0.5)
+        self.assertAlmostEqual(transform.dy, dy_true, delta=0.5)
+        self.assertAlmostEqual(transform.theta, theta_true, delta=0.5)
+
+
+class TestBuildGrayPyramid(unittest.TestCase):
+    """Coarse-to-fine level construction shared by :class:`GradientECC`."""
+
+    def test_finest_level_is_input_array(self):
+        gray = np.zeros((200, 200), dtype=np.float32)
+        levels = _build_gray_pyramid(gray, max_levels=4, min_size=128)
+        self.assertIs(levels[0], gray)
+
+    def test_stops_on_min_size_before_reaching_max_levels(self):
+        """The default ``min_pyramid_size=128`` used by ``GradientECC`` must
+        keep the existing 200x200 test fixtures single-level (a candidate
+        100x100 next level is rejected as < 128) -- i.e. no existing
+        ``GradientECC`` test's behavior changes because of the pyramid."""
+        gray = np.zeros((SIZE, SIZE), dtype=np.float32)
+        levels = _build_gray_pyramid(gray, max_levels=4, min_size=128)
+        self.assertEqual(len(levels), 1)
+
+    def test_stops_on_max_levels_before_reaching_min_size(self):
+        gray = np.zeros((4096, 4096), dtype=np.float32)
+        levels = _build_gray_pyramid(gray, max_levels=3, min_size=16)
+        self.assertEqual(len(levels), 3)
+        for level, expected_size in zip(levels, (4096, 2048, 1024), strict=True):
+            self.assertEqual(level.shape, (expected_size, expected_size))
+
+    def test_handles_non_square_odd_dimensions(self):
+        gray = np.zeros((201, 151), dtype=np.float32)
+        levels = _build_gray_pyramid(gray, max_levels=4, min_size=16)
+        self.assertEqual(levels[0].shape, (201, 151))
+        for prev, cur in pairwise(levels):
+            self.assertEqual(
+                cur.shape, ((prev.shape[0] + 1) // 2, (prev.shape[1] + 1) // 2)
+            )
 
 
 class TestShapeMismatchGuard(unittest.TestCase):

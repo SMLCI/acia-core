@@ -343,6 +343,33 @@ def _grayscale_gradient(image: np.ndarray) -> np.ndarray:
     return _gradient_magnitude(_to_grayscale_f32(image))
 
 
+def _build_gray_pyramid(
+    gray: np.ndarray, max_levels: int, min_size: int
+) -> list[np.ndarray]:
+    """Finest-to-coarsest Gaussian pyramid of a grayscale frame.
+
+    Repeatedly halves ``gray`` via ``cv2.pyrDown`` (Gaussian blur + downsample,
+    avoids the aliasing a naive strided subsample would introduce), stopping
+    once ``max_levels`` is reached or the next candidate level would fall
+    below ``min_size`` on its shorter side.
+
+    Args:
+        gray: ``(H, W)`` grayscale array, dtype ``float32``.
+        max_levels: Hard cap on the number of levels returned.
+        min_size: Minimum allowed length, in pixels, of a level's shorter side.
+
+    Returns:
+        list[np.ndarray]: Levels ordered finest-to-coarsest; ``levels[0] is gray``.
+    """
+    levels = [gray]
+    while len(levels) < max_levels:
+        candidate = cv2.pyrDown(levels[-1])
+        if min(candidate.shape[:2]) < min_size:
+            break
+        levels.append(candidate)
+    return levels
+
+
 def _decompose_similarity(
     matrix: np.ndarray, center: tuple[float, float]
 ) -> FrameTransform:
@@ -1060,15 +1087,24 @@ class GradientECC(RegistrationMethod):
     :class:`RegistrationError`) for large motions well beyond its capture
     range. To improve convergence reliability within the intended
     happy-path envelope (translation up to roughly a dozen pixels, small
-    rotation), the initial warp guess is seeded with a coarse
-    translation-only phase-correlation estimate (on the same gradient
-    images) rather than starting from the identity transform; if that
-    coarse pre-pass itself fails, estimation simply falls back to an
-    identity-seeded warp, matching the previous behavior.
+    rotation), estimation runs coarse-to-fine over a small image pyramid
+    (see :func:`_build_gray_pyramid`): the coarsest level is seeded with a
+    translation-only phase-correlation estimate (on that level's gradient
+    images) rather than starting from the identity transform, and each
+    finer level is seeded from the previous level's converged warp,
+    scaled to that level's resolution; if the coarse phase-correlation
+    pre-pass itself fails, the coarsest level simply falls back to an
+    identity-seeded warp. This also substantially reduces the number of
+    full-resolution ECC iterations needed on large frames, since the seed
+    arriving at full resolution is already close to the true optimum. One
+    accepted limitation shared with :class:`HoughLineRigidFit`: on device
+    geometry with several closely-spaced parallel channel walls,
+    downsampling can blur two walls into one feature at a coarse level,
+    risking a wrong-by-one-period coarse seed.
 
     Attributes:
-        n_iterations: Maximum ECC iterations.
-        epsilon: ECC convergence threshold.
+        n_iterations: Maximum ECC iterations, applied at every pyramid level.
+        epsilon: ECC convergence threshold, applied at every pyramid level.
         min_gradient_std: Minimum standard deviation of the gradient-magnitude
             image required to consider a frame to have detectable signal;
             below this, the frame is treated as blank/textureless.
@@ -1080,6 +1116,13 @@ class GradientECC(RegistrationMethod):
             tightly around ``0.98``-``0.99``, while silently-wrong fits
             (converged to the wrong local optimum) top out around ``0.87``
             -- ``0.9`` cleanly separates the two with margin on both sides.
+        max_pyramid_levels: Hard cap on the number of coarse-to-fine levels
+            (see :func:`_build_gray_pyramid`); the finest level is always
+            the full-resolution frame.
+        min_pyramid_size: Minimum shorter-side length, in pixels, a level
+            must have to be included; smaller frames simply get fewer
+            levels (possibly just one, i.e. today's single-resolution
+            behavior).
     """
 
     def __init__(
@@ -1088,11 +1131,15 @@ class GradientECC(RegistrationMethod):
         epsilon: float = 1e-6,
         min_gradient_std: float = 1e-3,
         min_confidence: float = 0.9,
+        max_pyramid_levels: int = 4,
+        min_pyramid_size: int = 128,
     ):
         self.n_iterations = n_iterations
         self.epsilon = epsilon
         self.min_gradient_std = min_gradient_std
         self.min_confidence = min_confidence
+        self.max_pyramid_levels = max_pyramid_levels
+        self.min_pyramid_size = min_pyramid_size
 
     def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
         """See :meth:`RegistrationMethod.estimate`."""
@@ -1101,8 +1148,10 @@ class GradientECC(RegistrationMethod):
                 "GradientECC: reference and frame must have the same (H, W) "
                 f"shape, got {reference.shape[:2]} and {frame.shape[:2]}."
             )
-        ref_grad = _grayscale_gradient(reference)
-        frm_grad = _grayscale_gradient(frame)
+        ref_gray = _to_grayscale_f32(reference)
+        frm_gray = _to_grayscale_f32(frame)
+        ref_grad = _gradient_magnitude(ref_gray)
+        frm_grad = _gradient_magnitude(frm_gray)
 
         if (
             not np.isfinite(ref_grad).all()
@@ -1115,52 +1164,91 @@ class GradientECC(RegistrationMethod):
                 "frame (blank/textureless or non-finite input)."
             )
 
-        ref_norm = cv2.normalize(  # type: ignore[call-overload]
-            ref_grad, None, 0, 1, cv2.NORM_MINMAX
+        ref_pyr = _build_gray_pyramid(
+            ref_gray, self.max_pyramid_levels, self.min_pyramid_size
         )
-        frm_norm = cv2.normalize(  # type: ignore[call-overload]
-            frm_grad, None, 0, 1, cv2.NORM_MINMAX
+        frm_pyr = _build_gray_pyramid(
+            frm_gray, self.max_pyramid_levels, self.min_pyramid_size
         )
-
-        # Coarse translation-only pre-pass: seed the ECC warp guess with a
-        # phase-correlation estimate (on the same gradient images) instead
-        # of the identity transform. A better starting point measurably
-        # improves ECC's convergence rate within the happy-path motion
-        # envelope; a failure here is non-fatal (falls back to identity).
-        dx0, dy0 = 0.0, 0.0
-        try:
-            shift, _error, _phasediff = phase_cross_correlation(
-                ref_grad, frm_grad, upsample_factor=1
-            )
-            dy_coarse, dx_coarse = shift
-            dx0, dy0 = float(-dx_coarse), float(-dy_coarse)
-        except Exception:  # pre-pass is best-effort only; any failure here
-            # simply falls back to an identity-seeded warp below.
-            dx0, dy0 = 0.0, 0.0
-
-        warp_matrix: np.ndarray = np.eye(2, 3, dtype=np.float32)
-        warp_matrix[0, 2] = dx0
-        warp_matrix[1, 2] = dy0
         criteria = (
             cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
             self.n_iterations,
             self.epsilon,
         )
-        try:
-            cc, warp_matrix = cv2.findTransformECC(
-                ref_norm, frm_norm, warp_matrix, cv2.MOTION_EUCLIDEAN, criteria
-            )
-        except cv2.error as exc:
-            raise RegistrationError(
-                f"GradientECC: cv2.findTransformECC failed to converge: {exc}"
-            ) from exc
 
-        if not np.isfinite(cc) or cc < self.min_confidence:
+        warp_matrix: np.ndarray = np.eye(2, 3, dtype=np.float32)
+        cc: float = 0.0
+        for level_idx in range(len(ref_pyr) - 1, -1, -1):
+            level_ref_grad = _gradient_magnitude(ref_pyr[level_idx])
+            level_frm_grad = _gradient_magnitude(frm_pyr[level_idx])
+            level_ref_norm = cv2.normalize(  # type: ignore[call-overload]
+                level_ref_grad, None, 0, 1, cv2.NORM_MINMAX
+            )
+            level_frm_norm = cv2.normalize(  # type: ignore[call-overload]
+                level_frm_grad, None, 0, 1, cv2.NORM_MINMAX
+            )
+
+            if level_idx == len(ref_pyr) - 1:
+                # Coarsest level: seed the ECC warp guess with a coarse
+                # translation-only phase-correlation estimate (on this
+                # level's gradient images) instead of the identity
+                # transform. A failure here is non-fatal (falls back to
+                # an identity-seeded warp).
+                dx0, dy0 = 0.0, 0.0
+                try:
+                    shift, _error, _phasediff = phase_cross_correlation(
+                        level_ref_grad, level_frm_grad, upsample_factor=1
+                    )
+                    dy_coarse, dx_coarse = shift
+                    dx0, dy0 = float(-dx_coarse), float(-dy_coarse)
+                except Exception:  # pre-pass is best-effort only; any
+                    # failure here simply falls back to an identity-seeded
+                    # warp below.
+                    dx0, dy0 = 0.0, 0.0
+                warp_matrix = np.eye(2, 3, dtype=np.float32)
+                warp_matrix[0, 2] = dx0
+                warp_matrix[1, 2] = dy0
+            else:
+                # Finer level: seed from the previous (coarser) level's
+                # converged warp. Rotation is scale-invariant and carries
+                # over unchanged; translation is scaled by the exact
+                # per-axis ratio between the two levels' shapes (not a
+                # hardcoded x2 -- cv2.pyrDown halves via (w+1)//2, so real
+                # dimensions aren't guaranteed evenly divisible at every
+                # level).
+                prev_h, prev_w = ref_pyr[level_idx + 1].shape[:2]
+                cur_h, cur_w = ref_pyr[level_idx].shape[:2]
+                warp_matrix[0, 2] *= cur_w / prev_w
+                warp_matrix[1, 2] *= cur_h / prev_h
+
+            try:
+                cc, warp_matrix = cv2.findTransformECC(
+                    level_ref_norm,
+                    level_frm_norm,
+                    warp_matrix,
+                    cv2.MOTION_EUCLIDEAN,
+                    criteria,
+                )
+            except cv2.error as exc:
+                raise RegistrationError(
+                    "GradientECC: cv2.findTransformECC failed to converge "
+                    f"at pyramid level {level_idx} (shape "
+                    f"{level_ref_norm.shape}): {exc}"
+                ) from exc
+
+            if not np.isfinite(cc) or not np.isfinite(warp_matrix).all():
+                raise RegistrationError(
+                    "GradientECC: cv2.findTransformECC produced a "
+                    f"non-finite result at pyramid level {level_idx} "
+                    f"(shape {level_ref_norm.shape})."
+                )
+
+        if cc < self.min_confidence:
             raise RegistrationError(
                 f"GradientECC: final correlation coefficient {cc:.3f} is "
                 f"below min_confidence={self.min_confidence}; rejecting a "
                 "low-confidence fit rather than returning it."
             )
 
-        h, w = ref_norm.shape
+        h, w = ref_pyr[0].shape
         return _decompose_similarity(warp_matrix, (w / 2.0, h / 2.0))
