@@ -1049,6 +1049,7 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
   font-family:var(--font-mono);font-size:12px;}
 .acia-sd .sd-card h3{margin:0 0 7px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
   color:var(--text-faint);}
+.acia-sd .sd-crop{width:100%;height:auto;display:block;border-radius:6px;background:var(--panel-3);}
 .acia-sd .sd-frbar{display:flex;align-items:center;gap:8px;padding:7px 14px;flex:none;
   border-top:1px solid var(--border);background:var(--panel-2);
   font-family:var(--font-mono);font-size:11px;color:var(--text-dim);}
@@ -1124,7 +1125,9 @@ function render({ model, el }) {
         "</span></div>" +
         "<div class='sd-ebody'><div class='sd-cwrap'><div class='sd-cstatus'></div></div>" +
         "<div class='sd-readout'><div class='sd-card'><h3>Active ROI → RotatedCropSpec</h3>" +
-        "<div class='sd-spec'>no ROI selected</div></div></div></div>" +
+        "<div class='sd-spec'>no ROI selected</div></div>" +
+        "<div class='sd-card sd-crop-card' hidden><h3>Crop Preview</h3>" +
+        "<canvas class='sd-crop'></canvas></div></div></div>" +
         "<div class='sd-frbar'>frame <input type='range' class='sd-frame' min='0' max='" + (NT - 1) + "' value='0'>" +
         " <span class='sd-frlbl'>0 / " + NT + "</span> (view only)</div>" +
         "<div class='sd-tools'><button class='sd-draw'>✎ Draw ROI</button>" +
@@ -1175,6 +1178,11 @@ function render({ model, el }) {
   // selection.json) so newly drawn/fitted ROIs never collide with those ids
   let frame = 0, uid = selections.reduce((m, x) => Math.max(m, +x.id || 0), 0) + 1, picking = false, points = [];
   const frameImg = new Image();
+  // Which position/frame `frameImg` currently holds -- lets the crop preview
+  // tell "the loaded pixels match the active ROI's position" apart from
+  // "still showing the previous position while the new one is in flight",
+  // instead of drawing a confidently-wrong crop from stale pixels.
+  let frameImgPos = -1;
   const roisAt = (p) => selections.filter((x) => x.position === p);
 
   // ---- image requests over the wire ----
@@ -1187,7 +1195,7 @@ function render({ model, el }) {
       thumbInFlight--; pumpThumbQueue();
     } else if (msg.type === "frame") {
       clearTimeout(frameTimer);
-      if (buffers && buffers[0]) frameImg.src = blobUrl(buffers[0]);
+      if (buffers && buffers[0]) { frameImgPos = msg.pos; frameImg.src = blobUrl(buffers[0]); }
     } else if (msg.type === "error") {
       if (msg.kind === "thumb") {
         delete pending["t" + msg.pos];
@@ -1197,6 +1205,7 @@ function render({ model, el }) {
       if (msg.kind === "frame" && msg.pos === currentPos) {
         clearTimeout(frameTimer);
         showStatus("Error loading pos " + String(msg.pos).padStart(3, "0") + ": " + (msg.message || "failed to load"), true);
+        frameImgPos = -1; renderSpec();
         return;
       }
       if (msg.kind === "fit" && picking) {
@@ -1219,7 +1228,7 @@ function render({ model, el }) {
     return URL.createObjectURL(new Blob([arr], { type: "image/png" }));
   }
   frameImg.onload = () => { wrap.style.backgroundImage = "url(" + frameImg.src + ")";
-    wrap.style.backgroundSize = "cover"; hideStatus(); };
+    wrap.style.backgroundSize = "cover"; hideStatus(); renderSpec(); };
   frameImg.onerror = () => { clearTimeout(frameTimer); showStatus("Failed to decode frame image", true); };
 
   // ---- gallery (accordion + lazy thumb) ----
@@ -1300,12 +1309,41 @@ function render({ model, el }) {
   }
   function renderSpec() {
     const box = $(".sd-spec");
-    if (picking) { box.textContent = pickHint(); return; }
+    if (picking) { box.textContent = pickHint(); renderCropPreview(null); return; }
     const sel = selections.find((x) => x.id === activeId);
-    if (!sel || sel.position !== currentPos) { box.textContent = "no ROI selected"; return; }
+    if (!sel || sel.position !== currentPos) { box.textContent = "no ROI selected"; renderCropPreview(null); return; }
     const um = PX ? " (" + (sel.w * PX).toFixed(1) + "×" + (sel.h * PX).toFixed(1) + " µm)" : "";
     box.innerHTML = "center " + Math.round(sel.x) + ", " + Math.round(sel.y) + " px<br>" +
       "size " + Math.round(sel.w) + "×" + Math.round(sel.h) + " px" + um + "<br>angle " + sel.angle.toFixed(1) + "°";
+    renderCropPreview(sel);
+  }
+  // Renders exactly what crop_rotated(RotatedCropSpec(...)) would produce for
+  // the active ROI: sample the already-loaded frame image into a small
+  // un-rotated canvas, de-rotating by the SAME angle (and sense) the ROI box
+  // itself is drawn with (CSS `rotate(sel.angle + "deg")` in renderEditor),
+  // so the preview always matches what's on screen without a kernel round-trip.
+  const MAX_PREVIEW_PX = 220;
+  function renderCropPreview(sel) {
+    const card = $(".sd-crop-card");
+    if (!sel || frameImgPos !== currentPos || !frameImg.complete || !frameImg.naturalWidth) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    const canvas = $(".sd-crop");
+    const w = Math.max(1, Math.round(sel.w)), h = Math.max(1, Math.round(sel.h));
+    const scalePrev = Math.min(1, MAX_PREVIEW_PX / Math.max(w, h));
+    const cw = Math.max(1, Math.round(w * scalePrev)), ch = Math.max(1, Math.round(h * scalePrev));
+    if (canvas.width !== cw) canvas.width = cw;
+    if (canvas.height !== ch) canvas.height = ch;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.save();
+    ctx.translate(cw / 2, ch / 2);
+    ctx.rotate(-(sel.angle * Math.PI) / 180);
+    ctx.scale(scalePrev, scalePrev);
+    ctx.drawImage(frameImg, -sel.x, -sel.y);
+    ctx.restore();
   }
   function renderLabel() {
     const sel = selections.find((x) => x.id === activeId);
