@@ -1112,7 +1112,9 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
 .acia-sd .sd-card{background:var(--panel-2);border:1px solid var(--border);border-radius:9px;padding:10px;
   font-family:var(--font-mono);font-size:12px;}
 .acia-sd .sd-card h3{margin:0 0 7px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--text-faint);}
+  color:var(--text-faint);display:flex;align-items:center;gap:6px;}
+.acia-sd .sd-hint{font-size:12px;letter-spacing:normal;text-transform:none;cursor:help;
+  color:var(--text-dim);}
 .acia-sd .sd-crop{width:100%;height:auto;display:block;border-radius:6px;background:var(--panel-3);}
 .acia-sd .sd-frbar{display:flex;align-items:center;gap:8px;padding:7px 14px;flex:none;
   border-top:1px solid var(--border);background:var(--panel-2);
@@ -1188,7 +1190,8 @@ function render({ model, el }) {
         "<button class='sd-full' title='Toggle fullscreen (Ctrl/Cmd+scroll over the image also zooms)'>⛶ Fullscreen</button>" +
         "</span></div>" +
         "<div class='sd-ebody'><div class='sd-cwrap'><div class='sd-cstatus'></div></div>" +
-        "<div class='sd-readout'><div class='sd-card'><h3>Active ROI → RotatedCropSpec</h3>" +
+        "<div class='sd-readout'><div class='sd-card'><h3>Active ROI → RotatedCropSpec" +
+        "<span class='sd-hint' title='Delete/Backspace removes the active ROI; Ctrl/Cmd+C duplicates it (multi mode) -- hover the widget for shortcuts to apply'>⌨</span></h3>" +
         "<div class='sd-spec'>no ROI selected</div></div>" +
         "<div class='sd-card sd-crop-card' hidden><h3>Crop Preview</h3>" +
         "<canvas class='sd-crop'></canvas></div></div></div>" +
@@ -1196,7 +1199,7 @@ function render({ model, el }) {
         " <span class='sd-frlbl'>0 / " + NT + "</span> (view only)</div>" +
         "<div class='sd-tools'><button class='sd-draw'>✎ Draw ROI</button>" +
         "<button class='sd-point primary' title='Click the 4 corners of the rectangle'>✛ Point-fit ROI</button>" +
-        "<button class='sd-del'>🗑 Delete</button>" +
+        "<button class='sd-del' title='Delete the active ROI (Delete/Backspace)'>🗑 Delete</button>" +
         "<span style='margin-left:auto;display:flex;gap:6px;align-items:center'>" +
         "<span class='sd-sw' style='width:12px;height:12px;border-radius:3px'></span>" +
         "<input class='sd-lbl' placeholder='label' style='width:120px'></span></div></div>" +
@@ -1483,6 +1486,26 @@ function render({ model, el }) {
     selections.push(sel); activeId = sel.id;
     renderEditor(); renderList(); pushSelections();
   }
+  function duplicateActive() {
+    const src = selections.find((x) => x.id === activeId);
+    if (!src || src.position !== currentPos) return;
+    const h = roisAt(currentPos), ci = h.length ? Math.max.apply(null, h.map((x) => x.ci)) + 1 : 0;
+    // Offset so the copy doesn't sit exactly on top of the source (which would
+    // otherwise look like nothing happened) but stays inside the frame. Flip
+    // the offset's sign per-axis when the source is already flush against
+    // that edge, so a corner-positioned source doesn't clamp both axes back
+    // to the same point as the source.
+    const OFFSET = 24;
+    const offX = (src.x + OFFSET <= dims[0] - 5) ? OFFSET : -OFFSET;
+    const offY = (src.y + OFFSET <= dims[1] - 5) ? OFFSET : -OFFSET;
+    const sel = { id: uid++, position: currentPos,
+      x: Math.max(5, Math.min(dims[0] - 5, src.x + offX)),
+      y: Math.max(5, Math.min(dims[1] - 5, src.y + offY)),
+      w: src.w, h: src.h, angle: src.angle,
+      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci };
+    selections.push(sel); activeId = sel.id;
+    renderEditor(); renderList(); pushSelections(); toast("Duplicated ROI -- drag it into place");
+  }
   function removeSel(id) {
     selections = selections.filter((x) => x.id !== id);
     if (activeId === id) { const h = roisAt(currentPos); activeId = h.length ? h[0].id : null; }
@@ -1626,6 +1649,33 @@ function render({ model, el }) {
   $(".sd-save").onclick = () => model.send({ type: "save" });
   $(".sd-autochk").addEventListener("change", (e) => { autosave = e.target.checked; });
 
+  // ---- keyboard shortcuts (Delete/Backspace, Ctrl/Cmd+C) ----
+  // Scoped to "mouse is over this widget instance" (not tab/window focus) so
+  // multiple dashboards in one notebook, or typing elsewhere on the page,
+  // don't cross-trigger each other -- same reasoning as the wheel-zoom above.
+  let hovering = false;
+  root.addEventListener("pointerenter", () => { hovering = true; });
+  root.addEventListener("pointerleave", () => { hovering = false; });
+  function onKeyDown(ev) {
+    if (!hovering || picking) return;
+    const t = ev.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    if (!activeId) return;
+    if (ev.key === "Delete" || ev.key === "Backspace") {
+      ev.preventDefault(); removeSel(activeId);
+    } else if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "c") {
+      // Only steal the shortcut when we're actually going to act: leave native
+      // copy alone in single mode (duplicate is meaningless there -- at most
+      // one ROI per position) and when the user has text selected (they're
+      // copying that, not asking to duplicate the ROI).
+      if (mode !== "multi") return;
+      const textSel = window.getSelection();
+      if (textSel && textSel.toString()) return;
+      ev.preventDefault(); duplicateActive();
+    }
+  }
+  document.addEventListener("keydown", onKeyDown);
+
   // ---- splitters ----
   root.querySelectorAll(".sd-rz").forEach((rz) => {
     rz.addEventListener("pointerdown", (e) => {
@@ -1646,7 +1696,8 @@ function render({ model, el }) {
     clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 2200); }
 
   buildGallery(); selectPos(0); renderList();
-  return () => { io.disconnect(); document.removeEventListener("fullscreenchange", onFsChange); };
+  return () => { io.disconnect(); document.removeEventListener("fullscreenchange", onFsChange);
+    document.removeEventListener("keydown", onKeyDown); };
 }
 export default { render };
 """
