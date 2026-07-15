@@ -11,6 +11,9 @@ section to a dated version entry automatically.
 ## [Unreleased]
 
 ### Added
+- `FlowposeRTSegmenter` (`acia.segm.processor.flowpose_rt`): omnipose-compatible
+  segmentation backed by the lightweight `flowpose-rt` package (no
+  cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.
 - fsspec-based remote image sources: read TIFFs from SMB/SAMBA shares (and any
   fsspec backend) via `SambaSequenceSource` / `LocalSequenceSource`, plus
   `list_sequence_sources` for folder discovery and a per-user credentials store

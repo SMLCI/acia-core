@@ -100,6 +100,10 @@ omnipose = [
     "natsort",
     "scipy==1.11.4",
 ]
+# flowpose-rt: lightweight omnipose-compatible backend (no cellpose/omnipose/numba
+# at runtime). Not on PyPI yet -- install the flowpose-rt package from source
+# (e.g. `pip install ../flowpose-rt`) until it's published.
+flowpose-rt = ["flowpose-rt", "torch"]
 
 [project.scripts]
 acia = "acia.cli:main"
