@@ -458,6 +458,69 @@ class TestGradientECC(unittest.TestCase):
         self.assertAlmostEqual(transform.dy, dy_true, delta=0.5)
         self.assertAlmostEqual(transform.theta, theta_true, delta=0.5)
 
+    def test_translation_only_recovers_translation_forces_zero_theta(self):
+        """``translation_only=True`` fits ``cv2.MOTION_TRANSLATION`` -- no
+        rotation parameter exists to fit, so ``theta`` must come back exactly
+        ``0.0`` (not just close), matching the module's convention for
+        translation-only methods (``PhaseCorrelationHighpass`` etc.)."""
+        reference = _structured_frame(seed=2)
+        dx_true, dy_true = 3.0, 2.0
+        frame = _warp(reference, dx_true, dy_true, 0.0)
+
+        transform = GradientECC(translation_only=True).estimate(reference, frame)
+
+        self.assertAlmostEqual(transform.dx, dx_true, delta=0.5)
+        self.assertAlmostEqual(transform.dy, dy_true, delta=0.5)
+        self.assertEqual(transform.theta, 0.0)
+
+    def test_early_stop_delta_px_stops_before_full_resolution(self):
+        """A generous ``early_stop_delta_px`` should stop the 800x800
+        fixture's 3-level pyramid (800 -> 400 -> 200) after the coarsest
+        level -- fewer ``cv2.findTransformECC`` calls than the full pyramid,
+        while the returned transform still meets the same tolerance."""
+        reference = _structured_frame(seed=2, size=800)
+        dx_true, dy_true, theta_true = 3.0, 2.0, 2.5
+        frame = _warp(reference, dx_true, dy_true, theta_true)
+
+        call_count = 0
+        original = cv2.findTransformECC
+
+        def _counting_ecc(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original(*args, **kwargs)
+
+        cv2.findTransformECC = _counting_ecc
+        try:
+            full_call_count = call_count = 0
+            GradientECC().estimate(reference, frame)
+            full_call_count = call_count
+
+            call_count = 0
+            transform = GradientECC(early_stop_delta_px=5.0).estimate(reference, frame)
+            early_stop_call_count = call_count
+        finally:
+            cv2.findTransformECC = original
+
+        self.assertLess(early_stop_call_count, full_call_count)
+        self.assertAlmostEqual(transform.dx, dx_true, delta=0.5)
+        self.assertAlmostEqual(transform.dy, dy_true, delta=0.5)
+        self.assertAlmostEqual(transform.theta, theta_true, delta=0.5)
+
+    def test_early_stop_delta_px_none_matches_prior_behavior(self):
+        """``early_stop_delta_px=None`` (the default) must run every pyramid
+        level, identically to a `GradientECC()` with no early-stop kwarg --
+        i.e. this feature is opt-in, not a behavior change by default."""
+        reference = _structured_frame(seed=2, size=800)
+        dx_true, dy_true, theta_true = 3.0, 2.0, 2.5
+        frame = _warp(reference, dx_true, dy_true, theta_true)
+
+        transform = GradientECC(early_stop_delta_px=None).estimate(reference, frame)
+
+        self.assertAlmostEqual(transform.dx, dx_true, delta=0.5)
+        self.assertAlmostEqual(transform.dy, dy_true, delta=0.5)
+        self.assertAlmostEqual(transform.theta, theta_true, delta=0.5)
+
 
 class TestBuildGrayPyramid(unittest.TestCase):
     """Coarse-to-fine level construction shared by :class:`GradientECC`."""

@@ -1102,6 +1102,12 @@ class GradientECC(RegistrationMethod):
     downsampling can blur two walls into one feature at a coarse level,
     risking a wrong-by-one-period coarse seed.
 
+    Optionally, ``early_stop_delta_px`` lets estimation stop before reaching
+    full resolution once the coarse-to-fine estimate has stabilized (see
+    :func:`_build_gray_pyramid`) -- disabled by default (``None``), since
+    stopping early trades some estimation precision for speed and should be
+    enabled deliberately, not silently.
+
     Attributes:
         n_iterations: Maximum ECC iterations, applied at every pyramid level.
         epsilon: ECC convergence threshold, applied at every pyramid level.
@@ -1123,6 +1129,20 @@ class GradientECC(RegistrationMethod):
             must have to be included; smaller frames simply get fewer
             levels (possibly just one, i.e. today's single-resolution
             behavior).
+        early_stop_delta_px: If set, estimation stops as soon as a level's
+            full-resolution-equivalent ``(dx, dy)`` changes by less than
+            this many pixels *and* ``theta`` changes by less than this many
+            degrees, compared to the previous (coarser) level -- the same
+            value doing double duty as a pixel threshold and a degree
+            threshold, mirroring this class's existing ``0.5`` px / ``0.5``
+            deg pairing. ``None`` (default) always runs to full resolution,
+            matching prior behavior exactly.
+        translation_only: If ``True``, fits ``cv2.MOTION_TRANSLATION``
+            instead of ``cv2.MOTION_EUCLIDEAN`` -- no rotation is estimated
+            (the returned ``theta`` is always exactly ``0.0``), which fits
+            fewer parameters and converges more robustly when the true
+            motion is known to be translation-only. ``False`` (default)
+            matches prior behavior exactly.
     """
 
     def __init__(
@@ -1133,6 +1153,8 @@ class GradientECC(RegistrationMethod):
         min_confidence: float = 0.9,
         max_pyramid_levels: int = 4,
         min_pyramid_size: int = 128,
+        early_stop_delta_px: float | None = None,
+        translation_only: bool = False,
     ):
         self.n_iterations = n_iterations
         self.epsilon = epsilon
@@ -1140,6 +1162,8 @@ class GradientECC(RegistrationMethod):
         self.min_confidence = min_confidence
         self.max_pyramid_levels = max_pyramid_levels
         self.min_pyramid_size = min_pyramid_size
+        self.early_stop_delta_px = early_stop_delta_px
+        self.translation_only = translation_only
 
     def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
         """See :meth:`RegistrationMethod.estimate`."""
@@ -1175,9 +1199,15 @@ class GradientECC(RegistrationMethod):
             self.n_iterations,
             self.epsilon,
         )
+        full_h, full_w = ref_pyr[0].shape
+        motion_type = (
+            cv2.MOTION_TRANSLATION if self.translation_only else cv2.MOTION_EUCLIDEAN
+        )
 
         warp_matrix: np.ndarray = np.eye(2, 3, dtype=np.float32)
         cc: float = 0.0
+        cur_h, cur_w = ref_pyr[-1].shape
+        prev: tuple[float, float, float] | None = None
         for level_idx in range(len(ref_pyr) - 1, -1, -1):
             level_ref_grad = _gradient_magnitude(ref_pyr[level_idx])
             level_frm_grad = _gradient_magnitude(frm_pyr[level_idx])
@@ -1226,7 +1256,7 @@ class GradientECC(RegistrationMethod):
                     level_ref_norm,
                     level_frm_norm,
                     warp_matrix,
-                    cv2.MOTION_EUCLIDEAN,
+                    motion_type,
                     criteria,
                 )
             except cv2.error as exc:
@@ -1243,6 +1273,28 @@ class GradientECC(RegistrationMethod):
                     f"(shape {level_ref_norm.shape})."
                 )
 
+            cur_h, cur_w = ref_pyr[level_idx].shape[:2]
+            if self.early_stop_delta_px is not None:
+                # Full-resolution-equivalent (dx, dy): this level's warp
+                # translation is in *this level's* pixel units, so it must
+                # be scaled before comparing across levels (or returning it
+                # below) -- levels aren't the same size.
+                level_transform = _decompose_similarity(
+                    warp_matrix, (cur_w / 2.0, cur_h / 2.0)
+                )
+                dx = level_transform.dx * (full_w / cur_w)
+                dy = level_transform.dy * (full_h / cur_h)
+                theta = level_transform.theta
+                if prev is not None:
+                    prev_dx, prev_dy, prev_theta = prev
+                    if (
+                        abs(dx - prev_dx) < self.early_stop_delta_px
+                        and abs(dy - prev_dy) < self.early_stop_delta_px
+                        and abs(theta - prev_theta) < self.early_stop_delta_px
+                    ):
+                        break
+                prev = (dx, dy, theta)
+
         if cc < self.min_confidence:
             raise RegistrationError(
                 f"GradientECC: final correlation coefficient {cc:.3f} is "
@@ -1250,5 +1302,17 @@ class GradientECC(RegistrationMethod):
                 "low-confidence fit rather than returning it."
             )
 
-        h, w = ref_pyr[0].shape
-        return _decompose_similarity(warp_matrix, (w / 2.0, h / 2.0))
+        # warp_matrix's translation is in whichever level was last processed
+        # (full resolution unless early_stop_delta_px stopped it sooner) --
+        # scale up to full-resolution-equivalent pixels for the returned
+        # FrameTransform, the same scaling the loop above already applies.
+        transform = _decompose_similarity(warp_matrix, (cur_w / 2.0, cur_h / 2.0))
+        return FrameTransform(
+            dx=transform.dx * (full_w / cur_w),
+            dy=transform.dy * (full_h / cur_h),
+            # MOTION_TRANSLATION never touches warp_matrix's rotation block,
+            # so decomposition should already yield ~0.0 -- force it exactly
+            # rather than trust floating-point noise, matching how the
+            # module's other translation-only methods report theta.
+            theta=0.0 if self.translation_only else transform.theta,
+        )
