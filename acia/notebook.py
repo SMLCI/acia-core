@@ -3261,6 +3261,7 @@ if _HAS_ANYWIDGET:
             mask_rect: RotatedCropSpec | None,
             num_positions: int,
             *,
+            source=None,
             existing_record: RegistrationRecord | None = None,
             positions_remaining_after: int = 0,
             progress_state: dict | None = None,
@@ -3291,6 +3292,14 @@ if _HAS_ANYWIDGET:
                     otherwise.
                 num_positions: Total position count, forwarded into progress
                     messages unchanged.
+                source: Optional :class:`~acia.base.ImageSequenceSource` to
+                    register instead of ``self._file.position(pos)`` -- e.g. a
+                    lazily-sliced ``self._file.position(pos)[:30]`` to limit
+                    registration to the first 30 frames. Its own ``size_t``
+                    (not the full position's) drives the frame loop, so a
+                    resumed record's "already done" count is compared against
+                    the *sliced* length. ``None`` (default) reproduces the
+                    prior always-whole-position behavior.
                 existing_record: A partial (or empty) prior result to resume
                     from; ``None`` is equivalent to a from-scratch position.
                     Assumed to already be for ``method_name`` -- callers
@@ -3309,7 +3318,7 @@ if _HAS_ANYWIDGET:
             from acia.registration_persistence import RegistrationRecord
 
             method = self._build_method(method_name, mask_rect)
-            source = self._file.position(pos)
+            source = source if source is not None else self._file.position(pos)
             num_frames = source.size_t
             reference = np.asarray(source.get_frame(0).raw)
 
@@ -3385,7 +3394,7 @@ if _HAS_ANYWIDGET:
                 failed_frames=failed,
             )
 
-        def batch_apply(self, directory=None, positions=None) -> dict:
+        def batch_apply(self, directory=None, positions=None, sources=None) -> dict:
             """Estimate transforms for every (or a subset of) position, live.
 
             For the currently-selected :attr:`method_name`, processes every
@@ -3417,6 +3426,17 @@ if _HAS_ANYWIDGET:
                     consulted for already-completed positions to skip.
                 positions: Optional subset of position indices to process;
                     defaults to every position in the acquisition.
+                sources: Optional ``{position: ImageSequenceSource}`` override --
+                    when a position has an entry, that source is registered
+                    instead of ``self._file.position(position)``, and its own
+                    ``size_t`` (not the full position's) is what "already
+                    complete" is checked against. Lets a caller limit
+                    registration to a sub-range via the lazy numpy-style
+                    indexing every ``ImageSequenceSource`` already supports,
+                    e.g. ``sources={2: seqfile.position(2)[:30]}`` to register
+                    only the first 30 frames of position 2. A position absent
+                    from ``sources`` (or when ``sources`` is ``None``) falls
+                    back to the whole position, unchanged from before.
 
             Returns:
                 dict: ``{"num_positions", "completed", "skipped",
@@ -3480,6 +3500,7 @@ if _HAS_ANYWIDGET:
             }
             try:
                 for idx, i in enumerate(target_positions):
+                    pos_source = (sources or {}).get(i)
                     existing_record = records.get(i)
                     if (
                         existing_record is not None
@@ -3498,7 +3519,11 @@ if _HAS_ANYWIDGET:
                         # via _register_position) records it as a per-position
                         # failure instead.
                         try:
-                            num_frames_i = self._file.position(i).size_t
+                            num_frames_i = (
+                                pos_source.size_t
+                                if pos_source is not None
+                                else self._file.position(i).size_t
+                            )
                             already_done = len(existing_record.transforms) + len(
                                 existing_record.failed_frames
                             )
@@ -3524,6 +3549,7 @@ if _HAS_ANYWIDGET:
                             method_name,
                             mask_rect,
                             num_positions,
+                            source=pos_source,
                             existing_record=existing_record,
                             positions_remaining_after=positions_remaining_after,
                             progress_state=progress_state,

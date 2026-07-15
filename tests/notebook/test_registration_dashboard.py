@@ -685,6 +685,54 @@ class TestBatchApply(unittest.TestCase):
             summary = dash.batch_apply(directory=out, positions=[0])
             self.assertEqual(summary["completed"], [0])
 
+    def test_batch_apply_sources_override_limits_frames(self):
+        # A `sources` override (e.g. a lazily-sliced `position[:n]`) restricts
+        # registration to just those frames instead of the whole position.
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=10)
+            seqfile = open_sequence(path)
+            dash = RegistrationDashboard(
+                seqfile, method_name="PhaseCorrelationHighpass"
+            )
+            dash.send = _Recorder()
+            out = Path(d) / "out"
+            limited = seqfile.position(0)[:4]
+            summary = dash.batch_apply(
+                directory=out, positions=[0], sources={0: limited}
+            )
+            self.assertEqual(summary["completed"], [0])
+            manifest = RegistrationManifest.load(summary["path"])
+            record = manifest.records[0]
+            self.assertEqual(
+                set(record.transforms) | set(record.failed_frames), {0, 1, 2, 3}
+            )
+
+    def test_batch_apply_sources_override_resume_uses_sliced_length(self):
+        # The "already complete" resume check must compare against the
+        # override source's size_t, not the full position's -- otherwise a
+        # 4-frame-limited position recorded as complete would look "partial"
+        # against the full 10-frame position and be reprocessed forever.
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=10)
+            seqfile = open_sequence(path)
+            dash = RegistrationDashboard(
+                seqfile, method_name="PhaseCorrelationHighpass"
+            )
+            dash.send = _Recorder()
+            out = Path(d) / "out"
+            limited = seqfile.position(0)[:4]
+            dash.batch_apply(directory=out, positions=[0], sources={0: limited})
+
+            dash2 = RegistrationDashboard(
+                seqfile, method_name="PhaseCorrelationHighpass"
+            )
+            dash2.send = _Recorder()
+            summary2 = dash2.batch_apply(
+                directory=out, positions=[0], sources={0: limited}
+            )
+            self.assertEqual(summary2["skipped"], [0])
+            self.assertEqual(summary2["completed"], [])
+
 
 class TestManifestAndSave(unittest.TestCase):
     def test_manifest_empty_before_batch_apply(self):
