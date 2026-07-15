@@ -14,6 +14,9 @@ section to a dated version entry automatically.
 - `FlowposeRTSegmenter` (`acia.segm.processor.flowpose_rt`): omnipose-compatible
   segmentation backed by the lightweight `flowpose-rt` package (no
   cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.
+- `ImageSequenceSource.to_channel(c)`: a generic lazy single-channel view
+  (equivalent to `self[..., c]`), now available on every source implementation
+  (e.g. `LocalSequenceSource`), not just `THWCSequenceSource`.
 - fsspec-based remote image sources: read TIFFs from SMB/SAMBA shares (and any
   fsspec backend) via `SambaSequenceSource` / `LocalSequenceSource`, plus
   `list_sequence_sources` for folder discovery and a per-user credentials store

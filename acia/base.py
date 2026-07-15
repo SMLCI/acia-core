@@ -10,7 +10,7 @@ import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence, Sized
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from acia.registration import FrameTransform
@@ -763,6 +763,18 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
             key_list = key_list[:i] + [slice(None)] * fill + key_list[i + 1 :]
 
         return key_list[0], tuple(key_list[1:])
+
+    def to_channel(self, c: int) -> ImageSequenceSource:
+        """Return a lazy single-channel view of this source.
+
+        Args:
+            c: the channel index to select.
+
+        Returns:
+            ImageSequenceSource: a view of this source with only channel ``c``
+            (equivalent to ``self[..., c]``).
+        """
+        return cast(ImageSequenceSource, self[..., c])
 
     def crop_rotated(self, spec: RotatedCropSpec) -> RotatedCropSequenceSource:
         """Return a lazy rotated-rectangle crop view of this source.

@@ -32,6 +32,21 @@ def test_local_path_backward_compat(tmp_path):
     assert frames[0].raw.shape == (8, 8, 3)
 
 
+def test_local_path_to_channel(tmp_path):
+    """to_channel() selects one of the artificially-RGB-repeated channels."""
+    stack = _make_stack()
+    path = tmp_path / "stack.tif"
+    tifffile.imwrite(str(path), stack)
+
+    src = LocalSequenceSource(str(path))
+    single = src.to_channel(0)
+
+    assert single.size_t == len(stack)
+    frame = single.get_frame(0)
+    assert frame.raw.shape == (8, 8)
+    np.testing.assert_array_equal(frame.raw, src.get_frame(0).raw[..., 0])
+
+
 def test_memory_backend_end_to_end():
     """The non-local fsspec path (same code SAMBA uses) reads a TIFF correctly."""
     stack = _make_stack(num_frames=2)

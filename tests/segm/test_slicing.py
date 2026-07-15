@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from acia.base import BaseImage, ImageSequenceSource
-from acia.segm.local import THWCSequenceSource
+from acia.segm.local import InMemorySequenceSource, THWCSequenceSource
 
 
 def _src(t=6, h=8, w=10, c=3):
@@ -73,6 +73,18 @@ def test_ellipsis_channel_select():
     sub = src[..., 0]
     assert sub.get_frame(0).raw.shape == (8, 10)
     np.testing.assert_array_equal(sub.get_frame(0).raw, stack[0, :, :, 0])
+
+
+def test_to_channel_matches_ellipsis_select():
+    # InMemorySequenceSource doesn't override to_channel, so this exercises the
+    # generic ImageSequenceSource.to_channel -> self[..., c] base implementation
+    # (THWCSequenceSource has its own to_channel override with different, keep-
+    # axis semantics).
+    stack = np.arange(6 * 8 * 10 * 3, dtype=np.uint8).reshape(6, 8, 10, 3)
+    src = InMemorySequenceSource(stack)
+    sub = src.to_channel(1)
+    assert sub.get_frame(0).raw.shape == (8, 10)
+    np.testing.assert_array_equal(sub.get_frame(0).raw, stack[0, :, :, 1])
 
 
 def test_chained_slicing_composes():
