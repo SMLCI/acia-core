@@ -14,6 +14,8 @@ section to a dated version entry automatically.
 - `FlowposeRTSegmenter` (`acia.segm.processor.flowpose_rt`): omnipose-compatible
   segmentation backed by the lightweight `flowpose-rt` package (no
   cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.
+  Processes frames in configurable batches (`batch_size`, default 20) with a
+  `tqdm` progress bar, matching `OmniposeSegmenter`'s existing behavior.
 - `ImageSequenceSource.to_channel(c)`: a generic lazy single-channel view
   (equivalent to `self[..., c]`), now available on every source implementation
   (e.g. `LocalSequenceSource`), not just `THWCSequenceSource`.

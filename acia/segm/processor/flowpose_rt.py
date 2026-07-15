@@ -1,12 +1,19 @@
 """flowpose-rt segmentation implementation"""
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from acia.attribute import attribute_segmentation
 from acia.base import ImageSequenceSource, Overlay
 from acia.segm.formats import overlay_from_masks
 
 from . import SegmentationProcessor
+
+
+def _batch(iterable, n=1):
+    length = len(iterable)
+    for ndx in range(0, length, n):
+        yield iterable[ndx : min(ndx + n, length)]
 
 
 class FlowposeRTSegmenter(SegmentationProcessor):
@@ -19,12 +26,14 @@ class FlowposeRTSegmenter(SegmentationProcessor):
         precision="auto",
         compile=None,  # noqa: A002 - mirrors flowpose_rt.Segmenter's own kwarg name
         autorelease: bool = True,
+        batch_size: int = 20,
     ):
         super().__init__(autorelease=autorelease)
         self.model_spec = model
         self.device = device
         self.precision = precision
         self.compile = compile
+        self.batch_size = batch_size
 
     def _load_model(self):
         import flowpose_rt as ort
@@ -53,9 +62,17 @@ class FlowposeRTSegmenter(SegmentationProcessor):
 
             imgs.append(raw_image)
 
-        # a single vectorized net forward over the whole (uniform-shape) stack
-        stack = np.stack(imgs)
-        masks = self.model.segment(stack)
+        # one vectorized net forward per batch (not per image) -- batch_size
+        # trades progress granularity for throughput; a batch of 1 shows
+        # per-image progress but loses flowpose-rt's batched-forward speedup
+        all_masks = []
+        pbar = tqdm(total=len(imgs), desc="Batched flowpose-rt prediction...")
+        for image_batch in _batch(imgs, self.batch_size):
+            stack = np.stack(image_batch)
+            all_masks.append(self.model.segment(stack))
+            pbar.update(len(image_batch))
+
+        masks = np.concatenate(all_masks)
 
         ov = overlay_from_masks(masks)
 

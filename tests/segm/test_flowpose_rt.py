@@ -21,9 +21,11 @@ class _FakeSegmenter:
         self.precision = precision
         self.compile = compile
         self.last_stack = None
+        self.call_shapes = []
 
     def segment(self, stack):
         self.last_stack = stack
+        self.call_shapes.append(stack.shape)
         # a single labeled instance covering the top-left quadrant of every frame
         masks = np.zeros(stack.shape, dtype=np.int32)
         masks[:, : stack.shape[1] // 2, : stack.shape[2] // 2] = 1
@@ -88,6 +90,20 @@ class TestFlowposeRTSegmenter(unittest.TestCase):
         processor(source)
 
         self.assertEqual(processor._model.last_stack.shape, (4, 16, 16))
+
+    def test_batch_size_splits_stack_across_calls(self):
+        """batch_size < num_frames -> multiple smaller model.segment() calls."""
+        processor = FlowposeRTSegmenter(device="cpu", autorelease=False, batch_size=2)
+        image = np.zeros((5, 16, 16, 1), dtype=np.uint8)
+        source = THWCSequenceSource(image)
+
+        overlay = processor(source)
+
+        self.assertEqual(
+            processor._model.call_shapes,
+            [(2, 16, 16), (2, 16, 16), (1, 16, 16)],
+        )
+        self.assertEqual(overlay.numFrames(), 5)
 
     def test_multi_channel_input_raises(self):
         processor = FlowposeRTSegmenter(device="cpu")
