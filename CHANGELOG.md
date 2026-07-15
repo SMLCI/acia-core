@@ -47,6 +47,11 @@ section to a dated version entry automatically.
   silently-normalized, artificially-3-channel uint8 — this also fixes previously
   wrong `dtype`/channel-count metadata, and affects any quantitative analysis
   (registration, fluorescence/area extraction) run on `open_sequence`-opened TIFFs.
+- `JupyterVisualizationMixin._repr_html_`'s interactive preview no longer crashes
+  on a genuinely single-channel raw `(H, W, 1)` frame (as now returned by
+  `open_sequence`-opened TIFFs, and already returned by `ND2SequenceSource`/
+  `CZISequenceSource`) — PIL's `Image.fromarray` has no mode for a trailing
+  size-1 channel axis; that axis is now squeezed before display.
 
 ## [0.1.0] - 2021-07-30
 

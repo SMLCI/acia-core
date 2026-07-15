@@ -238,6 +238,11 @@ class JupyterVisualizationMixin:
                         image_data = normalize_to_uint8(image_data)
 
                     # Ensure image is in correct format for PIL
+                    if image_data.ndim == 3 and image_data.shape[-1] == 1:
+                        # a raw single-channel (H, W, 1) frame -- drop the axis so
+                        # the 2D branch below promotes it to RGB; PIL's fromarray
+                        # has no mode for a trailing size-1 channel axis
+                        image_data = image_data[..., 0]
                     if len(image_data.shape) == 2:
                         # Grayscale - convert to RGB
                         image_data = np.repeat(image_data[:, :, np.newaxis], 3, axis=-1)
