@@ -52,6 +52,13 @@ section to a dated version entry automatically.
   `open_sequence`-opened TIFFs, and already returned by `ND2SequenceSource`/
   `CZISequenceSource`) — PIL's `Image.fromarray` has no mode for a trailing
   size-1 channel axis; that axis is now squeezed before display.
+- Releasing a `FlowposeRTSegmenter` now also clears `torch.compile`'s
+  process-global CUDA-graph cache via `torch.compiler.reset()` — the base
+  class's generic `torch.cuda.empty_cache()` doesn't reclaim it, since
+  flowpose-rt's default `torch.compile(mode="reduce-overhead")` (on CUDA)
+  caches graphs outside the model instance. Each processed batch is also
+  followed by an explicit `gc.collect()` to encourage prompt reclamation of
+  its activation memory before the next batch starts.
 
 ## [0.1.0] - 2021-07-30
 

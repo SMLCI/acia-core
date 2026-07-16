@@ -114,6 +114,78 @@ class TestFlowposeRTSegmenter(unittest.TestCase):
             processor(source)
 
 
+class _FakeCompiler:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def reset(self):
+        self._calls.append("compiler.reset")
+
+
+class _FakeCuda:
+    def __init__(self, available, calls):
+        self._available = available
+        self._calls = calls
+
+    def is_available(self):
+        return self._available
+
+    def empty_cache(self):
+        self._calls.append("empty_cache")
+
+
+def _install_fake_torch(available):
+    """Install a fake ``torch`` module (cuda + compiler.reset) in sys.modules."""
+    calls: list[str] = []
+    fake = types.ModuleType("torch")
+    fake.cuda = _FakeCuda(available, calls)  # type: ignore[attr-defined]
+    fake.compiler = _FakeCompiler(calls)  # type: ignore[attr-defined]
+    sys.modules["torch"] = fake
+    return calls
+
+
+class TestFlowposeRTReleaseModel(unittest.TestCase):
+    """FlowposeRTSegmenter._release_model additionally clears the compile cache."""
+
+    def setUp(self):
+        self._saved_module = sys.modules.get("flowpose_rt")
+        self._fake_module = _FakeFlowposeRTModule()
+        sys.modules["flowpose_rt"] = self._fake_module
+
+        self._saved_torch = sys.modules.get("torch")
+
+    def tearDown(self):
+        if self._saved_module is None:
+            sys.modules.pop("flowpose_rt", None)
+        else:
+            sys.modules["flowpose_rt"] = self._saved_module
+
+        if self._saved_torch is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = self._saved_torch
+
+    def test_compiler_reset_called_when_cuda_available(self):
+        calls = _install_fake_torch(available=True)
+        processor = FlowposeRTSegmenter(device="cpu")
+        image = np.zeros((1, 20, 20, 1), dtype=np.uint8)
+        source = THWCSequenceSource(image)
+
+        processor(source)  # autorelease=True -> triggers _release_model
+
+        self.assertIn("compiler.reset", calls)
+
+    def test_compiler_reset_not_called_when_cuda_unavailable(self):
+        calls = _install_fake_torch(available=False)
+        processor = FlowposeRTSegmenter(device="cpu")
+        image = np.zeros((1, 20, 20, 1), dtype=np.uint8)
+        source = THWCSequenceSource(image)
+
+        processor(source)
+
+        self.assertNotIn("compiler.reset", calls)
+
+
 @pytest.mark.integration
 class TestFlowposeRTSegmenterIntegration(unittest.TestCase):
     """Real flowpose_rt import; skipped unless the (optional) dependency is installed."""
