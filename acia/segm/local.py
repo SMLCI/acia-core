@@ -290,41 +290,10 @@ class THWCSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         # select channel but make it TxHxWxC immediately
         return THWCSequenceSource(self.image_stack[..., c][..., None])
 
-    def to_rgb(self) -> "THWCSequenceSource":
-        """Convert image source into rgb space
-
-        Raises:
-            ValueError: if has wrong format
-
-        Returns:
-            InMemorySequenceSource:
-        """
-
-        if self.image_stack.shape[3] != 1:
-            raise ValueError(
-                f"Only works for single-channel sequences for now. You have C={self.num_channels}!"
-            )
-
-        def normalize(im: np.ndarray) -> np.ndarray:
-            """Normalize image"""
-            min_val = np.quantile(im, 0.01)
-            max_val = np.quantile(im, 0.99)
-
-            result: np.ndarray = (
-                np.clip((im.astype(float) - min_val) / (max_val - min_val), 0.0, 1.0)
-                * 255.0
-            ).astype(np.uint8)
-            return result
-
-        # select the first channel
-        image_stack = self.image_stack[..., 0]
-
-        # apply normalization into unit8 space
-        if self.image_stack.dtype != np.uint8:
-            image_stack = normalize(image_stack)
-
-        # repeat the channels to make a grayscale rendering
-        return THWCSequenceSource(np.stack((image_stack,) * 3, axis=-1))
+    # to_rgb() is inherited from ImageSequenceSource (acia/base.py) -- see
+    # RGBSequenceSource. The previous bespoke quantile-clip implementation
+    # was retired in favor of the shared normalize_to_uint8()-based path
+    # (spec-to-rgb).
 
 
 class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):

@@ -23,7 +23,8 @@ from PIL import Image, ImageDraw
 from shapely.geometry import MultiPolygon, Polygon
 from tqdm.contrib.concurrent import process_map
 
-from acia.notebook import JupyterVisualizationMixin
+from acia.colors import resolve_channel_color
+from acia.notebook import JupyterVisualizationMixin, normalize_to_uint8
 
 from .utils import mask_to_polygons, polygon_to_mask
 
@@ -812,6 +813,40 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
         """
         return RegisteredSequenceSource(self, transforms)
 
+    def to_rgb(
+        self, *, channel: int = 0, colors: dict[int, str] | None = None
+    ) -> RGBSequenceSource:
+        """Return a lazy ``(H, W, 3)`` uint8 RGB view of this source.
+
+        With ``colors=None`` (the default), renders ``channel`` in grayscale:
+        that channel's plane is normalized to uint8 via
+        :func:`acia.notebook.normalize_to_uint8`, then triplicated across the
+        color axis. With ``colors``, renders a per-channel color composite:
+        each channel present in ``colors`` is normalized independently,
+        scaled by its assigned color, and additively blended (clipped to
+        ``[0, 255]``); channels not present in ``colors`` are not rendered.
+
+        Args:
+            channel: Channel index to render in grayscale mode. Ignored when
+                ``colors`` is given. Defaults to ``0``.
+            colors: Optional mapping of channel index -> color, where each
+                color is a hex string (e.g. ``"#00FF00"``) or a name from
+                :data:`acia.colors.CHANNEL_COLORS` (case-insensitive). See
+                :func:`acia.colors.resolve_channel_color`. Defaults to
+                ``None`` (grayscale mode).
+
+        Returns:
+            RGBSequenceSource: A lazy view of this source whose
+            ``get_frame(t)`` yields ``(H, W, 3)`` uint8 frames. No frame is
+            read or converted until it is accessed.
+
+        Raises:
+            ValueError: if any color in ``colors`` is not a known channel
+                name and not a color :func:`matplotlib.colors.to_rgb` can
+                parse.
+        """
+        return RGBSequenceSource(self, channel=channel, colors=colors)
+
     def materialize(self) -> THWCSequenceSource:
         """Eagerly freeze this (possibly lazy) source into an in-memory source.
 
@@ -1046,6 +1081,112 @@ class RegisteredSequenceSource(ImageSequenceSource):
     @property
     def num_channels(self) -> int:
         return self.parent.num_channels
+
+    @property
+    def timepoints(self):
+        return self.parent.timepoints
+
+    @property
+    def pixel_size(self):
+        return self.parent.pixel_size
+
+
+class RGBSequenceSource(ImageSequenceSource):
+    """A lazy grayscale-to-RGB or per-channel color-composite view.
+
+    With ``colors=None``, each frame is rendered by selecting ``channel``'s
+    plane, normalizing it to uint8 via :func:`acia.notebook.normalize_to_uint8`,
+    and triplicating it across the color axis. With ``colors`` given, each
+    channel present in ``colors`` is normalized independently, scaled by its
+    resolved RGB color, and additively blended, clipped to ``[0, 255]``.
+    Colors are resolved once at construction time (via
+    :func:`acia.colors.resolve_channel_color`), so an unknown color name or
+    invalid hex string raises ``ValueError`` immediately rather than on first
+    frame access. ``colors`` must not be empty -- pass ``colors=None`` for
+    grayscale mode instead. Channel indices (``channel`` and every key of
+    ``colors``) are validated against each frame's actual channel count as
+    it is read, raising a clear ``ValueError`` rather than a bare numpy
+    ``IndexError``; this does not special-case sources whose frames are
+    already RGB-like (e.g. an already-3-channel source, or chaining
+    ``to_rgb()`` on the output of another ``to_rgb()`` call) -- those are
+    still rendered via ``channel``/``colors`` like any other source, with no
+    pass-through or idempotency guarantee.
+
+    Rendering to RGB does not change the frame's temporal/spatial extent, so
+    ``size_t``/``size_h``/``size_w``/``pixel_size``/``timepoints`` delegate
+    straight to the parent, mirroring :class:`RegisteredSequenceSource`.
+    ``size_c``/``num_channels`` are always ``3`` (not delegated), since the
+    output is always an RGB image regardless of how many channels the parent
+    has.
+    """
+
+    def __init__(
+        self,
+        parent: ImageSequenceSource,
+        channel: int = 0,
+        colors: dict[int, str] | None = None,
+    ):
+        self.parent = parent
+        self.channel = channel
+        self.colors = colors
+        self._resolved_colors: dict[int, np.ndarray] | None = None
+        if colors is not None:
+            if len(colors) == 0:
+                raise ValueError(
+                    "colors must not be empty; pass colors=None for grayscale mode"
+                )
+            self._resolved_colors = {
+                c: np.array(resolve_channel_color(color), dtype=np.float32)
+                for c, color in colors.items()
+            }
+
+    def _select_channel(self, raw: np.ndarray, c: int) -> np.ndarray:
+        n_channels = 1 if raw.ndim == 2 else raw.shape[-1]
+        if not 0 <= c < n_channels:
+            raise ValueError(
+                f"channel index {c} out of range for a frame with "
+                f"{n_channels} channel(s)"
+            )
+        return raw if raw.ndim == 2 else raw[..., c]
+
+    def get_frame(self, frame: int) -> BaseImage:
+        idx = self._resolve_t_index(frame)
+        raw = np.asarray(self.parent.get_frame(idx).raw)
+
+        if self._resolved_colors is None:
+            plane = self._select_channel(raw, self.channel)
+            gray = normalize_to_uint8(plane)
+            rgb = np.stack((gray,) * 3, axis=-1)
+        else:
+            h, w = raw.shape[0], raw.shape[1]
+            acc = np.zeros((h, w, 3), dtype=np.float32)
+            for c, rgb_0to1 in self._resolved_colors.items():
+                plane = self._select_channel(raw, c)
+                gray = normalize_to_uint8(plane).astype(np.float32)
+                acc += gray[..., None] * rgb_0to1
+            rgb = np.clip(acc, 0, 255).astype(np.uint8)
+
+        return ArrayImage(rgb, frame=idx)
+
+    @property
+    def size_t(self) -> int:
+        return self.parent.size_t
+
+    @property
+    def size_h(self) -> int:
+        return self.parent.size_h
+
+    @property
+    def size_w(self) -> int:
+        return self.parent.size_w
+
+    @property
+    def size_c(self) -> int:
+        return 3
+
+    @property
+    def num_channels(self) -> int:
+        return 3
 
     @property
     def timepoints(self):
