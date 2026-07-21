@@ -53,6 +53,10 @@ class Instance:
             id (_type_, optional): Unique identifier for the object. Defaults to None.
             score (float, optional): E.g. confidence of the detection method. Defaults to None.
         """
+        # derived-value caches; invalidated by the mask/label setters below
+        self._polygon: Polygon | MultiPolygon | None = None
+        self._center: tuple[float, float] | None = None
+
         self.mask = mask
         self.frame = frame
         self.label = label
@@ -60,8 +64,28 @@ class Instance:
         self.score = score
         self.time = None  # pint timestamp, set when the overlay carries a time model
 
+    @property
+    def mask(self) -> np.ndarray:
+        return self._mask
+
+    @mask.setter
+    def mask(self, value: np.ndarray):
+        self._mask = value
+        self._invalidate()
+
+    @property
+    def label(self):
+        return self._label
+
+    @label.setter
+    def label(self, value):
+        self._label = value
+        self._invalidate()
+
+    def _invalidate(self):
+        """Drop cached values derived from ``mask``/``label``."""
         self._polygon = None
-        self._center: tuple[float, float] | None = None
+        self._center = None
 
     @property
     def binary_mask(self):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import numbers
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 from acia import ureg
-from acia.base import BaseImage, ImageSequenceSource, Overlay
+from acia.base import BaseImage, ImageSequenceSource, Instance, Overlay
 from acia.segm.local import InMemorySequenceSource, LocalImage, THWCSequenceSource
 
 from .utils import strfdelta
@@ -528,64 +528,75 @@ def render_tracking(
 
     images = []
 
-    contour_lookup = {cont.id: cont for cont in overlay}
+    # Centers are constant, but deriving one is expensive (a shapely centroid
+    # for Contour, a full-frame mask pass for Instance) and the draw loop below
+    # needs each of them once per incident edge. Resolve them all up front.
+    center_lookup = {
+        cont.id: np.asarray(cont.center, dtype=np.float64).astype(np.int32)
+        for cont in overlay
+    }
+
+    # marker colors
+    line_color = (255, 0, 0)  # rgb: red
+    division_color = (0, 0, 255)  # bgr: blue
+    marker_color = (203, 192, 255)
 
     for image, frame_overlay in zip(
         tqdm(image_source, desc="Render cell tracking paths..."),
         overlay.timeIterator(),
         strict=False,
     ):
-        np_image = np.copy(image.raw)
+        raw = image.raw
 
-        if len(np_image.shape) == 2:
-            # convert to grayscale if needed
-            np_image = np.stack((np_image,) * 3, axis=-1)
-
-        if len(np_image.shape) != 3 or np_image.shape[2] != 3:
+        if raw.ndim != 2 and (raw.ndim != 3 or raw.shape[2] not in (1, 3)):
             logging.warning(
                 "Your images are in the wrong shape! The shape of an image is %s but we need (height, width, 3)! This is likely to cause an error!",
-                image.shape,
+                raw.shape,
             )
 
+        np_image = _to_uint8_rgb(raw)
+
+        # Draw order is kept cell-by-cell (rather than batched per color) so
+        # that overlapping tracks stack exactly as they did before.
         for cont in frame_overlay:
-            if cont.id in tracking_graph.nodes:
-                edges = tracking_graph.out_edges(cont.id)
+            if cont.id not in tracking_graph.nodes:
+                continue
 
-                born = tracking_graph.in_degree(cont.id) == 0
+            edges = tracking_graph.out_edges(cont.id)
 
-                for edge in edges:
-                    source = contour_lookup[edge[0]].center
-                    target = contour_lookup[edge[1]].center
+            if len(edges) == 0:
+                center = center_lookup[cont.id]
+                cv2.rectangle(
+                    np_image,
+                    tuple(map(int, center - 2)),
+                    tuple(map(int, center + 2)),
+                    marker_color,
+                )
+                continue
 
-                    line_color = (255, 0, 0)  # rgb: red
+            # more than one successor -> the cell divides in this frame
+            color = division_color if len(edges) > 1 else line_color
+            born = tracking_graph.in_degree(cont.id) == 0
 
-                    if len(edges) > 1:
-                        line_color = (0, 0, 255)  # bgr: blue
+            for edge in edges:
+                source = center_lookup[edge[0]]
+                target = center_lookup[edge[1]]
 
-                    cv2.line(
+                cv2.line(
+                    np_image,
+                    tuple(map(int, source)),
+                    tuple(map(int, target)),
+                    color,
+                    thickness=3,
+                )
+
+                if born:
+                    cv2.circle(
                         np_image,
                         tuple(map(int, source)),
-                        tuple(map(int, target)),
-                        line_color,
-                        thickness=3,
-                    )
-
-                    if born:
-                        cv2.circle(
-                            np_image,
-                            tuple(map(int, source)),
-                            3,
-                            (203, 192, 255),
-                            thickness=1,
-                        )
-
-                if len(edges) == 0:
-                    center = np.array(cont.center).astype(np.int32)
-                    cv2.rectangle(
-                        np_image,
-                        tuple(map(int, center - 2)),
-                        tuple(map(int, center + 2)),
-                        (203, 192, 255),
+                        3,
+                        marker_color,
+                        thickness=1,
                     )
 
         images.append(np_image)
@@ -921,6 +932,166 @@ def colorize_instance_mask(
     return np.asarray(colored_mask)
 
 
+def _to_uint8_rgb(image: np.ndarray) -> np.ndarray:
+    """Normalize an arbitrary frame into a HxWx3 uint8 RGB array.
+
+    Overlay colors live in the 0-255 range, so blending them onto a uint16 or
+    float frame requires bringing the frame into the same range first.
+
+    The result is always a fresh, contiguous buffer -- renderers draw onto it
+    with cv2, which mutates in place, so it must never alias the source data.
+
+    Args:
+        image (np.ndarray): frame in HxW, HxWx1 or HxWx3 layout (uint8/uint16/float).
+
+    Returns:
+        np.ndarray: HxWx3 uint8 copy of the frame.
+    """
+    im = image
+
+    # Convert image to uint8 if necessary
+    if im.dtype == np.uint16:
+        im = (im / 256).astype(np.uint8)
+    elif im.dtype in (np.float32, np.float64):
+        im = np.clip(im * 255, 0, 255).astype(np.uint8)
+    elif im.dtype != np.uint8:
+        im = im.astype(np.uint8)
+
+    # Convert grayscale images to RGB by duplicating channels
+    if im.ndim == 2:
+        im = np.stack([im] * 3, axis=-1)
+    elif im.ndim == 3 and im.shape[2] == 1:
+        im = np.stack([im[:, :, 0]] * 3, axis=-1)
+
+    # copy=True is load-bearing: np.ascontiguousarray alone would return the
+    # caller's array untouched for an already-contiguous uint8 RGB frame, and
+    # the subsequent in-place cv2 drawing would then corrupt the source data.
+    return np.array(im, dtype=np.uint8, order="C", copy=True)
+
+
+def _contour_labels(contours: Sequence[Any], enumerate_fallback: bool) -> list[int]:
+    """Resolve the integer label to rasterize for each contour.
+
+    Args:
+        contours (Sequence): contours/instances of a single frame.
+        enumerate_fallback (bool): if True, contours whose ``label`` is None or
+            not convertible to int fall back to their 1-based position. If
+            False, such contours are skipped (label 0).
+
+    Returns:
+        list[int]: one label per contour.
+    """
+    labels = []
+    for i, cont in enumerate(contours):
+        label = i + 1 if enumerate_fallback else 0
+        if cont.label is not None:
+            # could not convert label to integer -> keep the fallback label
+            with contextlib.suppress(ValueError, TypeError):
+                label = int(cont.label)
+        labels.append(label)
+    return labels
+
+
+def _frame_label_mask(
+    contours: Sequence[Any],
+    height: int,
+    width: int,
+    enumerate_fallback: bool = False,
+) -> np.ndarray:
+    """Rasterize one frame's contours into a single instance label mask.
+
+    This is the hot path of every mask-based renderer. The naive formulation
+    (one full-image ``mask == label`` plus ``np.maximum`` per cell) costs
+    O(n_cells * height * width); every branch below is O(height * width).
+
+    On overlapping pixels the higher label wins, matching the ``np.maximum``
+    semantics of the original implementation.
+
+    Args:
+        contours (Sequence): contours/instances of a single frame.
+        height (int): frame height.
+        width (int): frame width.
+        enumerate_fallback (bool): see :func:`_contour_labels`.
+
+    Returns:
+        np.ndarray: HxW uint32 label mask (0 = background).
+    """
+    contours = list(contours)
+    if not contours:
+        return np.zeros((height, width), dtype=np.uint32)
+
+    labels = _contour_labels(contours, enumerate_fallback)
+
+    first = contours[0]
+    if isinstance(first, Instance) and all(
+        isinstance(c, Instance) and c.mask is first.mask for c in contours
+    ):
+        # Fast path: acia.segm.formats.overlay_from_masks hands every instance
+        # of a frame a reference to the same full-frame label mask, so the mask
+        # we want already exists -- one LUT remap keeps the requested labels and
+        # drops everything else, instead of one pass per cell.
+        src = first.mask
+        src_labels = np.asarray([c.label for c in contours])
+        lut_size = int(max(int(src.max()), int(src_labels.max()), max(labels))) + 1
+        lut = np.zeros(lut_size, dtype=np.uint32)
+        lut[src_labels] = np.asarray(labels, dtype=np.uint32)
+        return np.asarray(lut[src])
+
+    # Slow path: write each contour into the shared buffer. Ascending label
+    # order reproduces "higher label wins" without a per-cell np.maximum.
+    # int32 rather than uint32 because cv2.fillPoly has no uint32 overload.
+    local_mask = np.zeros((height, width), dtype=np.int32)
+
+    for i in np.argsort(np.asarray(labels, dtype=np.int64), kind="stable"):
+        cont = contours[i]
+
+        if isinstance(cont, Instance):
+            np.putmask(local_mask, cont.binary_mask, np.int32(labels[i]))
+            continue
+
+        # Instance must be handled above: its `coordinates` property derives a
+        # shapely polygon from the mask and raises when the mask is empty.
+        coordinates = getattr(cont, "coordinates", None)
+
+        if coordinates is None:
+            # anything exposing only the toMask() protocol
+            np.putmask(
+                local_mask, cont.toMask(height=height, width=width), np.int32(labels[i])
+            )
+        else:
+            # cv2.fillPoly only touches the polygon bounding box, whereas
+            # Contour.toMask rasterizes over the whole frame per contour.
+            points = np.asarray(coordinates, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(local_mask, [points], int(labels[i]))
+
+    return local_mask.astype(np.uint32)
+
+
+def _blend_overlay(
+    image: np.ndarray, colored_mask: np.ndarray, label_mask: np.ndarray, alpha: float
+) -> np.ndarray:
+    """Alpha-blend a colorized instance mask onto a frame, foreground only.
+
+    Args:
+        image (np.ndarray): HxWx3 uint8 frame (see :func:`_to_uint8_rgb`).
+        colored_mask (np.ndarray): HxWx3 uint8 colorized instance mask.
+        label_mask (np.ndarray): HxW label mask deciding what counts as foreground.
+        alpha (float): weight of the original image (1.0 = original only).
+
+    Returns:
+        np.ndarray: HxWx3 uint8 blended frame.
+    """
+    # uint8 saturating arithmetic -- avoids six full-frame float32 temporaries
+    blended = cv2.addWeighted(image, alpha, colored_mask, 1 - alpha, 0)
+
+    # keep the original image where no overlay is available. Testing the label
+    # mask rather than the colors means a cell that happens to be colored
+    # (0, 0, 0) still counts as foreground.
+    result = image.copy()
+    np.copyto(result, blended, where=(label_mask != 0)[..., None])
+    return result
+
+
 def get_mask(self, height, width, binary_mask=True) -> np.ndarray:
     """
     Turn the individual overlays into masks. For every time point we create a mask of all contours.
@@ -930,28 +1101,12 @@ def get_mask(self, height, width, binary_mask=True) -> np.ndarray:
     height: height of the image
     width: width of the image
     """
+    label_mask = _frame_label_mask(list(self), height, width, enumerate_fallback=True)
+
     if binary_mask:
-        local_mask = np.zeros((height, width), dtype=bool)
-    else:
-        # non-binary
-        local_mask = np.zeros((height, width), dtype=np.uint16)
+        return np.asarray(label_mask != 0)
 
-    # combine all contours in one mask
-    for i, cont in enumerate(self):
-        mask = cont.toMask(height=height, width=width)
-        if not binary_mask:
-            label = i + 1
-            if cont.label is not None:
-                # could not convert label to integer -> keep the fallback label
-                with contextlib.suppress(ValueError):
-                    label = int(cont.label)
-
-            mask = mask.astype(np.uint16) * (label)  # convert into a non-binary mask
-
-        # combine into a single mask
-        local_mask = np.maximum(mask, local_mask)
-
-    return local_mask
+    return label_mask
 
 
 def render_overlay_frame(
@@ -975,52 +1130,23 @@ def render_overlay_frame(
         np.ndarray: Blended image with overlay applied, dtype uint8, shape HxWx3 (RGB).
             Where the overlay has no data (background), returns the original image unchanged.
     """
-    # Make a copy of the image to avoid modifying the original
-    im = np.copy(image)
-
     # Get image dimensions
-    height, width = im.shape[:2]
+    height, width = image.shape[:2]
 
-    # Convert image to uint8 if necessary
-    if im.dtype == np.uint16:
-        im = (im / 256).astype(np.uint8)
-    elif im.dtype in (np.float32, np.float64):
-        im = np.clip(im * 255, 0, 255).astype(np.uint8)
-    elif im.dtype != np.uint8:
-        im = im.astype(np.uint8)
+    # Normalize to a HxWx3 uint8 copy (never touches the caller's array)
+    im = _to_uint8_rgb(image)
 
-    # Convert grayscale images to RGB by duplicating channels
-    if len(im.shape) == 2:
-        # 2D array (HxW)
-        im = np.stack([im] * 3, axis=-1)
-    elif len(im.shape) == 3 and im.shape[2] == 1:
-        # 3D array with single channel (HxWx1)
-        im = np.stack([im[:, :, 0]] * 3, axis=-1)
-
-    # Convert overlay to instance label mask (uint16, where each instance has unique ID)
-    label_mask = get_mask(overlay, height, width, False)
+    # Convert overlay to instance label mask (each instance has a unique ID)
+    label_mask = _frame_label_mask(
+        list(overlay), height, width, enumerate_fallback=True
+    )
 
     # Colorize the instance mask (assigns random colors per instance)
     colored_mask = colorize_instance_mask(label_mask)
 
-    # Alpha blend the colored mask with the original image
+    # Alpha blend the colored mask onto the image, foreground pixels only.
     # alpha controls the mix: higher alpha = more original image, lower = more overlay
-    blended = cv2.addWeighted(
-        im.astype(np.float32),
-        alpha,
-        colored_mask.astype(np.float32),
-        1 - alpha,
-        0,
-    ).astype(np.uint8)
-
-    # Create binary mask where overlay has data (non-zero pixels)
-    # Stack to make it 3-channel to match blended image shape
-    binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-
-    # Use original image where no overlay is available, blended image where overlay exists
-    result = np.where(binary_mask, blended, im.astype(np.float32))
-
-    return result.astype(np.uint8)
+    return _blend_overlay(im, colored_mask, label_mask, alpha)
 
 
 def render_segmentation_mask(
@@ -1043,25 +1169,16 @@ def render_segmentation_mask(
         overlay.time_iterator(),
         strict=False,
     ):
-        im = np.copy(im.raw)
+        raw = im.raw
+        height, width = raw.shape[:2]
+        image = _to_uint8_rgb(raw)
 
-        height, width = im.shape[:2]
-
-        label_mask = get_mask(ov, height, width, False)
+        label_mask = _frame_label_mask(list(ov), height, width, enumerate_fallback=True)
 
         # render the masks based on the first contour mask in the frame
         colored_mask = colorize_instance_mask(label_mask)
 
-        # Alpha blend with original image
-        blended = cv2.addWeighted(
-            im.astype(np.float32), alpha, colored_mask.astype(np.float32), 1 - alpha, 0
-        ).astype(np.uint8)
-
-        # use the original image where no overlay is availabel
-        binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-        blended = np.where(binary_mask, blended, im)
-
-        return_images.append(blended)
+        return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
@@ -1086,12 +1203,11 @@ def render_tracking_mask(
     """
     return_images = []
 
-    # generate color LUT (persistent for labels)
+    # generate color LUT (persistent for labels). Only the label range matters
+    # here, so take the max directly instead of sorting every label.
     rng = np.random.default_rng(seed)
-    unique_labels = np.unique([0] + [cont.label for cont in overlay])
-    color_lut = rng.integers(
-        0, 256, size=(np.max(unique_labels) + 1, 3), dtype=np.uint8
-    )
+    max_label = max((int(cont.label) for cont in overlay), default=0)
+    color_lut = rng.integers(0, 256, size=(max_label + 1, 3), dtype=np.uint8)
     color_lut[0] = (0, 0, 0)
 
     for im, ov in zip(
@@ -1099,21 +1215,20 @@ def render_tracking_mask(
         overlay.time_iterator(),
         strict=False,
     ):
-        im = np.copy(im.raw)
+        raw = im.raw
+        h, w = raw.shape[:2]
+        image = _to_uint8_rgb(raw)
 
-        h, w = im.shape[:2]
+        contours = list(ov)
 
-        label_mask = np.zeros((h, w), dtype=np.uint32)
+        # single-pass rasterization of the whole frame (see _frame_label_mask)
+        label_mask = _frame_label_mask(contours, h, w)
 
-        for cont in ov:
-            # print(f"Label: {cont.label}")
-            cell_mask = (cont.binary_mask * cont.label).astype(np.uint16)
-            label_mask = np.maximum(label_mask, cell_mask)
-
-            # render label numbers if necessary
-            if show_label_numbers:
+        # render label numbers if necessary
+        if show_label_numbers:
+            for cont in contours:
                 cv2.putText(
-                    im,
+                    image,
                     f"{cont.label}",
                     tuple(map(int, np.array(cont.center).astype(int))),
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -1126,16 +1241,7 @@ def render_tracking_mask(
         # render the masks based on the labels
         colored_mask = colorize_instance_mask(label_mask, color_lut=color_lut)
 
-        # Alpha blend with original image
-        blended = cv2.addWeighted(
-            im.astype(np.float32), alpha, colored_mask.astype(np.float32), 1 - alpha, 0
-        ).astype(np.uint8)
-
-        # use the original image where no overlay is availabel
-        binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-        blended = np.where(binary_mask, blended, im)
-
-        return_images.append(blended)
+        return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
