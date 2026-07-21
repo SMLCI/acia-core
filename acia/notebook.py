@@ -1066,6 +1066,7 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
   border-bottom:1px solid var(--border);flex-wrap:wrap;font-family:var(--font-mono);font-size:11.5px;}
 .acia-sd .sd-src input{flex:1;min-width:160px;background:var(--panel);border:1px solid var(--border);
   color:var(--text);border-radius:7px;padding:6px 9px;font-family:var(--font-mono);font-size:12px;}
+.acia-sd .sd-src input[readonly]{background:var(--panel-3);color:var(--text-dim);cursor:text;}
 .acia-sd .sd-meta{color:var(--text-dim);width:100%;}
 .acia-sd .sd-meta b{color:var(--text)}
 .acia-sd .sd-main{flex:1;display:grid;grid-template-columns:var(--lw,190px) 5px minmax(0,1fr) 5px var(--rw,250px);
@@ -1181,7 +1182,7 @@ function render({ model, el }) {
 
   root.innerHTML =
     "<div class='sd-src'><span>Source</span>" +
-    "<input class='sd-path' value='" + (md.path || "") + "' spellcheck='false'>" +
+    "<input class='sd-path' readonly spellcheck='false' title='source file'>" +
     "<div class='sd-meta'>" + metaLine + "</div></div>" +
     "<div class='sd-main'>" +
       "<div class='sd-pane'><div class='sd-head'><span>Positions</span>" +
@@ -1216,11 +1217,15 @@ function render({ model, el }) {
           "<div class='sd-saverow'>" +
             "<button class='sd-save accent'>💾 Save selection.json</button>" +
             "<label class='sd-auto' title='Automatically write selection.json a moment after each change'>" +
-              "<input type='checkbox' class='sd-autochk'> auto-save</label>" +
+              "<input type='checkbox' class='sd-autochk'" +
+                (model.get("auto_save") ? " checked" : "") + "> auto-save</label>" +
           "</div></div></div>" +
     "</div><div class='sd-toast'></div>";
 
   const $ = (s) => root.querySelector(s);
+  // Set as a property, not interpolated into the innerHTML above: a source path
+  // containing a quote would otherwise break out of the value attribute.
+  $(".sd-path").value = md.path || "(in-memory source)";
   const gal = $(".sd-gal"), wrap = $(".sd-cwrap"), main = $(".sd-main");
   const cstatus = wrap.querySelector(".sd-cstatus");
   function showStatus(text, isErr) {
@@ -1432,7 +1437,7 @@ function render({ model, el }) {
   }
 
   // ---- selections ----
-  let autosave = false, autoSaveTimer = null;
+  let autosave = !!model.get("auto_save"), autoSaveTimer = null;
   function pushSelections() {
     model.set("selections", selections.map((x) => ({
       id: x.id, position: x.position, label: x.label, ci: x.ci,
@@ -1652,7 +1657,12 @@ function render({ model, el }) {
       renderEditor(); renderList(); pushSelections(); } }; });
   root.querySelectorAll(".sd-mode button").forEach((x) => x.classList.toggle("on", x.dataset.m === mode));
   $(".sd-save").onclick = () => model.send({ type: "save" });
-  $(".sd-autochk").addEventListener("change", (e) => { autosave = e.target.checked; });
+  $(".sd-autochk").addEventListener("change", (e) => {
+    autosave = e.target.checked;
+    // round-trip to the trait so the choice survives a re-render and is
+    // readable/settable from Python (and preserved across `resume`)
+    model.set("auto_save", autosave); model.save_changes();
+  });
 
   // ---- keyboard shortcuts (Delete/Backspace, Ctrl/Cmd+C) ----
   // Scoped to "mouse is over this widget instance" (not tab/window focus) so
@@ -2757,24 +2767,32 @@ if _HAS_ANYWIDGET:
         selections = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
         roi_mode = traitlets.Unicode("single").tag(sync=True)
         view_size = traitlets.Int(430).tag(sync=True)
+        auto_save = traitlets.Bool(True).tag(sync=True)
 
         _esm = _SEQUENCE_DASHBOARD_ESM
         _css = _SEQUENCE_DASHBOARD_CSS
 
-        def __init__(self, source, *, roi_mode: str = "single", **kwargs) -> None:
+        def __init__(
+            self, source, *, roi_mode: str = "single", save_dir=None, **kwargs
+        ) -> None:
             """Build the dashboard from a source (no pixel reads at construction).
 
             Args:
                 source: A :class:`~acia.segm.open.SequenceFile`, or a path/str that
                     is opened via :func:`~acia.segm.open.open_sequence`.
                 roi_mode: ``"single"`` (<=1 ROI/position) or ``"multi"``.
-                **kwargs: Forwarded to ``anywidget.AnyWidget``.
+                save_dir: Default output directory for :meth:`save` (and hence for
+                    auto-save, which is on by default). ``None`` keeps the previous
+                    behaviour of writing into the current working directory.
+                **kwargs: Forwarded to ``anywidget.AnyWidget`` (e.g. ``auto_save``
+                    to start with auto-save switched off).
             """
             from acia.segm.open import open_sequence
 
             if isinstance(source, (str, os.PathLike)):
                 source = open_sequence(source)
             self._file = source
+            self._save_dir = None if save_dir is None else os.fspath(save_dir)
 
             meta = source.metadata
             positions = [
@@ -2782,7 +2800,15 @@ if _HAS_ANYWIDGET:
                 for p in source.positions
             ]
             super().__init__(
-                metadata=meta.to_dict(),
+                # `path`/`format` alongside the metadata so the header can show
+                # which file is open -- same identity fields `make_source_block`
+                # bakes into the manifest. `getattr` because in-memory sources are
+                # only SequenceFile-compatible, not necessarily subclasses.
+                metadata={
+                    **meta.to_dict(),
+                    "path": str(getattr(source, "path", "") or ""),
+                    "format": str(getattr(source, "format", "") or ""),
+                },
                 positions=positions,
                 selections=[],
                 roi_mode=roi_mode,
@@ -2915,7 +2941,8 @@ if _HAS_ANYWIDGET:
             """Write ``selection.json`` (+ previews) via :func:`save_selection`.
 
             Args:
-                directory: Output dir; defaults to the current working directory
+                directory: Output dir; defaults to the ``save_dir`` passed to the
+                    constructor, and failing that to the current working directory
                     (the notebook's dir at run time).
 
             Returns:
@@ -2923,7 +2950,10 @@ if _HAS_ANYWIDGET:
             """
             from acia.selection import save_selection
 
-            directory = os.getcwd() if directory is None else directory
+            if directory is None:
+                directory = (
+                    self._save_dir if self._save_dir is not None else os.getcwd()
+                )
             return save_selection(self.manifest, directory)
 
         @classmethod
@@ -2958,9 +2988,12 @@ if _HAS_ANYWIDGET:
                 manifest = manifest_or_path
             else:
                 path = os.fspath(manifest_or_path)
-                if os.path.isdir(path):
-                    path = os.path.join(path, "selection.json")
                 manifest = SelectionManifest.load(path)
+                # Keep saving back where it was resumed from, so a continued
+                # session doesn't silently start writing to the cwd instead.
+                kwargs.setdefault(
+                    "save_dir", path if os.path.isdir(path) else os.path.dirname(path)
+                )
 
             if source is None:
                 source = open_sequence(manifest.source_path)

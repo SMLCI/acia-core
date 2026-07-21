@@ -117,6 +117,15 @@ class TestRoundTrip(unittest.TestCase):
             loaded = SelectionManifest.load(path)
             self.assertEqual(loaded.selections[0].spec.size, (20, 16))
 
+    def test_load_accepts_the_directory_save_selection_was_given(self):
+        m = _mk_manifest([(0, (25.0, 30.0), (20, 16), 10.0, "A")])
+        with tempfile.TemporaryDirectory() as d:
+            path = save_selection(m, d)
+            self.assertEqual(
+                SelectionManifest.load(d).to_dict(),
+                SelectionManifest.load(path).to_dict(),
+            )
+
     def test_save_writes_previews(self):
         m = _mk_manifest([(0, (25.0, 30.0), (20, 16), 10.0, "A")])
         with tempfile.TemporaryDirectory() as d:

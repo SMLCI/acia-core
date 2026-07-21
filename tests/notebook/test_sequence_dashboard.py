@@ -46,12 +46,35 @@ _AXIS_ALIGNED = [[0, 0], [10, 0], [10, 8], [0, 8]]  # 4 corners -> angle ~0
 class TestConstruct(unittest.TestCase):
     def test_traits_populated(self):
         with tempfile.TemporaryDirectory() as d:
-            dash = SequenceDashboard(open_sequence(_tif(d)))
+            path = _tif(d)
+            dash = SequenceDashboard(open_sequence(path))
             self.assertEqual(dash.metadata["num_positions"], 1)
             self.assertEqual(dash.metadata["num_timepoints"], 3)
             self.assertEqual(len(dash.positions), 1)
             self.assertEqual(dash.selections, [])
             self.assertEqual(dash.roi_mode, "single")
+            self.assertTrue(dash.auto_save)
+
+    def test_metadata_carries_source_identity(self):
+        """The header's read-only Source field renders ``metadata['path']``."""
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif(d)
+            dash = SequenceDashboard(open_sequence(path))
+            self.assertEqual(dash.metadata["path"], str(path))
+            self.assertTrue(dash.metadata["format"])
+
+    def test_metadata_path_falls_back_for_in_memory_source(self):
+        """Synthetic/in-memory sources are only SequenceFile-*compatible*."""
+        with tempfile.TemporaryDirectory() as d:
+            seqfile = open_sequence(_tif(d))
+
+            class _NoPath:
+                metadata = seqfile.metadata
+                positions = seqfile.positions
+
+            dash = SequenceDashboard(_NoPath())
+            self.assertEqual(dash.metadata["path"], "")
+            self.assertEqual(dash.metadata["format"], "")
 
     def test_construct_from_path_and_mode(self):
         with tempfile.TemporaryDirectory() as d:
@@ -182,6 +205,23 @@ class TestManifestAndSave(unittest.TestCase):
             reloaded = SelectionManifest.load(path)
             self.assertEqual(reloaded.selections[0].label, "colony A")
 
+    def test_save_dir_is_the_default_output(self):
+        """Auto-save calls ``save()`` with no argument -- it must land in save_dir."""
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "curation"
+            dash = SequenceDashboard(open_sequence(_tif(d)), save_dir=out)
+            dash.selections = [self._SEL]
+            self.assertEqual(Path(dash.save()), out / "selection.json")
+
+    def test_explicit_directory_beats_save_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "curation"
+            other = Path(d) / "elsewhere"
+            dash = SequenceDashboard(open_sequence(_tif(d)), save_dir=out)
+            dash.selections = [self._SEL]
+            self.assertEqual(Path(dash.save(other)), other / "selection.json")
+            self.assertFalse((out / "selection.json").exists())
+
 
 class TestResume(unittest.TestCase):
     _SELS = [
@@ -229,6 +269,17 @@ class TestResume(unittest.TestCase):
             _tif_path, out = self._saved(d)
             resumed = SequenceDashboard.resume(out / "selection.json")
             self.assertEqual(len(resumed.selections), 2)
+
+    def test_resume_keeps_saving_where_it_resumed_from(self):
+        with tempfile.TemporaryDirectory() as d:
+            _tif_path, out = self._saved(d)
+            self.assertEqual(
+                Path(SequenceDashboard.resume(out).save()), out / "selection.json"
+            )
+            self.assertEqual(
+                Path(SequenceDashboard.resume(out / "selection.json").save()),
+                out / "selection.json",
+            )
 
     def test_resume_roi_mode_override(self):
         with tempfile.TemporaryDirectory() as d:

@@ -107,8 +107,18 @@ class SelectionManifest:
 
     @classmethod
     def load(cls, path: str | os.PathLike) -> SelectionManifest:
-        """Read a manifest from a ``selection.json`` file."""
-        with open(os.fspath(path), encoding="utf-8") as fh:
+        """Read a manifest from a ``selection.json`` file.
+
+        Args:
+            path: The ``selection.json`` file, or the directory containing it —
+                i.e. the same directory :func:`save_selection` was given, so a
+                caller can round-trip an output dir without restating the
+                filename.
+        """
+        path = os.fspath(path)
+        if os.path.isdir(path):
+            path = os.path.join(path, "selection.json")
+        with open(path, encoding="utf-8") as fh:
             return cls.from_dict(json.load(fh))
 
 
