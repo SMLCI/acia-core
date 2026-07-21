@@ -28,6 +28,11 @@ class FlowposeRTSegmenter(SegmentationProcessor):
     frames bigger than flowpose-rt's ~224px tile size costs more memory per image
     than single-frame calls would. Lower ``batch_size`` if memory is a concern for
     large frames.
+
+    ``weights_path`` selects a local checkpoint instead of the downloaded zoo
+    weights (e.g. a fine-tuned model). ``model`` is still required in that case:
+    it names the zoo entry whose preprocessing contract (channel count, channel
+    mapping, default tolerance) the checkpoint follows.
     """
 
     def __init__(
@@ -38,6 +43,7 @@ class FlowposeRTSegmenter(SegmentationProcessor):
         compile=None,  # noqa: A002 - mirrors flowpose_rt.Segmenter's own kwarg name
         autorelease: bool = True,
         batch_size: int = 20,
+        weights_path=None,
     ):
         super().__init__(autorelease=autorelease)
         self.model_spec = model
@@ -45,9 +51,21 @@ class FlowposeRTSegmenter(SegmentationProcessor):
         self.precision = precision
         self.compile = compile
         self.batch_size = batch_size
+        self.weights_path = weights_path
 
     def _load_model(self):
         import flowpose_rt as ort
+
+        if self.weights_path is not None:
+            # from_path never downloads and never checksums; model_spec supplies
+            # the preprocessing contract the local checkpoint is assumed to match
+            return ort.Segmenter.from_path(
+                self.weights_path,
+                model_type=self.model_spec,
+                device=self.device,
+                precision=self.precision,
+                compile=self.compile,
+            )
 
         return ort.Segmenter(
             model=self.model_spec,

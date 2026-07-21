@@ -16,6 +16,9 @@ section to a dated version entry automatically.
   cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.
   Processes frames in configurable batches (`batch_size`, default 20) with a
   `tqdm` progress bar, matching `OmniposeSegmenter`'s existing behavior.
+  `weights_path=...` loads a local checkpoint (e.g. a fine-tuned model) instead of
+  the downloaded zoo weights; `model` then names the zoo entry whose preprocessing
+  contract the checkpoint follows.
 - `ImageSequenceSource.to_channel(c)`: a generic lazy single-channel view
   (equivalent to `self[..., c]`), now available on every source implementation
   (e.g. `LocalSequenceSource`), not just `THWCSequenceSource`.

@@ -32,14 +32,28 @@ class _FakeSegmenter:
         return masks
 
 
+class _FakeSegmenterFactory:
+    """Callable stand-in for ``flowpose_rt.Segmenter`` that also has ``from_path``."""
+
+    def __init__(self, built_with, built_from_path):
+        self._built_with = built_with
+        self._built_from_path = built_from_path
+
+    def __call__(self, model, device, precision, compile):  # noqa: A002
+        self._built_with.append((model, device, precision, compile))
+        return _FakeSegmenter(model, device, precision, compile)
+
+    def from_path(self, path, model_type, device, precision, compile):  # noqa: A002
+        self._built_from_path.append((path, model_type, device, precision, compile))
+        return _FakeSegmenter(model_type, device, precision, compile)
+
+
 class _FakeFlowposeRTModule(types.ModuleType):
     def __init__(self):
         super().__init__("flowpose_rt")
         self.built_with = []
-
-    def Segmenter(self, model, device, precision, compile):  # noqa: A002
-        self.built_with.append((model, device, precision, compile))
-        return _FakeSegmenter(model, device, precision, compile)
+        self.built_from_path = []
+        self.Segmenter = _FakeSegmenterFactory(self.built_with, self.built_from_path)
 
 
 class TestFlowposeRTSegmenter(unittest.TestCase):
@@ -104,6 +118,27 @@ class TestFlowposeRTSegmenter(unittest.TestCase):
             [(2, 16, 16), (2, 16, 16), (1, 16, 16)],
         )
         self.assertEqual(overlay.numFrames(), 5)
+
+    def test_weights_path_loads_local_checkpoint(self):
+        """weights_path -> Segmenter.from_path (no download), model names the contract."""
+        processor = FlowposeRTSegmenter(
+            model="bact_phase_omni",
+            device="cpu",
+            precision="fp32",
+            compile=False,
+            weights_path="/tmp/finetuned.pth",
+        )
+        image = np.zeros((2, 20, 20, 1), dtype=np.uint8)
+        source = THWCSequenceSource(image)
+
+        overlay = processor(source)
+
+        self.assertEqual(
+            self._fake_module.built_from_path,
+            [("/tmp/finetuned.pth", "bact_phase_omni", "cpu", "fp32", False)],
+        )
+        self.assertEqual(self._fake_module.built_with, [])
+        self.assertEqual(overlay.numFrames(), 2)
 
     def test_multi_channel_input_raises(self):
         processor = FlowposeRTSegmenter(device="cpu")
