@@ -78,6 +78,75 @@ def test_local_path_normalize_image_false_preserves_raw_dtype_and_channel(tmp_pa
     assert src.num_channels == 1
 
 
+def test_stack_is_decoded_once_and_cached(tmp_path):
+    """tifffile.imread decodes the whole file -- it must happen at most once.
+
+    Regression: get_frame() re-read (and re-allocated) the full stack on every
+    call, so a T-frame source did T full decodes.
+    """
+    stack = _make_stack(num_frames=5)
+    path = tmp_path / "stack.tif"
+    tifffile.imwrite(str(path), stack)
+
+    src = LocalSequenceSource(str(path), normalize_image=False)
+    decodes = []
+    original = LocalSequenceSource._read_images
+
+    def counting(self):
+        if self._images is None:
+            decodes.append(1)
+        return original(self)
+
+    LocalSequenceSource._read_images = counting
+    try:
+        assert src.size_t == 5
+        for i in range(src.size_t):
+            src.get_frame(i)
+        mat = src.materialize()
+    finally:
+        LocalSequenceSource._read_images = original
+
+    assert len(decodes) == 1
+    np.testing.assert_array_equal(mat.image_stack[..., 0], stack)
+
+    # close() drops the cache; the source stays usable (and re-decodes once)
+    src.close()
+    assert src._images is None
+    assert src.get_frame(0).raw.shape == (8, 8, 1)
+
+
+def test_materialize_does_not_retain_parent_buffers(tmp_path):
+    """materialize() must copy frames, not keep views into the decoded stack."""
+    stack = _make_uint16_stack(num_frames=4)
+    path = tmp_path / "stack16.tif"
+    tifffile.imwrite(str(path), stack)
+
+    src = LocalSequenceSource(str(path), normalize_image=False)
+    mat = src.materialize()
+
+    assert mat.image_stack.shape == (4, 8, 8, 1)
+    np.testing.assert_array_equal(mat.image_stack[..., 0], stack)
+    # writing through the materialized copy must not touch the source's stack
+    mat.image_stack[0, 0, 0, 0] = 0
+    assert src.get_frame(0).raw[0, 0, 0] == stack[0, 0, 0]
+
+
+def test_luts_do_not_corrupt_the_cached_stack(tmp_path):
+    """LUTs are applied in place -- on a copy, never on the cached decode."""
+    stack = _make_stack(num_frames=2)
+    path = tmp_path / "stack.tif"
+    tifffile.imwrite(str(path), stack)
+
+    src = LocalSequenceSource(
+        str(path), normalize_image=False, luts=[lambda img: img // 2]
+    )
+    first = [f.raw.copy() for f in src]
+    second = [f.raw.copy() for f in src]
+
+    for a, b in zip(first, second, strict=True):
+        np.testing.assert_array_equal(a, b)  # not halved twice on the 2nd pass
+
+
 def test_memory_backend_end_to_end():
     """The non-local fsspec path (same code SAMBA uses) reads a TIFF correctly."""
     stack = _make_stack(num_frames=2)

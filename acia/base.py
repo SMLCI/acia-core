@@ -61,6 +61,7 @@ class Instance:
         self.time = None  # pint timestamp, set when the overlay carries a time model
 
         self._polygon = None
+        self._center: tuple[float, float] | None = None
 
     @property
     def binary_mask(self):
@@ -70,12 +71,17 @@ class Instance:
     def center(self):
         # compute (x,y) center on pixel level
 
-        bin_mask = self.binary_mask
+        # cached: deriving the center touches the full-frame mask, and callers
+        # (e.g. viz.render_tracking) ask for it once per edge per frame
+        if self._center is None:
+            bin_mask = self.binary_mask
 
-        x = np.median(np.nonzero(np.max(bin_mask, axis=0)))
-        y = np.median(np.nonzero(np.max(bin_mask, axis=1)))
+            x = np.median(np.nonzero(np.max(bin_mask, axis=0)))
+            y = np.median(np.nonzero(np.max(bin_mask, axis=1)))
 
-        return (x, y)
+            self._center = (x, y)
+
+        return self._center
 
     @property
     def area(self) -> float:
@@ -856,6 +862,13 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
         ``pixel_size``/``timepoints``. This trades RAM for repeated warp/IO CPU
         and lets a large parent be released once a small ROI has been extracted.
 
+        Frames are copied into a pre-allocated output array one at a time
+        instead of being collected in a list first: a frame's ``raw`` is often
+        only a *view* into a much larger parent buffer (a slice of a stack, a
+        channel selection, a freshly decoded file), and holding all ``T`` views
+        alive at once would pin ``T`` parent buffers in memory. Peak usage here
+        is the output array plus a single frame.
+
         Returns:
             THWCSequenceSource: An in-memory source independent of any parent.
         """
@@ -863,9 +876,25 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
 
         if self.size_t == 0:
             raise ValueError("Cannot materialize an empty source (size_t == 0).")
-        arr = np.stack([np.asarray(self.get_frame(i).raw) for i in range(self.size_t)])
-        if arr.ndim == 3:  # (T, H, W) grayscale -> (T, H, W, 1)
-            arr = arr[..., None]
+
+        def _frame(i):
+            raw = np.asarray(self.get_frame(i).raw)
+            return raw[..., None] if raw.ndim == 2 else raw  # (H, W) -> (H, W, 1)
+
+        first = _frame(0)
+        arr = np.empty((self.size_t, *first.shape), dtype=first.dtype)
+        arr[0] = first
+        del first
+        for i in range(1, self.size_t):
+            frame = _frame(i)
+            if frame.shape != arr.shape[1:]:
+                # np.stack used to catch this; assignment alone would broadcast
+                raise ValueError(
+                    f"Frame {i} has shape {frame.shape}, expected {arr.shape[1:]}; "
+                    "cannot materialize a source with inhomogeneous frames."
+                )
+            arr[i] = frame
+
         return THWCSequenceSource(
             arr, timepoints=self.timepoints, pixel_size=self.pixel_size
         )

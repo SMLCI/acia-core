@@ -342,6 +342,8 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         self._user_timepoints = timepoints
         self._calibration_resolved = False
         self._calibration_source: str | None = None
+        # decoded stack, cached on first read (see _read_images/close)
+        self._images: np.ndarray | None = None
 
     def _ensure_calibration(self) -> None:
         """Resolve calibration once: user override > file metadata > None.
@@ -391,16 +393,30 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         return self._calibration_source
 
     def _read_images(self):
-        """Read the image stack via fsspec (works for local and remote URLs)."""
-        opts = resolve_storage_options(self.filename, self.storage_options)
-        with fsspec.open(self.filename, mode="rb", **opts) as f:
-            return tifffile.imread(f)
+        """Read the image stack via fsspec (works for local and remote URLs).
+
+        The decoded stack is cached on the source: ``tifffile.imread`` decodes
+        the *whole* file, so re-reading it per frame made ``get_frame`` (and
+        anything built on it, e.g. ``materialize``) do ``T`` full decodes and
+        allocate ``T`` full stacks. Call :meth:`close` to drop the cache.
+        """
+        if self._images is None:
+            opts = resolve_storage_options(self.filename, self.storage_options)
+            with fsspec.open(self.filename, mode="rb", **opts) as f:
+                self._images = tifffile.imread(f)
+        return self._images
+
+    def close(self) -> None:
+        """Release the cached decoded stack (the source stays usable)."""
+        self._images = None
 
     def __iter__(self):
         images = self._read_images()
 
         for image in images:
             if self.luts is not None:
+                # LUTs are applied in-place below -- never onto the cached stack
+                image = np.array(image)
                 if len(image.shape) == 2:
                     # just a single channel
                     num_image_channels = 1
@@ -426,8 +442,7 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
             yield LocalImage(image)
 
     def get_frame(self, frame: int) -> BaseImage:
-        # TODO: this is super slow access for indiviudal images
-        images = self._read_images()
+        images = self._read_images()  # decoded once, then cached
         assert frame < len(images)
 
         return LocalImage(prepare_image(images[frame], self.normalize_image))
