@@ -1714,3 +1714,73 @@ def plotly_cell_lineage(
         title=figure_title, height=fig_height, width=fig_width, plot_bgcolor="white"
     )
     return fig
+
+
+# ========== TRACKLET (CELL-CYCLE) LINEAGE ==========
+def tracklet_graph_to_segments(tracklet_graph: nx.DiGraph) -> nx.DiGraph:
+    """Reshape a tracklet graph into a "one line per cell cycle" segment graph.
+
+    :func:`plotly_cell_lineage`/:func:`plot_cell_lineage` (and their shared
+    layout helpers :func:`compute_lineage_y`/:func:`extract_lineage_plotdata`)
+    only require a graph where every node carries a unique id and a scalar
+    ``time_feature`` attribute -- they know nothing about tracklets. This
+    function bridges that gap by turning each tracklet node ``n`` (with
+    ``start_frame``/``end_frame`` int attributes, as produced by e.g.
+    :func:`acia.tracking.formats.read_ctc_tracklet_graph`) into **two** point
+    nodes, so a tracklet becomes a single line segment from its start to its
+    end and a division becomes a branch from a parent segment's end-point to
+    each child segment's start-point.
+
+    Args:
+        tracklet_graph: one node per tracklet, keyed by an arbitrary hashable
+            label (e.g. the CTC integer label), with ``start_frame``/
+            ``end_frame`` int attributes; edges ``parent -> child`` encode a
+            division.
+
+    Returns:
+        A new :class:`networkx.DiGraph` where each input node ``n`` becomes
+        ``(n, "start")`` and ``(n, "end")``, each carrying a ``"frame"`` int
+        attribute (``start_frame``/``end_frame`` respectively). One
+        intra-tracklet edge ``(n, "start") -> (n, "end")`` per tracklet, and
+        one inter-tracklet edge ``(n, "end") -> (child, "start")`` for every
+        division edge ``n -> child`` in the input. Suitable for
+        ``plotly_cell_lineage(segments, time_feature="frame")`` with zero
+        changes to that function.
+    """
+    segments = nx.DiGraph()
+
+    for n, attrs in tracklet_graph.nodes(data=True):
+        segments.add_node((n, "start"), frame=attrs["start_frame"])
+        segments.add_node((n, "end"), frame=attrs["end_frame"])
+        segments.add_edge((n, "start"), (n, "end"))
+
+    for parent, child in tracklet_graph.edges:
+        segments.add_edge((parent, "end"), (child, "start"))
+
+    return segments
+
+
+def plot_tracklet_lineage(tracklet_graph: nx.DiGraph, **kwargs):
+    """Render a tracklet graph as a lineage tree with one line per cell cycle.
+
+    One-line convenience wrapper hiding :func:`tracklet_graph_to_segments`
+    behind a single call to the existing, unmodified
+    :func:`plotly_cell_lineage`. ``time_feature`` is fixed to ``"frame"``
+    (matching what the reshape produces) and is not caller-overridable; a
+    caller who also passes ``time_feature=`` gets Python's own "got multiple
+    values for keyword argument" ``TypeError``, which is the correct,
+    sufficient failure mode here.
+
+    Args:
+        tracklet_graph: see :func:`tracklet_graph_to_segments`.
+        **kwargs: forwarded to :func:`plotly_cell_lineage` unchanged (e.g.
+            ``orientation``, ``show_label``, ``node_color_by``,
+            ``mark_births``).
+
+    Returns:
+        The :class:`plotly.graph_objects.Figure` produced by
+        :func:`plotly_cell_lineage`.
+    """
+    return plotly_cell_lineage(
+        tracklet_graph_to_segments(tracklet_graph), time_feature="frame", **kwargs
+    )
