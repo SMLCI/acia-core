@@ -609,6 +609,8 @@ def render_video(
     filename: str,
     framerate: int = 10,
     codec: str = "libx264",
+    pixelformat: str = "yuv420p",
+    macro_block_size: int = 2,
     ffmpeg_params: list[str] | None = None,
 ) -> None:
     """Render video
@@ -618,10 +620,26 @@ def render_video(
         filename (str): video filename
         framerate (int): framerate of the video
         codec (str): the codec for video encoding
+        pixelformat (str): output pixel format. "yuv420p" is required by most
+            browsers/players (e.g. Firefox rejects other chroma subsampling).
+        macro_block_size (int): frame dimensions are padded up to a multiple of
+            this value. imageio's own default of 16 stretches typical
+            (already-even) frame sizes noticeably; 2 is the minimum yuv420p
+            allows and avoids that visible distortion.
+        ffmpeg_params (list[str] | None): extra output ffmpeg arguments, applied
+            in addition to "-movflags +faststart" (which moves the moov atom to
+            the front of the file so it plays back in browsers instead of
+            failing to load).
     """
 
     with iio.get_writer(
-        filename, fps=framerate, codec=codec, ffmpeg_params=ffmpeg_params
+        filename,
+        fps=framerate,
+        codec=codec,
+        pixelformat=pixelformat,
+        macro_block_size=macro_block_size,
+        output_params=["-movflags", "+faststart"],
+        ffmpeg_params=ffmpeg_params,
     ) as writer:
         for im in tqdm(image_source, desc="Encoding video..."):
             image = im.raw
