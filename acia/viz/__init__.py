@@ -31,6 +31,9 @@ from acia import ureg
 from acia.base import BaseImage, ImageSequenceSource, Instance, Overlay
 from acia.segm.local import InMemorySequenceSource, LocalImage, THWCSequenceSource
 
+from .compose import ComposedSequenceSource as ComposedSequenceSource
+from .compose import compose_sequences as compose_sequences
+from .compose import label_sequence as label_sequence
 from .utils import strfdelta
 
 # loda the deja vu sans default font
@@ -1662,10 +1665,17 @@ def plotly_cell_lineage(
     show_colorbar: bool = True,
     show_legend: bool = True,
     colorbar_title: str | None = None,  # NEW: numeric colorbar title
+    time_axis_label: str | None = None,  # override the time-axis title
 ):
     """
     Plot a cell lineage tree as an interactive Plotly chart.
     Node hover shows all features as a readable (monospace) "pseudo-table".
+
+    ``time_axis_label`` overrides the title on whichever axis encodes
+    ``time_feature`` (x when horizontal, y when vertical). When it is ``None``
+    (the default), the title is auto-derived: ``f"Time [{unit}]"`` when the
+    graph carries a ``graph["time_unit"]`` (as stamped by the tracker when the
+    source was time-calibrated), else plain ``"Time"``.
     """
     assigned_y = compute_lineage_y(G, time_feature)
     data = extract_lineage_plotdata(
@@ -1827,13 +1837,21 @@ def plotly_cell_lineage(
             )
         )
 
-    # axes & layout
+    # axes & layout. Auto-label the time axis with the graph's own unit (set by
+    # the tracker when it stamped real time on the nodes, e.g. "min"), unless the
+    # caller gave an explicit override.
+    if time_axis_label is not None:
+        time_title = time_axis_label
+    elif G.graph.get("time_unit"):
+        time_title = f"Time [{G.graph['time_unit']}]"
+    else:
+        time_title = "Time"
     if orientation == "horizontal":
-        fig.update_xaxes(title="Time")
+        fig.update_xaxes(title=time_title)
         fig.update_yaxes(title="Lineage")
     else:
         fig.update_xaxes(title="Lineage")
-        fig.update_yaxes(title="Time", autorange="reversed")
+        fig.update_yaxes(title=time_title, autorange="reversed")
     fig.update_layout(
         title=figure_title, height=fig_height, width=fig_width, plot_bgcolor="white"
     )
@@ -1861,25 +1879,47 @@ def tracklet_graph_to_segments(tracklet_graph: nx.DiGraph) -> nx.DiGraph:
             ``end_frame`` int attributes; edges ``parent -> child`` encode a
             division.
 
+    When the tracklet graph carries real time on its nodes -- ``start_time``/
+    ``end_time`` float attributes plus a ``graph["time_unit"]``, as stamped by
+    :func:`acia.tracking.annotate_tracklet_times` at tracking time -- those are
+    forwarded to the point nodes' ``"time"`` attribute (and the unit copied to
+    ``segments.graph["time_unit"]``), so the lineage lays out on a real-time
+    axis with no extra input. Otherwise only ``"frame"`` is carried.
+
     Returns:
         A new :class:`networkx.DiGraph` where each input node ``n`` becomes
         ``(n, "start")`` and ``(n, "end")``, each carrying a ``"frame"`` int
-        attribute (``start_frame``/``end_frame`` respectively). One
+        attribute (``start_frame``/``end_frame`` respectively) and, when the
+        input carried real time, a ``"time"`` float attribute. One
         intra-tracklet edge ``(n, "start") -> (n, "end")`` per tracklet, and
         one inter-tracklet edge ``(n, "end") -> (child, "start")`` for every
         division edge ``n -> child`` in the input. Suitable for
-        ``plotly_cell_lineage(segments, time_feature="frame")`` with zero
-        changes to that function.
+        ``plotly_cell_lineage(segments, time_feature="frame")`` (or
+        ``time_feature="time"`` when the input carried real time).
     """
     segments = nx.DiGraph()
 
+    # Real time is present iff every tracklet node carries start_time/end_time.
+    has_time = tracklet_graph.number_of_nodes() > 0 and all(
+        "start_time" in a and "end_time" in a
+        for _, a in tracklet_graph.nodes(data=True)
+    )
+
     for n, attrs in tracklet_graph.nodes(data=True):
-        segments.add_node((n, "start"), frame=attrs["start_frame"])
-        segments.add_node((n, "end"), frame=attrs["end_frame"])
+        start_attrs = {"frame": attrs["start_frame"]}
+        end_attrs = {"frame": attrs["end_frame"]}
+        if has_time:
+            start_attrs["time"] = attrs["start_time"]
+            end_attrs["time"] = attrs["end_time"]
+        segments.add_node((n, "start"), **start_attrs)
+        segments.add_node((n, "end"), **end_attrs)
         segments.add_edge((n, "start"), (n, "end"))
 
     for parent, child in tracklet_graph.edges:
         segments.add_edge((parent, "end"), (child, "start"))
+
+    if has_time and "time_unit" in tracklet_graph.graph:
+        segments.graph["time_unit"] = tracklet_graph.graph["time_unit"]
 
     return segments
 
@@ -1888,23 +1928,31 @@ def plot_tracklet_lineage(tracklet_graph: nx.DiGraph, **kwargs):
     """Render a tracklet graph as a lineage tree with one line per cell cycle.
 
     One-line convenience wrapper hiding :func:`tracklet_graph_to_segments`
-    behind a single call to the existing, unmodified
-    :func:`plotly_cell_lineage`. ``time_feature`` is fixed to ``"frame"``
-    (matching what the reshape produces) and is not caller-overridable; a
-    caller who also passes ``time_feature=`` gets Python's own "got multiple
-    values for keyword argument" ``TypeError``, which is the correct,
-    sufficient failure mode here.
+    behind a single call to :func:`plotly_cell_lineage`. ``time_feature`` is
+    selected automatically -- ``"time"`` when the tracklet graph carries real
+    time (``start_time``/``end_time``, as stamped by
+    :func:`acia.tracking.annotate_tracklet_times`), else ``"frame"`` -- and is
+    not caller-overridable; a caller who also passes ``time_feature=`` gets
+    Python's own "got multiple values for keyword argument" ``TypeError``,
+    which is the correct, sufficient failure mode here. When real time is
+    present, the axis is auto-labelled from the graph's ``time_unit``.
 
     Args:
         tracklet_graph: see :func:`tracklet_graph_to_segments`.
         **kwargs: forwarded to :func:`plotly_cell_lineage` unchanged (e.g.
             ``orientation``, ``show_label``, ``node_color_by``,
-            ``mark_births``).
+            ``mark_births``, ``time_axis_label``).
 
     Returns:
         The :class:`plotly.graph_objects.Figure` produced by
         :func:`plotly_cell_lineage`.
     """
+    segments = tracklet_graph_to_segments(tracklet_graph)
+    time_feature = (
+        "time" if any("time" in a for _, a in segments.nodes(data=True)) else "frame"
+    )
     return plotly_cell_lineage(
-        tracklet_graph_to_segments(tracklet_graph), time_feature="frame", **kwargs
+        segments,
+        time_feature=time_feature,
+        **kwargs,
     )

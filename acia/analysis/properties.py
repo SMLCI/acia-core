@@ -34,11 +34,14 @@ def _axis_label(prop: str, units: dict[str, pint.Unit] | None) -> str:
             absent (or ``units`` is ``None``), no unit suffix is added.
 
     Returns:
-        ``f"{prop} [{units[prop]:~L}]"`` when a unit is known, else the bare
-        ``prop`` name.
+        ``f"{prop} [{units[prop]:~P}]"`` when a unit is known, else the bare
+        ``prop`` name. The ``~P`` (pretty) pint format yields Unicode (e.g.
+        ``µm²``) that matplotlib renders directly; ``~L`` (LaTeX) is avoided
+        because matplotlib only interprets LaTeX inside ``$...$`` and would
+        otherwise show the raw ``\\mathrm{...}`` markup.
     """
     if units is not None and prop in units:
-        return f"{prop} [{units[prop]:~L}]"
+        return f"{prop} [{units[prop]:~P}]"
     return prop
 
 
@@ -163,14 +166,18 @@ def plot_property_histograms(
                 ax_before.set_ylabel("before")
                 ax_after.set_ylabel("after")
 
-            if log_y:
-                ax_before.set_yscale("log")
-                ax_after.set_yscale("log")
+            for ax in (ax_before, ax_after):
+                ax.grid(True, linestyle=":", alpha=0.4)
+                ax.set_axisbelow(True)
+                if log_y:
+                    ax.set_yscale("log")
         else:
             ax = axes[0, j]
             ax.hist(before_arrays[j], bins=prop_bins, density=True)
             ax.set_title(prop)
             ax.set_xlabel(_axis_label(prop, units))
+            ax.grid(True, linestyle=":", alpha=0.4)
+            ax.set_axisbelow(True)
             if log_y:
                 ax.set_yscale("log")
 

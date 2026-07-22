@@ -72,6 +72,31 @@ class TestTrackletGraphToSegments(unittest.TestCase):
         fig = plotly_cell_lineage(segments, time_feature="frame")
         self.assertIsInstance(fig, go.Figure)
 
+    def test_start_end_time_attaches_real_time(self):
+        # tracklet nodes carrying real time (as stamped by
+        # annotate_tracklet_times) forward it to the point nodes' "time" attr
+        g = build_tracklet_graph()
+        for _n, a in g.nodes(data=True):
+            a["start_time"] = a["start_frame"] * 5.0
+            a["end_time"] = a["end_frame"] * 5.0
+        g.graph["time_unit"] = "min"
+
+        segments = tracklet_graph_to_segments(g)
+
+        # frame attribute is still present, plus a real-time "time" attribute
+        self.assertEqual(segments.nodes[(5, "start")]["frame"], 0)
+        self.assertEqual(segments.nodes[(5, "start")]["time"], 0.0)
+        self.assertEqual(segments.nodes[(5, "end")]["time"], 15.0)
+        self.assertEqual(segments.nodes[(6, "end")]["time"], 35.0)
+        # graph-level unit is forwarded so the axis can auto-label
+        self.assertEqual(segments.graph["time_unit"], "min")
+
+    def test_no_time_attribute_without_start_end_time(self):
+        g = build_tracklet_graph()
+        segments = tracklet_graph_to_segments(g)
+        self.assertNotIn("time", segments.nodes[(5, "start")])
+        self.assertNotIn("time_unit", segments.graph)
+
 
 class TestPlotTrackletLineage(unittest.TestCase):
     """Wrapper's one-call render and kwargs forwarding."""
@@ -105,6 +130,30 @@ class TestPlotTrackletLineage(unittest.TestCase):
         g = build_tracklet_graph()
         with self.assertRaises(TypeError):
             plot_tracklet_lineage(g, time_feature="frame")
+
+    def test_real_time_drives_axis_and_autolabels(self):
+        g = build_tracklet_graph()
+        for _n, a in g.nodes(data=True):
+            a["start_time"] = a["start_frame"] * 5.0
+            a["end_time"] = a["end_frame"] * 5.0
+        g.graph["time_unit"] = "min"
+
+        fig = plot_tracklet_lineage(g)
+        self.assertIsInstance(fig, go.Figure)
+        # axis auto-labels from the graph's unit -- no caller input needed
+        self.assertEqual(fig.layout.xaxis.title.text, "Time [min]")
+        # x positions span real minutes (max end_frame 7 -> 35 min), not the
+        # raw frame indices (max 7)
+        max_x = max(x for trace in fig.data if trace.x is not None for x in trace.x)
+        self.assertEqual(max_x, 35.0)
+
+    def test_falls_back_to_frame_without_time(self):
+        g = build_tracklet_graph()
+        fig = plot_tracklet_lineage(g)
+        # no real time -> generic "Time" title and frame-indexed x positions
+        self.assertEqual(fig.layout.xaxis.title.text, "Time")
+        max_x = max(x for trace in fig.data if trace.x is not None for x in trace.x)
+        self.assertEqual(max_x, 7.0)
 
 
 if __name__ == "__main__":

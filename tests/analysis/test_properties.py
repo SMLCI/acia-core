@@ -120,14 +120,29 @@ class TestPlotPropertyHistograms(unittest.TestCase):
             self.assertEqual(ax.get_yscale(), "linear")
         plt.close(fig2)
 
-    def test_units_formatting_uses_pint_latex(self):
+    def test_units_formatting_uses_pint_pretty_unicode(self):
+        # ~P (pretty Unicode, e.g. "µm²") is used rather than ~L (LaTeX):
+        # matplotlib only interprets LaTeX inside $...$, so a raw ~L string would
+        # render as literal "\mathrm{...}" markup on the axis.
         df = _make_df(200, seed=8, area=100.0)
         area_unit = ureg.Unit("micrometer ** 2")
         fig = plot_property_histograms(df, ["area"], units={"area": area_unit})
         label = fig.axes[0].get_xlabel()
-        self.assertIn(f"{area_unit:~L}", label)
+        self.assertIn(f"{area_unit:~P}", label)
+        self.assertNotIn("\\mathrm", label)
         self.assertTrue(label.startswith("area ["))
         plt.close(fig)
+
+    def test_axes_have_grid(self):
+        # every subplot gets a readability grid, both single-row and
+        # before/after (two-row) layouts
+        df = _make_df(200, seed=11, area=100.0)
+        for kwargs in ({}, {"df_after": _make_df(80, seed=12, area=100.0)}):
+            fig = plot_property_histograms(df, ["area"], **kwargs)
+            for ax in fig.axes:
+                self.assertTrue(any(line.get_visible() for line in ax.get_xgridlines()))
+                self.assertTrue(any(line.get_visible() for line in ax.get_ygridlines()))
+            plt.close(fig)
 
     def test_units_missing_falls_back_to_bare_property_name(self):
         df = _make_df(200, seed=9, area=100.0, length=20.0)
@@ -263,12 +278,12 @@ class TestAcceptanceCriteria(unittest.TestCase):
         self.assertEqual(length_before.get_ylim(), length_after.get_ylim())
         plt.close(fig)
 
-    def test_units_dict_from_extractor_execute_style_produces_latex_label(self):
+    def test_units_dict_from_extractor_execute_style_produces_unicode_label(self):
         df = _make_df(100, seed=22, area=100.0)
         ex_units = {"area": ureg.Unit("micrometer ** 2")}
         fig = plot_property_histograms(df, ["area"], units=ex_units)
         label = fig.axes[0].get_xlabel()
-        self.assertIn(f"{ex_units['area']:~L}", label)
+        self.assertIn(f"{ex_units['area']:~P}", label)
         plt.close(fig)
 
 

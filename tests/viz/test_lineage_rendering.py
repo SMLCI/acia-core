@@ -123,6 +123,44 @@ class TestLineageRendering(unittest.TestCase):
 
         self.assertTrue(Path("lineage.html").exists())
 
+    def test_time_axis_label_override(self):
+        G = build_lineage_large(n_cells=16, max_branches=2, max_time=6)
+
+        # default: time axis titled "Time"
+        default_fig = plotly_cell_lineage(G, orientation="horizontal")
+        self.assertEqual(default_fig.layout.xaxis.title.text, "Time")
+
+        # override: custom unit-labelled title on the time (x) axis
+        labelled_fig = plotly_cell_lineage(
+            G, orientation="horizontal", time_axis_label="Time [min]"
+        )
+        self.assertEqual(labelled_fig.layout.xaxis.title.text, "Time [min]")
+        # the non-time axis is untouched
+        self.assertEqual(labelled_fig.layout.yaxis.title.text, "Lineage")
+
+    def test_time_axis_autolabels_from_graph_time_unit(self):
+        # a graph that carries its own time unit auto-labels the axis, with no
+        # explicit time_axis_label from the caller
+        G = build_lineage_large(n_cells=16, max_branches=2, max_time=6)
+        G.graph["time_unit"] = "min"
+        fig = plotly_cell_lineage(G, orientation="horizontal")
+        self.assertEqual(fig.layout.xaxis.title.text, "Time [min]")
+
+        # an explicit override still wins over the graph unit
+        fig2 = plotly_cell_lineage(
+            G, orientation="horizontal", time_axis_label="elapsed"
+        )
+        self.assertEqual(fig2.layout.xaxis.title.text, "elapsed")
+
+    def test_time_axis_label_override_vertical(self):
+        G = build_lineage_large(n_cells=16, max_branches=2, max_time=6)
+        fig = plotly_cell_lineage(
+            G, orientation="vertical", time_axis_label="Time [min]"
+        )
+        # vertical orientation puts time on the y axis
+        self.assertEqual(fig.layout.yaxis.title.text, "Time [min]")
+        self.assertEqual(fig.layout.xaxis.title.text, "Lineage")
+
 
 if __name__ == "__main__":
     unittest.main()

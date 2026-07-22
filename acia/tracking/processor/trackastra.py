@@ -12,7 +12,7 @@ from trackastra.tracking import graph_to_ctc
 from acia.attribute import attribute_tracking
 from acia.base import ImageSequenceSource, Overlay
 from acia.segm.formats import read_ctc_segmentation_native
-from acia.tracking import ctc_track_graph
+from acia.tracking import annotate_tracklet_times, ctc_track_graph
 from acia.tracking.formats import read_ctc_tracklet_graph
 
 from . import TrackingProcessor
@@ -59,6 +59,17 @@ class TrackastraTracker(TrackingProcessor):
 
             ov = read_ctc_segmentation_native(input_path)
             tracklet_graph = read_ctc_tracklet_graph(track_file)
+
+        # Propagate the source's time calibration onto the tracked overlay so
+        # real time (not just frame index) flows into the lineage graphs: the
+        # tracked overlay is otherwise uncalibrated, which is why callers used
+        # to have to re-supply timepoints downstream. Stamps cont.time on the
+        # overlay and start_time/end_time on the tracklet graph; both a no-op
+        # for an uncalibrated source.
+        timepoints = images.timepoints
+        if timepoints is not None:
+            ov = ov.with_timepoints(timepoints)
+            annotate_tracklet_times(tracklet_graph, timepoints)
 
         tracking_graph = ctc_track_graph(ov, tracklet_graph)
 

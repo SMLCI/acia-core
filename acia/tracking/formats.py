@@ -209,9 +209,20 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
 
     track_graph = nx.DiGraph()
 
-    # add all the nodes
+    # add all the nodes -- carrying real time (not just frame index) when the
+    # overlay is time-calibrated, so the lineage can plot against real time.
+    time_unit: str | None = None
+    all_timed = True
     for cont in ov:
-        track_graph.add_node(cont.id, frame=cont.frame)
+        t = getattr(cont, "time", None)
+        if t is None:
+            all_timed = False
+            track_graph.add_node(cont.id, frame=cont.frame)
+        else:
+            track_graph.add_node(cont.id, frame=cont.frame, time=float(t.magnitude))
+            time_unit = time_unit or f"{t.units:~P}"
+    if all_timed and time_unit is not None:
+        track_graph.graph["time_unit"] = time_unit
 
     tracklets: dict[Any, list[Any]] = {}
     for cont in ov:
