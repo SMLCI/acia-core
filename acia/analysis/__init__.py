@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import os
 import shutil
 from collections.abc import Iterable
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import reduce
 from itertools import starmap
 from multiprocessing import Pool
@@ -753,6 +755,47 @@ def default_execution_naming(source) -> str:
     )
 
 
+def _scale_execute_one(job, additional_parameters, exist_ok, exist_skip, kernel_name):
+    """Run every analysis script for one image entry.
+
+    Module-level (not a closure) so it is picklable for the ``spawn`` process pool.
+    ``job`` is a dict with ``image_id``, ``output_parent`` (str), ``source_parameters``
+    (dict) and ``scripts`` (list of ``(src, dst)`` path-string pairs). Returns the
+    list of execution records; raises ``PapermillExecutionError`` if a notebook fails.
+    """
+    output_parent = Path(job["output_parent"])
+    os.makedirs(output_parent, exist_ok=exist_ok)
+
+    executions = []
+    for src, dst in job["scripts"]:
+        dst = Path(dst)
+        # the notebook already exists and we should skip it
+        if dst.exists() and exist_skip:
+            continue
+
+        shutil.copy(src, dst)
+
+        # parameters to integrate into notebook
+        parameters = dict(
+            storage_folder=str(dst.parent.absolute()),
+            **job["source_parameters"],
+            **additional_parameters,
+        )
+
+        # execute the notebook (its own kernel subprocess; cwd is this process's,
+        # which is safe because each worker is a separate process)
+        pm.execute_notebook(
+            dst,
+            dst,
+            parameters=parameters,
+            cwd=dst.parent,
+            kernel_name=kernel_name,
+        )
+
+        executions.append(dict(parameters=parameters, storage_folder=dst.parent))
+    return executions
+
+
 def scale(
     output_path: Path,
     analysis_script: Path | list[Path],
@@ -763,6 +806,7 @@ def scale(
     exist_skip=False,
     kernel_name=None,
     parameter_name: str = "image_id",
+    max_workers: int = 1,
 ):
     """Scale an analysis notebook to several image sources.
 
@@ -796,6 +840,17 @@ def scale(
         kernel_name (str): specifies the notebook kernel to be used. None is the default kernel.
         parameter_name (str): name of the notebook parameter the identifier is
             injected as (ignored for ``dict`` entries, which are merged as-is).
+        max_workers (int): how many notebooks to execute concurrently. ``1``
+            (default) runs them sequentially, exactly as before. Values > 1 run
+            that many notebooks in parallel using a **process** pool started with
+            the ``"spawn"`` method (not threads: papermill sets the working
+            directory with a process-global ``os.chdir`` that threads would race
+            on; and not ``fork``: spawning fresh processes avoids duplicating a
+            CUDA-initialised parent kernel -- the classic Jupyter crash). Each
+            execution is still its own kernel subprocess, so a worker whose kernel
+            dies only fails its own image. On a **single GPU** keep this small
+            (2-3): every concurrent run loads its own model, so throughput is
+            bounded by GPU memory, not CPU cores.
     """
 
     if execution_naming is None:
@@ -837,52 +892,68 @@ def scale(
             )
         seen_names[name] = entry
 
-    for image_id in tqdm(image_ids):
-        try:
-            # create the main output folder
-            output_parent = output_path / execution_naming(image_id)
-            os.makedirs(output_parent, exist_ok=exist_ok)
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
-            # per-entry notebook parameters: dict entries are merged as-is,
-            # everything else is injected under `parameter_name`.
-            if isinstance(image_id, dict):
-                source_parameters = dict(image_id)
-            else:
-                source_parameters = {parameter_name: image_id}
+    # Resolve naming + per-entry parameters up front (in this process, so a lambda
+    # `execution_naming` still works). Each job is fully picklable for the pool.
+    jobs: list[dict[str, Any]] = []
+    for image_id in image_ids:
+        # per-entry notebook parameters: dict entries are merged as-is,
+        # everything else is injected under `parameter_name`.
+        if isinstance(image_id, dict):
+            source_parameters = dict(image_id)
+        else:
+            source_parameters = {parameter_name: image_id}
 
-            for script in analysis_script:
-                # path to the new notebook file
-                # every execution should have its own folder to store local files
-                output_file = output_parent / script.name
+        output_parent = output_path / execution_naming(image_id)
+        jobs.append(
+            {
+                "image_id": image_id,
+                "output_parent": str(output_parent),
+                "source_parameters": source_parameters,
+                "scripts": [
+                    (str(s), str(output_parent / s.name)) for s in analysis_script
+                ],
+            }
+        )
 
-                if output_file.exists() and exist_skip:
-                    # the notebook exists and we should skip it
-                    continue
-
-                shutil.copy(script, output_file)
-
-                # parameters to integrate into notebook
-                parameters = dict(
-                    storage_folder=str(output_file.parent.absolute()),
-                    **source_parameters,
-                    **additional_parameters,
+    if max_workers == 1:
+        # sequential (default) -- unchanged behaviour
+        for job in tqdm(jobs):
+            try:
+                experiment_executions.extend(
+                    _scale_execute_one(
+                        job, additional_parameters, exist_ok, exist_skip, kernel_name
+                    )
                 )
-
-                # execute the notebook
-                pm.execute_notebook(
-                    output_file,
-                    output_file,
-                    parameters=parameters,
-                    cwd=output_file.parent,
-                    kernel_name=kernel_name,
-                )
-
-                # save experiment in list
-                experiment_executions.append(
-                    dict(parameters=parameters, storage_folder=output_file.parent)
-                )
-        except pm.PapermillExecutionError:
-            failed_ids.append(image_id)
+            except pm.PapermillExecutionError:
+                failed_ids.append(job["image_id"])
+    else:
+        # Run several notebooks in parallel. A *process* pool (spawn) is required,
+        # not threads: papermill sets the working directory with a process-global
+        # os.chdir, which threads would race on (mislocating each run's relative
+        # outputs). spawn also avoids duplicating a CUDA-initialised parent kernel.
+        # Failures are collected here in the parent as each future completes.
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+            futures = {
+                pool.submit(
+                    _scale_execute_one,
+                    job,
+                    additional_parameters,
+                    exist_ok,
+                    exist_skip,
+                    kernel_name,
+                ): job["image_id"]
+                for job in jobs
+            }
+            for future in tqdm(as_completed(futures), total=len(futures)):
+                image_id = futures[future]
+                try:
+                    experiment_executions.extend(future.result())
+                except pm.PapermillExecutionError:
+                    failed_ids.append(image_id)
 
     if len(failed_ids) > 0:
         error_ratio = len(failed_ids) / len(image_ids) * 100
