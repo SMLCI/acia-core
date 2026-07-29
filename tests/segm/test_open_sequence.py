@@ -357,5 +357,286 @@ class TestTiffBackend(unittest.TestCase):
                 f.position(1)  # single-position
 
 
+# --------------------------------------------------------------------------- #
+# folder-of-per-timepoint-TIFFs backend (real small files)
+# --------------------------------------------------------------------------- #
+class _CountingTiff:
+    """Stand-in for the ``tifffile`` module that records every decode."""
+
+    def __init__(self):
+        self.reads: list[str] = []
+
+    def imread(self, handle):
+        import os.path
+
+        path = getattr(handle, "path", None) or getattr(handle, "name", repr(handle))
+        self.reads.append(os.path.basename(str(path)))
+        return tifffile.imread(handle)
+
+
+def _write_frames(folder, count, *, h=6, w=8, start=0):
+    """Write ``count`` single-plane TIFFs named ``t000.tif`` ... into ``folder``."""
+    from pathlib import Path
+
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        plane = np.full((h, w), start + i, dtype=np.uint16)
+        tifffile.imwrite(folder / f"t{i:03d}.tif", plane)
+    return folder
+
+
+class TestFolderBackend(unittest.TestCase):
+    def _counting(self):
+        from unittest import mock
+
+        from acia.segm import folder_source
+
+        counter = _CountingTiff()
+        return counter, mock.patch.object(folder_source, "tifffile", counter)
+
+    def test_directory_dispatches_to_folder_backend(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_frames(d, 12)
+            f = open_sequence(d)
+            self.assertEqual(f.format, "tiff_folder")
+            self.assertEqual(f.num_positions, 1)
+
+            md = f.metadata
+            self.assertEqual(md.num_timepoints, 12)
+            self.assertEqual(md.sizes, {"T": 12, "Y": 6, "X": 8, "C": 1})
+            self.assertEqual(md.dtype, "uint16")
+            self.assertEqual(md.num_positions, 1)
+
+            source = f.position(0)
+            self.assertEqual(source.size_t, 12)
+            self.assertEqual(source.get_frame(11).raw[0, 0, 0], 11)
+            self.assertIs(f.position(0), source)  # cached
+
+            with self.assertRaises(ValueError):
+                f.position(1)
+
+    def test_num_positions_and_positions_decode_nothing(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_frames(d, 5)
+            counter, patch = self._counting()
+            with patch:
+                f = open_sequence(d)
+                self.assertEqual(f.num_positions, 1)
+                self.assertEqual(len(f.positions), 1)
+                self.assertEqual(counter.reads, [])
+                # metadata needs Y/X/C, and pays exactly one frame for them
+                self.assertEqual(f.metadata.num_timepoints, 5)
+                self.assertEqual(counter.reads, ["t000.tif"])
+
+    def test_thumbnail_reads_one_file(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_frames(d, 6)
+            f = open_sequence(d)
+            counter, patch = self._counting()
+            with patch:
+                thumb = f.thumbnail(0, downscale=2)
+                self.assertEqual(counter.reads, ["t000.tif"])
+            self.assertEqual(thumb.shape[2], 3)
+
+    def test_calibration_override_propagates(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_frames(d, 4)
+            f = open_sequence(d, pixel_size="0.5 um", frame_interval="5 min")
+            self.assertAlmostEqual(
+                f.metadata.pixel_size.to("micrometer").magnitude, 0.5, places=6
+            )
+            self.assertAlmostEqual(
+                f.metadata.frame_interval.to("second").magnitude, 300.0, places=3
+            )
+            self.assertAlmostEqual(
+                f.position(0).pixel_size.to("micrometer").magnitude, 0.5, places=6
+            )
+            json.dumps(f.metadata.to_dict())  # still JSON-safe
+
+    def test_pattern_is_forwarded_to_the_folder(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a_c000.tif", "a_c001.tif", "b_c000.tif", "b_c001.tif"):
+                tifffile.imwrite(Path(d) / name, np.zeros((4, 4), np.uint16))
+            self.assertEqual(open_sequence(d).metadata.num_timepoints, 4)
+            self.assertEqual(
+                open_sequence(d, pattern="*_c000.tif").metadata.num_timepoints, 2
+            )
+
+    def test_pattern_on_a_non_folder_raises(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "stack.tif"
+            tifffile.imwrite(path, np.zeros((3, 4, 4), np.uint16))
+            with self.assertRaises(ValueError) as ctx:
+                open_sequence(path, pattern="*.tif")
+            self.assertIn("pattern", str(ctx.exception))
+
+    def test_unknown_suffix_message_mentions_folders(self):
+        from acia.segm.open import open_sequence
+
+        with self.assertRaises(ValueError) as ctx:
+            open_sequence("/nowhere/x.lif")
+        self.assertIn("folder", str(ctx.exception))
+
+    def test_nested_folders_are_positions(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            for i in [1, 2, 10]:
+                _write_frames(Path(d) / f"pos{i}", 3, start=100 * i)
+
+            counter, patch = self._counting()
+            with patch:
+                f = open_sequence(d)
+                self.assertEqual(f.num_positions, 3)
+                names = [p.name for p in f.positions]
+                self.assertEqual(names, ["pos1", "pos2", "pos10"])  # natural order
+                self.assertEqual(counter.reads, [])  # listing only
+
+            counter, patch = self._counting()
+            with patch:
+                self.assertEqual(f.metadata.num_positions, 3)
+                self.assertEqual(f.metadata.num_timepoints, 3)
+                # metadata needs Y/X/C: exactly one decode, from position 0
+                self.assertEqual(counter.reads, ["t000.tif"])
+
+            second = f.position(1)
+            self.assertIs(f.position(1), second)  # cached per index
+            self.assertEqual(second.get_frame(0).raw[0, 0, 0], 200)
+
+            with self.assertRaises(ValueError):
+                f.position(99)
+
+    def test_flat_folder_positions_are_unnamed(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_frames(d, 3)
+            self.assertIsNone(open_sequence(d).positions[0].name)
+
+    def test_directory_named_like_a_tiff_is_still_a_folder(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            # per-timepoint folders are routinely named like the stack they
+            # replace -- pos001_roi002.tiff/ is a directory, not a file
+            folder = Path(d) / "pos001_roi002.tiff"
+            _write_frames(folder, 4)
+            f = open_sequence(folder)
+            self.assertEqual(f.format, "tiff_folder")
+            self.assertEqual(f.metadata.num_timepoints, 4)
+            self.assertEqual(f.position(0).get_frame(3).raw[0, 0, 0], 3)
+
+    def test_calibration_reaches_metadata_through_sequencefile(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(3):
+                tifffile.imwrite(
+                    Path(d) / f"t{i}.tif",
+                    np.zeros((6, 8), np.uint16),
+                    imagej=True,
+                    resolution=(1 / 0.0733, 1 / 0.0733),
+                    metadata={"unit": "um"},
+                )
+            md = open_sequence(d).metadata
+            self.assertAlmostEqual(
+                md.pixel_size.to("micrometer").magnitude, 0.0733, places=4
+            )
+            self.assertAlmostEqual(md.to_dict()["pixel_size_um"], 0.0733, places=4)
+
+    def test_remote_folder_over_fsspec(self):
+        import fsspec
+
+        from acia.segm.open import open_sequence
+
+        # an in-memory fsspec filesystem stands in for smb://: same code path
+        # (url_to_fs + ls + per-file open), no network needed
+        fs = fsspec.filesystem("memory")
+        for pos in ("pos1", "pos2"):
+            for i in range(3):
+                with fs.open(f"/exp/{pos}/t{i:03d}.tif", "wb") as handle:
+                    tifffile.imwrite(handle, np.full((4, 5), i, np.uint16))
+        try:
+            f = open_sequence("memory://exp")
+            self.assertEqual(f.num_positions, 2)
+            self.assertEqual([p.name for p in f.positions], ["pos1", "pos2"])
+            self.assertEqual(f.metadata.num_timepoints, 3)
+            self.assertEqual(f.position(1).get_frame(2).raw[0, 0, 0], 2)
+        finally:
+            fs.store.clear()
+            fs.pseudo_dirs[:] = [""]
+
+    def test_manifest_round_trip_reopens_the_folder(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+        from acia.selection import SelectionManifest, make_source_block
+
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d) / "movie"
+            _write_frames(folder, 5)
+            manifest = SelectionManifest(
+                source=make_source_block(open_sequence(folder))
+            )
+            self.assertEqual(manifest.source["format"], "tiff_folder")
+            path = manifest.save(Path(d) / "selection.json")
+
+            # the curated folder reopens through the same dispatch on reload
+            reopened = open_sequence(SelectionManifest.load(path).source_path)
+            self.assertEqual(reopened.format, "tiff_folder")
+            self.assertEqual(reopened.metadata.num_timepoints, 5)
+
+    def test_empty_folder_raises_on_access(self):
+        import tempfile
+        from pathlib import Path
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "notes.txt").write_text("x")
+            f = open_sequence(d)  # dispatch itself stays cheap
+            with self.assertRaises(ValueError):
+                _ = f.num_positions
+
+
 if __name__ == "__main__":
     unittest.main()

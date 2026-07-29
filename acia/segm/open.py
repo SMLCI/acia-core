@@ -6,11 +6,16 @@ a per-position time series without loading pixels. A "position" is the ND2 ``P``
 axis and the CZI ``S`` (scene) axis, unified here so the notebook and dashboard
 never branch on format.
 
+A path that is a *directory* is opened as a folder of per-timepoint TIFFs (one
+file per frame); a folder whose immediate subfolders hold the TIFFs exposes one
+position per subfolder, so folder trees, ND2 and CZI all reach the notebook
+through the same :meth:`SequenceFile.position` surface.
+
 Reading :attr:`SequenceFile.metadata` / :attr:`SequenceFile.positions` performs
 no pixel reads for ND2/CZI; :meth:`SequenceFile.thumbnail` reads exactly one
-(downscaled) frame. (The TIFF backend wraps the existing local stack loader,
-which reads frame 0 to determine its shape — TIFF stacks are small, unlike the
-hundred-gigabyte ND2/CZI files this module is built for.)
+(downscaled) frame. (The TIFF backends read frame 0 to determine its shape — a
+TIFF stack or a single per-timepoint file is small, unlike the hundred-gigabyte
+ND2/CZI files this module is built for.)
 """
 
 from __future__ import annotations
@@ -98,14 +103,27 @@ class SequenceFile:
         *,
         pixel_size=None,
         frame_interval=None,
+        pattern=None,
     ) -> None:
         self.path = str(path)
         self.format = fmt
         self._pixel_size = pixel_size
         self._frame_interval = frame_interval
+        self._pattern = pattern
         self._pos_cache: dict[int, object] = {}
         self._meta: SequenceMetadata | None = None
         self._positions: list[PositionInfo] | None = None
+        self._layout: tuple[list[str], bool] | None = None
+
+    # --- folder layout (tiff_folder only) --------------------------------------
+
+    def _folders(self) -> tuple[list[str], bool]:
+        """Resolve (once) the folder's position folders and whether it is nested."""
+        if self._layout is None:
+            from acia.segm.folder_source import resolve_layout
+
+            self._layout = resolve_layout(self.path, pattern=self._pattern)
+        return self._layout
 
     # --- per-position sources --------------------------------------------------
 
@@ -142,6 +160,17 @@ class SequenceFile:
                 pixel_size=self._pixel_size,
                 frame_interval=self._frame_interval,
             )
+        if self.format == "tiff_folder":
+            from acia.segm.folder_source import FolderSequenceSource
+
+            folders, _ = self._folders()
+            return FolderSequenceSource(
+                folders[index],
+                pattern=self._pattern,
+                normalize_image=False,
+                pixel_size=self._pixel_size,
+                frame_interval=self._frame_interval,
+            )
         raise ValueError(f"unknown format {self.format!r}")  # pragma: no cover
 
     def _probe(self):
@@ -172,7 +201,11 @@ class SequenceFile:
 
     @property
     def num_positions(self) -> int:
-        """Number of positions (ND2 ``P`` / CZI ``S`` / 1 for TIFF)."""
+        """Number of positions (ND2 ``P`` / CZI ``S`` / folder subfolders / 1)."""
+        if self.format == "tiff_folder":
+            # answerable from the directory listing alone -- don't force the
+            # metadata read (which decodes frame 0) just to count positions
+            return len(self._folders()[0])
         return self.metadata.num_positions
 
     @property
@@ -188,18 +221,21 @@ class SequenceFile:
 
     def _read_metadata(self) -> SequenceMetadata:
         probe = self._probe()
-        if self.format == "tiff":
-            frame0 = probe.get_frame(0).raw  # small stack: reading is acceptable
+        if self.format in ("tiff", "tiff_folder"):
+            # one small read: a stack's frame 0, or one per-timepoint file. `size_t`
+            # of a folder is a directory listing, so T stays decode-free.
+            frame0 = probe.get_frame(0).raw
             h, w = int(frame0.shape[0]), int(frame0.shape[1])
             c = int(frame0.shape[2]) if frame0.ndim == 3 else 1
             sizes = {"T": int(probe.size_t), "Y": h, "X": w, "C": c}
+            num_positions = 1 if self.format == "tiff" else len(self._folders()[0])
             return SequenceMetadata(
                 sizes=sizes,
                 pixel_size=probe.pixel_size,
                 frame_interval=_scalar_frame_interval(probe),
                 channels=[f"ch{i}" for i in range(c)],
                 dtype=str(frame0.dtype),
-                num_positions=1,
+                num_positions=num_positions,
                 num_timepoints=int(probe.size_t),
             )
 
@@ -224,6 +260,11 @@ class SequenceFile:
     def _position_names(self) -> dict[int, str | None]:
         if self.format == "czi":
             return dict(getattr(self._probe(), "scene_names", {}) or {})
+        if self.format == "tiff_folder":
+            folders, nested = self._folders()
+            if not nested:  # the folder is the movie, not a named position
+                return {}
+            return {i: os.path.basename(f.rstrip("/")) for i, f in enumerate(folders)}
         return {}
 
     # --- thumbnails ------------------------------------------------------------
@@ -270,23 +311,78 @@ class SequenceFile:
         self.close()
 
 
-def open_sequence(path, *, pixel_size=None, frame_interval=None) -> SequenceFile:
-    """Open a multi-position acquisition by filename suffix (ND2/CZI/TIFF).
+def _is_directory(text: str) -> bool:
+    """Whether ``text`` points at a directory (locally or on an fsspec remote).
 
-    Returns a lazy :class:`SequenceFile`; no file is opened until metadata or a
-    position is accessed. User ``pixel_size``/``frame_interval`` override any file
-    metadata and propagate to every per-position source.
+    Never raises: a probe that cannot answer (unreachable host, missing
+    credentials, unknown protocol) means "not a directory", so the caller still
+    reports the plain "no reader for this suffix" ``ValueError`` rather than a
+    connection error from a filesystem the user never asked to open.
+    """
+    if "://" not in text:
+        return os.path.isdir(text)
+
+    import fsspec
+
+    from acia.config import resolve_storage_options
+
+    try:
+        fs, root = fsspec.core.url_to_fs(text, **resolve_storage_options(text))
+        return bool(fs.isdir(root))
+    except Exception:  # noqa: BLE001 - any probe failure means "not a directory"
+        return False
+
+
+def open_sequence(
+    path, *, pixel_size=None, frame_interval=None, pattern=None
+) -> SequenceFile:
+    """Open an acquisition by filename suffix (ND2/CZI/TIFF) or as a folder.
+
+    A path that *is a directory* is opened as a folder of per-timepoint TIFFs --
+    one file per frame, or one subfolder per position (see
+    :func:`acia.segm.folder_source.resolve_layout`). ND2/CZI dispatch purely on
+    suffix and stay strictly IO-free, so opening a hundred-gigabyte acquisition
+    costs nothing until metadata or a position is touched; only an unknown or
+    TIFF-like name is probed with a stat.
+
+    Returns a lazy :class:`SequenceFile`. User ``pixel_size``/``frame_interval``
+    override any file metadata and propagate to every per-position source.
+
+    Args:
+        path: file to open, or a directory of per-timepoint TIFFs.
+        pixel_size: physical pixel size overriding the file's own metadata.
+        frame_interval: scalar time between frames, likewise overriding.
+        pattern: frame-filename glob, folders only (``None`` -> ``.tif``/``.tiff``).
 
     Raises:
-        ValueError: If the suffix maps to no supported reader.
+        ValueError: If the suffix maps to no supported reader and the path is not
+            a directory, or if ``pattern`` is given for a non-folder path.
     """
     text = str(path)
     suffix = text.rsplit(".", 1)[-1].lower() if "." in os.path.basename(text) else ""
     fmt = _SUFFIX_FORMAT.get(suffix)
+    if fmt in (None, "tiff") and _is_directory(text):
+        # No suffix match, or a *.tif/*.tiff name that is actually a directory --
+        # per-timepoint folders are routinely named like the stack they replace
+        # (pos001_roi002.tiff/). ND2/CZI never reach this probe, so opening a
+        # hundred-gigabyte acquisition stays strictly IO-free.
+        fmt = "tiff_folder"
     if fmt is None:
         supported = ", ".join(sorted(set(_SUFFIX_FORMAT)))
         raise ValueError(
             f"open_sequence: no reader for '.{suffix}' in {text!r} "
-            f"(supported suffixes: {supported})"
+            f"(supported suffixes: {supported}; a directory is read as a folder "
+            "of per-timepoint TIFFs)"
         )
-    return SequenceFile(text, fmt, pixel_size=pixel_size, frame_interval=frame_interval)
+    if pattern is not None and fmt != "tiff_folder":
+        raise ValueError(
+            f"open_sequence: pattern={pattern!r} only applies to a folder of "
+            f"per-timepoint TIFFs, but {text!r} is a {fmt} file"
+        )
+    return SequenceFile(
+        text,
+        fmt,
+        pixel_size=pixel_size,
+        frame_interval=frame_interval,
+        pattern=pattern,
+    )
