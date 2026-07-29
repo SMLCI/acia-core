@@ -199,15 +199,16 @@ class TestPlotPropertyHistograms(unittest.TestCase):
             plot_property_histograms(df_before, ["area", "length"], df_after=df_after)
         self.assertEqual(plt.get_fignums(), before_fignums)
 
-    def test_empty_df_after_raises_value_error_no_finite_values_no_leak(self):
+    def test_empty_df_after_degrades_not_raises(self):
+        # all cells filtered out -> after axis empty, before still drawn, no raise
         df_before = _make_df(50, seed=33, area=100.0)
         df_after = df_before.iloc[:0].copy()  # 0 rows
 
-        before_fignums = plt.get_fignums()
-        with self.assertRaises(ValueError) as ctx:
-            plot_property_histograms(df_before, ["area"], df_after=df_after)
-        self.assertIn("no finite values", str(ctx.exception))
-        self.assertEqual(plt.get_fignums(), before_fignums)
+        fig = plot_property_histograms(df_before, ["area"], df_after=df_after)
+        ax_before, ax_after = fig.axes
+        self.assertGreater(len(ax_before.patches), 0)  # before histogram drawn
+        self.assertEqual(len(ax_after.patches), 0)  # after empty (annotated)
+        plt.close(fig)
 
     def test_nan_values_dropped_and_still_plot_both_paths(self):
         df_before = _make_df(200, seed=34, area=100.0)
@@ -227,15 +228,13 @@ class TestPlotPropertyHistograms(unittest.TestCase):
         self.assertAlmostEqual(_hist_density_sum(fig2.axes[0]), 1.0, places=6)
         plt.close(fig2)
 
-    def test_all_nan_column_raises_value_error_no_leak(self):
+    def test_all_nan_column_degrades_not_raises(self):
         df = _make_df(50, seed=35, area=100.0)
         df["area"] = np.nan
 
-        before_fignums = plt.get_fignums()
-        with self.assertRaises(ValueError) as ctx:
-            plot_property_histograms(df, ["area"])
-        self.assertIn("no finite values", str(ctx.exception))
-        self.assertEqual(plt.get_fignums(), before_fignums)
+        fig = plot_property_histograms(df, ["area"])
+        self.assertEqual(len(fig.axes[0].patches), 0)  # empty axis, annotated
+        plt.close(fig)
 
     def test_no_after_mode_sets_title_per_axes(self):
         df = _make_df(100, seed=36, area=100.0, length=20.0)

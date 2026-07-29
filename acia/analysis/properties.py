@@ -45,6 +45,32 @@ def _axis_label(prop: str, units: dict[str, pint.Unit] | None) -> str:
     return prop
 
 
+def _finite(series) -> np.ndarray:
+    """Return a column's finite float values as a 1-D array (drops NaN/inf)."""
+    arr = np.asarray(series, dtype=float)
+    return np.asarray(arr[np.isfinite(arr)])
+
+
+def _hist_or_note(ax, values: np.ndarray, bins, **hist_kwargs) -> None:
+    """Density-histogram ``values`` on ``ax``, or annotate "no cells" if empty.
+
+    An empty population (no detected cells, or all cells filtered out) is a valid
+    state, not an error -- the axis is drawn empty with a note instead of raising.
+    """
+    if values.size:
+        ax.hist(values, bins=bins, density=True, **hist_kwargs)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "no cells",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color="0.6",
+        )
+
+
 def plot_property_histograms(
     df_before: pd.DataFrame,
     properties: Sequence[str],
@@ -97,11 +123,10 @@ def plot_property_histograms(
             of column names (a plausible typo, e.g. ``"area"`` instead of
             ``["area"]``, that would otherwise be silently iterated
             character-by-character).
-        ValueError: if ``properties`` is empty, or if a property of a
-            *non-empty* ``df_before`` (or ``df_after``) has no finite values
-            left after dropping non-finite ones (an all-NaN column). A fully
-            empty population (0 rows) is not an error -- it returns a labeled but
-            empty grid.
+        ValueError: if ``properties`` is empty. A property with no finite values
+            to plot -- an empty population (0 rows), an empty ``df_after`` (all
+            cells filtered out), or an all-NaN column -- is *not* an error: that
+            axis is drawn empty with a "no cells" note.
         KeyError: if a property in ``properties`` is not a column of
             ``df_before`` (or ``df_after``, when given).
     """
@@ -117,33 +142,6 @@ def plot_property_histograms(
         raise ValueError("properties must be non-empty")
 
     has_after = df_after is not None
-
-    # An empty population (e.g. an ROI with no detected cells) is a valid state,
-    # not an error: return a labeled but empty grid instead of raising, so a
-    # whole-pipeline run survives a frame/ROI with nothing in it.
-    if len(df_before) == 0 and (df_after is None or len(df_after) == 0):
-        for prop in properties:  # still catch a mistyped property name
-            if prop not in df_before.columns:
-                raise KeyError(f"'{prop}' not found in df_before")
-        fig, axes = plt.subplots(2 if has_after else 1, n_props, squeeze=False)
-        for j, prop in enumerate(properties):
-            axes[0, j].set_title(prop)
-            axes[-1, j].set_xlabel(_axis_label(prop, units))
-            for row in range(axes.shape[0]):
-                axes[row, j].text(
-                    0.5,
-                    0.5,
-                    "no cells",
-                    ha="center",
-                    va="center",
-                    transform=axes[row, j].transAxes,
-                    color="0.6",
-                )
-        if has_after:
-            axes[0, 0].set_ylabel("before")
-            axes[1, 0].set_ylabel("after")
-        fig.tight_layout()
-        return fig
 
     # Pass 1: validate everything and precompute finite-filtered arrays (and,
     # for the df_after case, shared bin edges) BEFORE any Figure is created,
@@ -166,23 +164,23 @@ def plot_property_histograms(
     for prop in properties:
         if prop not in df_before.columns:
             raise KeyError(f"'{prop}' not found in df_before")
-        before_arr = np.asarray(df_before[prop], dtype=float)
-        before_finite = before_arr[np.isfinite(before_arr)]
-        if before_finite.size == 0:
-            raise ValueError(f"'{prop}' has no finite values to plot")
+        before_finite = _finite(df_before[prop])
         before_arrays.append(before_finite)
 
         if df_after is not None:
             if prop not in df_after.columns:
                 raise KeyError(f"'{prop}' not found in df_after")
-            after_arr = np.asarray(df_after[prop], dtype=float)
-            after_finite = after_arr[np.isfinite(after_arr)]
-            if after_finite.size == 0:
-                raise ValueError(f"'{prop}' has no finite values to plot")
+            after_finite = _finite(df_after[prop])
             after_arrays.append(after_finite)
 
-            combined = np.concatenate([before_finite, after_finite])
-            bins_per_prop.append(np.histogram_bin_edges(combined, bins=bins))
+            # bin edges from whatever finite values exist -- an empty "before" or
+            # "after" (e.g. all cells filtered out) is drawn empty, not raised.
+            populated = [a for a in (before_finite, after_finite) if a.size]
+            if populated:
+                combined = np.concatenate(populated)
+                bins_per_prop.append(np.histogram_bin_edges(combined, bins=bins))
+            else:
+                bins_per_prop.append(bins)
 
             if removed_index is not None and len(removed_index):
                 rem = np.asarray(df_before.loc[removed_index, prop], dtype=float)
@@ -208,8 +206,8 @@ def plot_property_histograms(
         if has_after:
             ax_before = axes[0, j]
             ax_after = axes[1, j]
-            ax_before.hist(before_arrays[j], bins=prop_bins, density=True)
-            ax_after.hist(after_arrays[j], bins=prop_bins, density=True, label="kept")
+            _hist_or_note(ax_before, before_arrays[j], prop_bins)
+            _hist_or_note(ax_after, after_arrays[j], prop_bins, label="kept")
 
             # overlay the removed cells in red so you can see WHERE (in this
             # property's range) the filter cut cells -- density-normalized, so it
@@ -239,7 +237,7 @@ def plot_property_histograms(
                     ax.set_yscale("log")
         else:
             ax = axes[0, j]
-            ax.hist(before_arrays[j], bins=prop_bins, density=True)
+            _hist_or_note(ax, before_arrays[j], prop_bins)
             ax.set_title(prop)
             ax.set_xlabel(_axis_label(prop, units))
             ax.grid(True, linestyle=":", alpha=0.4)
