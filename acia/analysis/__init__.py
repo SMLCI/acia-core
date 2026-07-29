@@ -31,7 +31,9 @@ from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_ra
 from acia.analysis.units import UNIT_ATTR, units_in_header
 from acia.analysis.units import attach_units as attach_units
 from acia.analysis.units import from_header as from_header
+from acia.analysis.units import read_units_csv as read_units_csv
 from acia.analysis.units import strip_units as strip_units
+from acia.analysis.units import write_units_csv as write_units_csv
 from acia.base import BaseImage, ImageSequenceSource, Overlay
 from acia.utils import pairwise_distances
 
@@ -179,7 +181,9 @@ class ExtractorExecutor:
             print(f"Extracting: {extractor.name}...")
             result_df, extractor_units = extractor.extract(overlay, images, df)
 
-            df = pd.merge(df, result_df, on="id")
+            # join on the shared `id` index -- order-independent and, unlike
+            # merge(on="id"), dtype-tolerant for an empty overlay (0 contours)
+            df = df.join(result_df)
 
             self.units.update(**extractor_units)
 
@@ -194,6 +198,16 @@ class ExtractorExecutor:
         # "none"/"magnitude" -> leave as plain floats
 
         return df
+
+
+def _id_indexed(records: list[dict], columns: list[str]) -> pd.DataFrame:
+    """Build an ``id``-indexed DataFrame from per-contour records, empty-safe.
+
+    ``pd.DataFrame([])`` has no columns, so ``.set_index("id")`` raises for an
+    empty overlay; passing explicit ``columns`` keeps ``id`` and the value
+    column(s) present (as an empty frame) instead.
+    """
+    return pd.DataFrame(records, columns=["id", *columns]).set_index("id")
 
 
 class AreaEx(PropertyExtractor):
@@ -220,7 +234,7 @@ class AreaEx(PropertyExtractor):
         for cont in overlay:
             data.append({"id": cont.id, self.name: self.convert(cont.area)})
 
-        df = pd.DataFrame(data).set_index("id")
+        df = _id_indexed(data, [self.name])
 
         return df, {self.name: self.output_unit}
 
@@ -252,7 +266,7 @@ class PerimeterEx(PropertyExtractor):
 
             data.append({"id": cont.id, self.name: self.convert(perimeter)})
 
-        df = pd.DataFrame(data).set_index("id")
+        df = _id_indexed(data, [self.name])
 
         return df, {self.name: self.output_unit}
 
@@ -577,7 +591,7 @@ class DynamicTimeEx(PropertyExtractor):
                 }
             )
 
-        df = pd.DataFrame(data).set_index("id")
+        df = _id_indexed(data, [self.name])
 
         return df, {self.name: self.output_unit}
 
@@ -682,7 +696,7 @@ class FluorescenceEx(PropertyExtractor):
                 local_data[channel_names[ch_id]] = value
             data.append(local_data)
 
-        return pd.DataFrame(data).set_index("id")
+        return _id_indexed(data, list(channel_names))
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         assert overlay.numFrames() == len(images), (
@@ -755,7 +769,14 @@ def default_execution_naming(source) -> str:
     )
 
 
-def _scale_execute_one(job, additional_parameters, exist_ok, exist_skip, kernel_name):
+def _scale_execute_one(
+    job,
+    additional_parameters,
+    exist_ok,
+    exist_skip,
+    kernel_name,
+    storage_parameter_name,
+):
     """Run every analysis script for one image entry.
 
     Module-level (not a closure) so it is picklable for the ``spawn`` process pool.
@@ -775,12 +796,15 @@ def _scale_execute_one(job, additional_parameters, exist_ok, exist_skip, kernel_
 
         shutil.copy(src, dst)
 
-        # parameters to integrate into notebook
-        parameters = dict(
-            storage_folder=str(dst.parent.absolute()),
-            **job["source_parameters"],
-            **additional_parameters,
-        )
+        # parameters to integrate into notebook -- inject the execution folder
+        # under `storage_parameter_name` unless it is None (some notebooks derive
+        # their output location differently and don't declare `storage_folder`,
+        # which papermill would otherwise warn about as an unknown parameter).
+        parameters = {}
+        if storage_parameter_name is not None:
+            parameters[storage_parameter_name] = str(dst.parent.absolute())
+        parameters.update(job["source_parameters"])
+        parameters.update(additional_parameters)
 
         # execute the notebook (its own kernel subprocess; cwd is this process's,
         # which is safe because each worker is a separate process)
@@ -807,6 +831,7 @@ def scale(
     kernel_name=None,
     parameter_name: str = "image_id",
     max_workers: int = 1,
+    storage_parameter_name: str | None = "storage_folder",
 ):
     """Scale an analysis notebook to several image sources.
 
@@ -840,6 +865,12 @@ def scale(
         kernel_name (str): specifies the notebook kernel to be used. None is the default kernel.
         parameter_name (str): name of the notebook parameter the identifier is
             injected as (ignored for ``dict`` entries, which are merged as-is).
+        storage_parameter_name (str | None): the notebook parameter the per-run
+            output/execution folder (absolute) is injected under. Defaults to
+            ``"storage_folder"``. Set it to match the notebook's own output
+            parameter, or to ``None`` to not inject it at all (avoids papermill's
+            "Passed unknown parameter" warning for notebooks that derive their
+            output location some other way).
         max_workers (int): how many notebooks to execute concurrently. ``1``
             (default) runs them sequentially, exactly as before. Values > 1 run
             that many notebooks in parallel using a **process** pool started with
@@ -924,7 +955,12 @@ def scale(
             try:
                 experiment_executions.extend(
                     _scale_execute_one(
-                        job, additional_parameters, exist_ok, exist_skip, kernel_name
+                        job,
+                        additional_parameters,
+                        exist_ok,
+                        exist_skip,
+                        kernel_name,
+                        storage_parameter_name,
                     )
                 )
             except pm.PapermillExecutionError:
@@ -945,6 +981,7 @@ def scale(
                     exist_ok,
                     exist_skip,
                     kernel_name,
+                    storage_parameter_name,
                 ): job["image_id"]
                 for job in jobs
             }

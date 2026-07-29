@@ -53,6 +53,7 @@ def plot_property_histograms(
     units: dict[str, pint.Unit] | None = None,
     bins: int = 50,
     log_y: bool = False,
+    show_removed: bool = False,
 ) -> Figure:
     """Plot density-normalized before/after histograms for one or more properties.
 
@@ -79,6 +80,11 @@ def plot_property_histograms(
         bins: number of histogram bins (default ``50``).
         log_y: if ``True``, every Axes' y-scale is set to ``"log"`` (still
             density-normalized). Default is linear.
+        show_removed: if ``True`` and ``df_after`` is an index-subset of
+            ``df_before``, overlay the filtered-out cells (``before`` minus
+            ``after``) on each "after" histogram as a red step outline, so you can
+            see where in the property's range the filter cut. Density-normalized
+            (shows location/shape, not count). Default ``False``.
 
     Returns:
         A matplotlib :class:`~matplotlib.figure.Figure` with a
@@ -91,10 +97,11 @@ def plot_property_histograms(
             of column names (a plausible typo, e.g. ``"area"`` instead of
             ``["area"]``, that would otherwise be silently iterated
             character-by-character).
-        ValueError: if ``properties`` is empty, or if a property (after
-            dropping non-finite values) has no finite values left to plot in
-            ``df_before`` (or ``df_after``, when given) -- e.g. an empty
-            DataFrame or an all-NaN column.
+        ValueError: if ``properties`` is empty, or if a property of a
+            *non-empty* ``df_before`` (or ``df_after``) has no finite values
+            left after dropping non-finite ones (an all-NaN column). A fully
+            empty population (0 rows) is not an error -- it returns a labeled but
+            empty grid.
         KeyError: if a property in ``properties`` is not a column of
             ``df_before`` (or ``df_after``, when given).
     """
@@ -111,12 +118,50 @@ def plot_property_histograms(
 
     has_after = df_after is not None
 
+    # An empty population (e.g. an ROI with no detected cells) is a valid state,
+    # not an error: return a labeled but empty grid instead of raising, so a
+    # whole-pipeline run survives a frame/ROI with nothing in it.
+    if len(df_before) == 0 and (df_after is None or len(df_after) == 0):
+        for prop in properties:  # still catch a mistyped property name
+            if prop not in df_before.columns:
+                raise KeyError(f"'{prop}' not found in df_before")
+        fig, axes = plt.subplots(2 if has_after else 1, n_props, squeeze=False)
+        for j, prop in enumerate(properties):
+            axes[0, j].set_title(prop)
+            axes[-1, j].set_xlabel(_axis_label(prop, units))
+            for row in range(axes.shape[0]):
+                axes[row, j].text(
+                    0.5,
+                    0.5,
+                    "no cells",
+                    ha="center",
+                    va="center",
+                    transform=axes[row, j].transAxes,
+                    color="0.6",
+                )
+        if has_after:
+            axes[0, 0].set_ylabel("before")
+            axes[1, 0].set_ylabel("after")
+        fig.tight_layout()
+        return fig
+
     # Pass 1: validate everything and precompute finite-filtered arrays (and,
     # for the df_after case, shared bin edges) BEFORE any Figure is created,
     # so a validation failure can never leak an orphaned/partial Figure.
     before_arrays: list[np.ndarray] = []
     after_arrays: list[np.ndarray] = []
+    removed_arrays: list[np.ndarray] = []
     bins_per_prop: list[np.ndarray | int] = []
+
+    # the removed cells = before rows whose index is not among the survivors
+    # (only meaningful when df_after is an index-subset of df_before)
+    removed_index = None
+    if (
+        df_after is not None
+        and show_removed
+        and df_after.index.isin(df_before.index).all()
+    ):
+        removed_index = df_before.index.difference(df_after.index)
 
     for prop in properties:
         if prop not in df_before.columns:
@@ -138,6 +183,12 @@ def plot_property_histograms(
 
             combined = np.concatenate([before_finite, after_finite])
             bins_per_prop.append(np.histogram_bin_edges(combined, bins=bins))
+
+            if removed_index is not None and len(removed_index):
+                rem = np.asarray(df_before.loc[removed_index, prop], dtype=float)
+                removed_arrays.append(rem[np.isfinite(rem)])
+            else:
+                removed_arrays.append(np.array([]))
         else:
             bins_per_prop.append(bins)
 
@@ -158,7 +209,22 @@ def plot_property_histograms(
             ax_before = axes[0, j]
             ax_after = axes[1, j]
             ax_before.hist(before_arrays[j], bins=prop_bins, density=True)
-            ax_after.hist(after_arrays[j], bins=prop_bins, density=True)
+            ax_after.hist(after_arrays[j], bins=prop_bins, density=True, label="kept")
+
+            # overlay the removed cells in red so you can see WHERE (in this
+            # property's range) the filter cut cells -- density-normalized, so it
+            # shows the shape/location of the removed population, not its count.
+            if show_removed and removed_arrays and removed_arrays[j].size:
+                ax_after.hist(
+                    removed_arrays[j],
+                    bins=prop_bins,
+                    density=True,
+                    histtype="step",
+                    color="red",
+                    linewidth=1.5,
+                    label="removed",
+                )
+                ax_after.legend(fontsize="small")
 
             ax_before.set_title(prop)
             ax_after.set_xlabel(_axis_label(prop, units))

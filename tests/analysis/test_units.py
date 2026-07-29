@@ -121,3 +121,28 @@ def test_registry_consistency_with_quantity():
     converted = df["area"].pint.to("mm ** 2")
     expected = Q_(6 * PS**2, "micrometer ** 2").to("mm ** 2").magnitude
     assert converted.pint.magnitude.iloc[0] == pytest.approx(expected)
+
+
+def test_write_read_units_csv_round_trip_and_derived_units(tmp_path):
+    import pandas as pd
+
+    from acia.analysis import read_units_csv, write_units_csv
+
+    df = pd.DataFrame(
+        {"area": [3.0, 4.0], "time": [10.0, 10.0], "label": ["a", "b"]},
+        index=pd.Index([1, 2], name="id"),
+    )
+    df.attrs["units"] = {"area": "micrometer ** 2", "time": "minute"}
+
+    path = tmp_path / "cells.csv"
+    assert write_units_csv(df, path) == str(path)
+
+    back = read_units_csv(path)
+    # units survived the file and are back as pint dtypes
+    assert "micrometer ** 2" in str(back["area"].dtype)
+    assert "minute" in str(back["time"].dtype)
+    # non-unit column stays plain
+    assert back["label"].tolist() == ["a", "b"]
+    # derived column derives its unit automatically
+    back["rate"] = back["area"] / back["time"]
+    assert "micrometer ** 2 / minute" in str(back["rate"].dtype)

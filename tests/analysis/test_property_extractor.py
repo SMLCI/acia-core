@@ -219,3 +219,21 @@ class TestPropertyExtractors(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_extractor_executor_empty_overlay_returns_empty_typed_frame():
+    import numpy as np
+
+    from acia import ureg
+    from acia.analysis import AreaEx, ExtractorExecutor, PerimeterEx, PositionEx
+    from acia.base import Overlay
+    from acia.segm.local import THWCSequenceSource
+
+    src = THWCSequenceSource(
+        np.zeros((2, 10, 10, 1), dtype=np.uint8), pixel_size=0.1 * ureg.micrometer
+    )
+    df = ExtractorExecutor().execute(
+        Overlay([], frames=[0, 1]), src, [AreaEx(), PerimeterEx(), PositionEx()]
+    )
+    assert len(df) == 0
+    assert {"area", "perimeter", "position_x", "position_y"} <= set(df.columns)

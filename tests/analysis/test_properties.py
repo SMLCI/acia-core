@@ -289,3 +289,46 @@ class TestAcceptanceCriteria(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShowRemoved(unittest.TestCase):
+    def test_show_removed_overlays_red_and_legend(self):
+        df_before = _make_df(300, seed=1, area=10.0)
+        df_after = df_before.iloc[:150].copy()  # index-subset of df_before
+        fig = plot_property_histograms(
+            df_before, ["area"], df_after=df_after, show_removed=True
+        )
+        ax_before, ax_after = fig.axes[0], fig.axes[1]
+        # the removed step outline adds exactly one extra artist on the after axis
+        self.assertEqual(len(ax_after.patches), len(ax_before.patches) + 1)
+        leg = ax_after.get_legend()
+        self.assertIsNotNone(leg)
+        self.assertEqual({t.get_text() for t in leg.get_texts()}, {"kept", "removed"})
+        plt.close(fig)
+
+    def test_show_removed_default_off(self):
+        df_before = _make_df(200, seed=2, area=10.0)
+        df_after = df_before.iloc[:100].copy()
+        fig = plot_property_histograms(df_before, ["area"], df_after=df_after)
+        self.assertIsNone(fig.axes[1].get_legend())
+        self.assertEqual(len(fig.axes[0].patches), len(fig.axes[1].patches))
+        plt.close(fig)
+
+
+class TestEmptyPopulation(unittest.TestCase):
+    def test_empty_before_returns_labeled_grid_no_raise(self):
+        df = pd.DataFrame({"area": [], "length": []})
+        fig = plot_property_histograms(df, ["area", "length"])
+        self.assertEqual(len(fig.axes), 2)  # 1 row x 2 props
+        plt.close(fig)
+
+    def test_empty_before_and_after_two_rows(self):
+        df = pd.DataFrame({"area": []})
+        fig = plot_property_histograms(df, ["area"], df_after=df.copy())
+        self.assertEqual(len(fig.axes), 2)  # 2 rows x 1 prop
+        plt.close(fig)
+
+    def test_empty_still_validates_property_name(self):
+        df = pd.DataFrame({"area": []})
+        with self.assertRaises(KeyError):
+            plot_property_histograms(df, ["nope"])

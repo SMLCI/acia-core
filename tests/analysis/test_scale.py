@@ -175,3 +175,22 @@ def test_scale_rejects_bad_max_workers(tmp_path):
     script = _make_script(tmp_path)
     with pytest.raises(ValueError):
         scale(tmp_path / "out", script, image_ids=[1], max_workers=0)
+
+
+def test_scale_storage_parameter_name_none_omits_it(tmp_path):
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        scale(out, script, image_ids=[1], storage_parameter_name=None)
+    params = exec_nb.call_args_list[0].kwargs["parameters"]
+    assert "storage_folder" not in params
+
+
+def test_scale_storage_parameter_name_custom(tmp_path):
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        scale(out, script, image_ids=[1], storage_parameter_name="output_folder")
+    params = exec_nb.call_args_list[0].kwargs["parameters"]
+    assert "storage_folder" not in params
+    assert params["output_folder"].endswith("execution_1")

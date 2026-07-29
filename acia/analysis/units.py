@@ -125,3 +125,43 @@ def units_in_header(df: pd.DataFrame, units: dict | None = None) -> pd.DataFrame
 def from_header(df: pd.DataFrame) -> pd.DataFrame:
     """Inverse of :func:`units_in_header`: header form -> unit-safe ``pint`` dtype."""
     return df.pint.quantify()
+
+
+def write_units_csv(df: pd.DataFrame, path, **to_csv_kwargs) -> str:
+    """Write ``df`` to CSV **with its units** (the unit-carrying header form).
+
+    A one-liner around :func:`units_in_header` + ``to_csv`` so tables are never
+    stored without their units. Round-trips with :func:`read_units_csv`. Extra
+    keyword arguments are forwarded to :meth:`pandas.DataFrame.to_csv`.
+
+    Args:
+        df: a table of plain-float columns (with ``df.attrs["units"]``) or
+            ``pint[...]`` columns.
+        path: destination CSV path.
+
+    Returns:
+        ``str(path)`` for convenience.
+    """
+    units_in_header(df).to_csv(path, **to_csv_kwargs)
+    return str(path)
+
+
+def read_units_csv(path, **read_csv_kwargs) -> pd.DataFrame:
+    """Read a CSV written by :func:`write_units_csv` back into ``pint[...]`` columns.
+
+    The returned DataFrame is **unit-aware**: arithmetic propagates units and
+    derived columns get their units automatically (e.g. ``df["area"] / df["time"]``
+    yields a ``pint[micrometer ** 2 / minute]`` column). Columns without a unit
+    (e.g. an id or a label) come back as plain columns. ``header`` / ``index_col``
+    default to the two-row unit header and first-column index; any other keyword
+    arguments are forwarded to :func:`pandas.read_csv`.
+
+    Args:
+        path: a CSV produced by :func:`write_units_csv`.
+
+    Returns:
+        A DataFrame with unit-safe ``pint`` columns (see :func:`from_header`).
+    """
+    read_csv_kwargs.setdefault("header", [0, 1])
+    read_csv_kwargs.setdefault("index_col", 0)
+    return from_header(pd.read_csv(path, **read_csv_kwargs))
