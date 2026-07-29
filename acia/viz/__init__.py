@@ -1171,18 +1171,46 @@ def render_overlay_frame(
 
 
 def render_segmentation_mask(
-    source: ImageSequenceSource, overlay: Overlay, alpha=0.8
+    source: ImageSequenceSource,
+    overlay: Overlay,
+    alpha=0.8,
+    *,
+    colors=None,
+    palette: dict | None = None,
+    cmap: str = "viridis",
+    default_color: tuple[int, int, int] = (120, 120, 120),
 ) -> THWCSequenceSource:
-    """Render cell segmentation based on masks with random colors
+    """Render cell segmentation masks, colored randomly (default) or from a table.
 
     Args:
-        source (ImageSequenceSource): the time-lapse sequence source
-        overlay (Overlay): the corresponding overlay. WARNING: all instances need to be based on masks!
-        alpha (float, optional): The opacity of the masked image. Defaults to 0.8.
+        source (ImageSequenceSource): the time-lapse sequence source.
+        overlay (Overlay): the corresponding overlay. WARNING: all instances need
+            to be based on masks!
+        alpha (float, optional): weight of the *original* image in the blend --
+            ``1.0`` keeps the frame unchanged, ``0.0`` shows solid mask color.
+            Defaults to 0.8.
+        colors: optional per-cell coloring, matched to contours by **id** -- a
+            ``pandas.Series`` indexed by contour id (i.e. one column of a property
+            table), a ``dict`` ``{id: value}``, or a single-column ``DataFrame``.
+            Each value becomes a color: an ``(r, g, b)`` triple is used directly, a
+            number is mapped through ``cmap`` (continuous), anything else is
+            categorical (one distinct color per category, from ``palette`` or a
+            qualitative colormap). ``None`` (default) keeps the original random
+            per-instance colors.
+        palette: optional ``{category: (r, g, b)}`` mapping for categorical
+            ``colors`` (its keys double as the color legend).
+        cmap: matplotlib colormap name used for numeric ``colors``.
+        default_color: color for cells absent from ``colors`` (or with ``NaN``).
 
     Returns:
         THWCSequenceSource: TxHxWx3 sequence
     """
+    id_to_rgb = None
+    if colors is not None:
+        id_to_rgb, _ = _resolve_cell_colors(
+            _as_id_value_dict(colors), palette, cmap, default_color
+        )
+
     return_images = []
 
     for im, ov in zip(
@@ -1194,15 +1222,92 @@ def render_segmentation_mask(
         height, width = raw.shape[:2]
         image = _to_uint8_rgb(raw)
 
-        label_mask = _frame_label_mask(list(ov), height, width, enumerate_fallback=True)
+        conts = list(ov)
+        label_mask = _frame_label_mask(conts, height, width, enumerate_fallback=True)
 
-        # render the masks based on the first contour mask in the frame
-        colored_mask = colorize_instance_mask(label_mask)
+        if id_to_rgb is None:
+            # random per-instance colors (original behaviour)
+            colored_mask = colorize_instance_mask(label_mask)
+        else:
+            # drive the color LUT from the table: each contour's rasterized label
+            # -> the color looked up for that contour's id
+            labels = _contour_labels(conts, enumerate_fallback=True)
+            lut = np.zeros((int(label_mask.max()) + 1, 3), dtype=np.uint8)
+            for cont, lbl in zip(conts, labels, strict=False):
+                lut[lbl] = id_to_rgb.get(cont.id, default_color)
+            colored_mask = colorize_instance_mask(label_mask, color_lut=lut)
 
         return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
+
+
+def _as_id_value_dict(values) -> dict:
+    """Normalize a Series / single-column DataFrame / dict into ``{id: value}``."""
+    if hasattr(values, "columns"):  # DataFrame
+        if values.shape[1] != 1:
+            raise ValueError(
+                "values DataFrame must have exactly one column (pass e.g. df['col'])"
+            )
+        values = values.iloc[:, 0]
+    if hasattr(values, "to_dict"):  # pandas Series
+        return dict(values.to_dict())
+    return dict(values)
+
+
+def _is_rgb(v) -> bool:
+    return (
+        isinstance(v, (tuple, list, np.ndarray))
+        and len(v) == 3
+        and all(isinstance(x, numbers.Number) and not isinstance(x, bool) for x in v)
+    )
+
+
+def _resolve_cell_colors(id_value, palette, cmap, default_color):
+    """Map ``{id: value}`` -> ``({id: (r,g,b)}, {category: (r,g,b)} legend)``.
+
+    ``(r,g,b)`` values pass through; numeric values map through ``cmap``
+    (continuous, no discrete legend); everything else is treated as categorical.
+    """
+    present = {
+        i: v
+        for i, v in id_value.items()
+        if v is not None and not (isinstance(v, float) and np.isnan(v))
+    }
+    vals = list(present.values())
+    id_to_rgb: dict = {}
+    legend: dict = {}
+
+    if vals and all(_is_rgb(v) for v in vals):
+        for i, v in present.items():
+            id_to_rgb[i] = tuple(int(x) for x in v)
+        return id_to_rgb, legend
+
+    if vals and all(
+        isinstance(v, numbers.Number) and not isinstance(v, bool) for v in vals
+    ):
+        arr = np.array([float(v) for v in vals], dtype=float)
+        lo = float(arr.min())
+        span = float(arr.max()) - lo or 1.0
+        cm = mpl.colormaps[cmap] if cmap in mpl.colormaps else mpl.colormaps["viridis"]
+        for i, v in present.items():
+            r, g, b, _ = cm((float(v) - lo) / span)
+            id_to_rgb[i] = (int(r * 255), int(g * 255), int(b * 255))
+        return id_to_rgb, legend
+
+    # categorical: one distinct color per category
+    categories = sorted({str(v) for v in vals})
+    resolved = {str(k): tuple(int(x) for x in c) for k, c in (palette or {}).items()}
+    qualitative = mpl.colormaps["tab10"]
+    for k, cat in enumerate(categories):
+        if cat not in resolved:
+            r, g, b, _ = qualitative(k % qualitative.N)
+            resolved[cat] = (int(r * 255), int(g * 255), int(b * 255))
+    for i, v in present.items():
+        id_to_rgb[i] = resolved.get(str(v), default_color)
+    legend = {cat: resolved[cat] for cat in categories}
+    return id_to_rgb, legend
 
 
 def render_tracking_mask(
