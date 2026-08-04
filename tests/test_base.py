@@ -267,5 +267,62 @@ class TestRegisteredSequenceSourceOnMissing:
         assert registered.missing_frames == {0, 2}
 
 
+class TestFragmentedInstance:
+    """An Instance whose mask has disconnected components.
+
+    `mask_to_polygons` returns a MultiPolygon for such a mask, which has no
+    `exterior` -- previously an AttributeError from `coordinates` (and so from
+    `save_segmentation`) rather than a usable contour.
+    """
+
+    @staticmethod
+    def _fragmented(label=1):
+        mask = np.zeros((20, 20), dtype=np.int32)
+        mask[3:8, 3:8] = label  # 25 px
+        mask[12:15, 12:15] = label  # 9 px, detached
+        return Instance(mask, frame=0, label=label, id=1)
+
+    @staticmethod
+    def _solid(label=1):
+        mask = np.zeros((20, 20), dtype=np.int32)
+        mask[3:8, 3:8] = label
+        return Instance(mask, frame=0, label=label, id=2)
+
+    def test_coordinates_returns_the_largest_part(self):
+        inst = self._fragmented()
+        coords = inst.coordinates
+        assert coords.shape[1] == 2
+        # the 5x5 blob's outline, not the 3x3 one
+        xs, ys = coords[:, 0], coords[:, 1]
+        assert xs.max() - xs.min() == 5
+        assert ys.max() - ys.min() == 5
+
+    def test_is_fragmented_flags_only_multi_part_masks(self):
+        assert self._fragmented().is_fragmented is True
+        assert self._solid().is_fragmented is False
+
+    def test_area_still_counts_every_component(self):
+        """`area` comes from the mask, so it is unaffected by the polygon
+        having to pick one part -- 25 + 9 px."""
+        assert self._fragmented().area == 34.0
+
+    def test_draw_agrees_with_coordinates(self):
+        """Both pick the same part, so a rendered outline matches what a
+        serialized contour would hold."""
+        from PIL import Image
+
+        inst = self._fragmented()
+        image = Image.new("RGB", (20, 20))
+        inst.draw(image)  # must not raise
+        drawn = np.array(image).sum(axis=-1)
+        # nothing drawn around the small, discarded blob
+        assert drawn[12:15, 12:15].sum() == 0
+
+    def test_empty_mask_still_raises_a_clear_error(self):
+        empty = Instance(np.zeros((20, 20), dtype=np.int32), frame=0, label=1, id=3)
+        with pytest.raises(ValueError, match="empty mask"):
+            _ = empty.coordinates
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,13 +2,14 @@
 
 import gzip
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
 from tifffile import imread
 
 from acia.base import Contour, ImageSequenceSource, Instance, Overlay
-from acia.utils import multi_mask_to_polygons
+from acia.utils import largest_polygon, multi_mask_to_polygons
 
 
 def parse_simple_segmentation(file_content: str) -> Overlay:
@@ -140,10 +141,26 @@ def save_segmentation(path: str | Path, overlay: Overlay) -> Path:
 
     coordinate_blocks = []
     offsets = [0]
+    fragmented = 0
     for cont in contours:
+        # An Instance whose mask has disconnected components has no single
+        # outline, so only its largest part can be stored. Count them and say
+        # so once below rather than quietly shrinking those detections.
+        if getattr(cont, "is_fragmented", False):
+            fragmented += 1
         coordinates = np.asarray(cont.coordinates, dtype=np.float32).reshape(-1, 2)
         coordinate_blocks.append(coordinates)
         offsets.append(offsets[-1] + len(coordinates))
+
+    if fragmented:
+        warnings.warn(
+            f"{fragmented} of {len(contours)} detections have masks with more "
+            "than one connected component; only each one's largest part is "
+            "stored as a polygon, so those detections reload smaller than they "
+            "were. Usually a sign of over-segmentation or specks sharing a "
+            "cell's label -- filter the overlay first if that matters.",
+            stacklevel=2,
+        )
 
     coordinates_array = (
         np.concatenate(coordinate_blocks)
@@ -293,6 +310,11 @@ def load_ctc_segmentation(segmentation_path: Path) -> Overlay:
         polygons = multi_mask_to_polygons(imread(segm_file))
 
         for _, poly in polygons:
+            # A label whose mask has disconnected components comes back as a
+            # MultiPolygon (and an empty one as None) -- neither has `exterior`.
+            poly = largest_polygon(poly)
+            if poly is None:
+                continue
             points = np.array(poly.exterior.coords.xy)
             overlay.add_contour(Contour(points, -1, frame_id, c_id, "cell"))
             c_id += 1

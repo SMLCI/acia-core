@@ -88,6 +88,16 @@ section to a dated version entry automatically.
   GitHub Pages documentation.
 
 ### Fixed
+- `Instance.coordinates` raised `AttributeError: 'MultiPolygon' object has no
+  attribute 'exterior'` when a detection's mask had more than one connected
+  component — a cell the segmentation split in two, or a speck sharing its
+  label. This aborted `save_segmentation` partway through. Such a mask has no
+  single outline, so its largest part is now used, the same choice
+  `Instance.draw` already made; the new `acia.utils.largest_polygon` helper is
+  shared by both (and by the CTC readers, which had the same latent crash).
+  `Instance.is_fragmented` reports when it applies, and `save_segmentation`
+  warns once with a count, since those detections reload smaller than they were.
+  `Instance.area` is computed from the mask and is unaffected.
 - `HoughLineRigidFit` raised `IndexError` on every call under OpenCV 5, which
   changed `cv2.HoughLinesP`'s output from `(N, 1, 4)` to `(N, 4)`. Detected
   segments are now reshaped instead of indexed at a fixed layout, so both

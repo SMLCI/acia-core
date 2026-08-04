@@ -26,7 +26,7 @@ from tqdm.contrib.concurrent import process_map
 from acia.colors import resolve_channel_color
 from acia.notebook import JupyterVisualizationMixin, normalize_to_uint8
 
-from .utils import mask_to_polygons, polygon_to_mask
+from .utils import largest_polygon, mask_to_polygons, polygon_to_mask
 
 
 def unpack(data, function):
@@ -139,8 +139,24 @@ class Instance:
         return self._polygon
 
     @property
+    def is_fragmented(self) -> bool:
+        """Whether this instance's mask has more than one connected component.
+
+        Such a mask has no single outline, so :attr:`coordinates` (and
+        :meth:`draw`) can only represent its largest part -- see
+        :func:`~acia.utils.largest_polygon`. Lets a caller that is about to
+        persist or render many instances report how many are affected instead
+        of losing the smaller parts silently.
+        """
+        return isinstance(self.polygon, MultiPolygon)
+
+    @property
     def coordinates(self) -> np.ndarray:
         """Extract contour coordinates
+
+        A mask with disconnected components has no single outline; its largest
+        part is used (see :func:`~acia.utils.largest_polygon`), matching what
+        :meth:`draw` renders. :attr:`is_fragmented` reports when that applies.
 
         Raises:
             ValueError: if the polygon is not valid or None
@@ -154,6 +170,10 @@ class Instance:
 
         if not poly.is_valid:
             raise ValueError("Invalid Shapely polygon.")
+
+        poly = largest_polygon(poly)
+        if poly is None:
+            raise ValueError("Polygon holds no parts (empty mask).")
 
         # polygon.exterior.coords returns a coordinate sequence with first==last (closed ring)
         coords = np.array(
@@ -177,14 +197,11 @@ class Instance:
         if draw is None:
             draw = ImageDraw.Draw(image)
 
-        def get_largest(poly):
-            if isinstance(poly, MultiPolygon):
-                return poly.geoms[np.argmax([p.area for p in poly.geoms])]
-            else:
-                return poly
-
-        # get the contour coordinates
-        coords = np.stack(get_largest(self.polygon).exterior.coords, axis=0).astype(int)
+        # get the contour coordinates (largest part only, for a mask with
+        # disconnected components -- same choice `coordinates` makes)
+        coords = np.stack(largest_polygon(self.polygon).exterior.coords, axis=0).astype(
+            int
+        )
         # draw the polygon
         draw.polygon(tuple(coords.flatten()), outline=outlineColor, fill=fillColor)
 

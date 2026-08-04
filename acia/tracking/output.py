@@ -11,12 +11,11 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import tifffile
-from shapely.geometry import MultiPolygon
 from tqdm.auto import tqdm
 
 from acia.base import BaseImage, Contour, ImageSequenceSource, Overlay
 from acia.tracking import TrackingSource
-from acia.utils import multi_mask_to_polygons
+from acia.utils import largest_polygon, multi_mask_to_polygons
 
 
 class CellTrackingChallengeDatasetGT:
@@ -327,11 +326,11 @@ class CTCTrackingHelper:
             tqdm(all_polygons, desc="Convert to overlay...")
         ):
             for id, poly in frame_polygons:
-                if isinstance(poly, MultiPolygon):
-                    # if it comes to parsing problems take the polygon with the largest area
-                    polygons = list(poly.geoms)
-                    areas = [p.area for p in polygons]
-                    poly = polygons[np.argmax(areas)]
+                # a label whose mask has disconnected components has no single
+                # outline; its largest part represents the object
+                poly = largest_polygon(poly)
+                if poly is None:
+                    continue
 
                 cc = np.stack(poly.exterior.coords.xy, axis=-1)
                 contours.append(Contour(cc, -1, frame, f"{frame}_{id}"))

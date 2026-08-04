@@ -60,6 +60,41 @@ def mask_to_polygons(mask: np.ndarray) -> Polygon | MultiPolygon | None:
     return all_polygons
 
 
+def largest_polygon(
+    polygon: Polygon | MultiPolygon | None,
+) -> Polygon | None:
+    """Reduce a possibly-multi-part polygon to its single largest-area part.
+
+    :func:`mask_to_polygons` returns a ``MultiPolygon`` whenever an object's
+    mask has disconnected components -- a cell the segmentation split in two, a
+    stray speck sharing the cell's label, or a self-intersecting outline that
+    ``buffer(0)`` repaired into several pieces. Anything that needs *one*
+    closed outline (a contour's coordinates, a drawn shape) has to pick a part,
+    and the largest is the one that represents the object.
+
+    Note that this discards the smaller parts, so a caller that persists or
+    measures the result is losing whatever area they held; callers in a
+    position to say so should report it. :attr:`~acia.base.Instance.area` is
+    unaffected, being computed from the mask rather than the polygon.
+
+    Args:
+        polygon: A ``Polygon``, a ``MultiPolygon``, or ``None``.
+
+    Returns:
+        shapely.geometry.Polygon | None: The largest constituent polygon,
+            ``polygon`` itself when it is already a single ``Polygon``, or
+            ``None`` when ``polygon`` is ``None`` or holds no parts.
+    """
+    if polygon is None:
+        return None
+    if isinstance(polygon, MultiPolygon):
+        parts = list(polygon.geoms)
+        if not parts:
+            return None
+        return max(parts, key=lambda part: part.area)
+    return polygon
+
+
 def multi_mask_to_polygons(
     mask: np.ndarray,
 ) -> list[tuple[int, Polygon | MultiPolygon]]:

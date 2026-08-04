@@ -13,13 +13,14 @@ tools read.
 
 import gzip
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from acia.base import Contour, Overlay
+from acia.base import Contour, Instance, Overlay
 from acia.segm.formats import (
     gen_simple_segmentation,
     load_segmentation,
@@ -243,6 +244,56 @@ class TestSegmentationCalibration(unittest.TestCase):
 
         self.assertIsNone(loaded.timepoints)
         self.assertEqual(len(loaded), 4)
+
+
+class TestFragmentedDetections(unittest.TestCase):
+    """Instances whose masks have disconnected components.
+
+    Such a mask has no single outline, so only its largest part can be stored
+    as a polygon. That used to raise `AttributeError: 'MultiPolygon' object has
+    no attribute 'exterior'` partway through a save.
+    """
+
+    @staticmethod
+    def _fragmented_overlay():
+        mask = np.zeros((20, 20), dtype=np.int32)
+        mask[3:8, 3:8] = 1
+        mask[12:15, 12:15] = 1  # detached speck sharing the label
+        solid = np.zeros((20, 20), dtype=np.int32)
+        solid[3:8, 3:8] = 1
+        return Overlay(
+            [
+                Instance(mask, frame=0, label=1, id=1),
+                Instance(solid, frame=0, label=1, id=2),
+            ],
+            frames=[0],
+        )
+
+    def test_saving_a_fragmented_detection_succeeds(self):
+        with TemporaryDirectory() as d:
+            with self.assertWarns(UserWarning) as ctx:
+                path = save_segmentation(
+                    Path(d) / "segmentation", self._fragmented_overlay()
+                )
+            self.assertIn("connected component", str(ctx.warning))
+            self.assertEqual(len(load_segmentation(path)), 2)
+
+    def test_no_warning_when_every_detection_is_one_piece(self):
+        solid = np.zeros((20, 20), dtype=np.int32)
+        solid[3:8, 3:8] = 1
+        overlay = Overlay([Instance(solid, frame=0, label=1, id=1)], frames=[0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with TemporaryDirectory() as d:
+                save_segmentation(Path(d) / "segmentation", overlay)
+
+    def test_contours_never_trigger_the_warning(self):
+        """A Contour is already a single outline -- it has no `polygon` to be
+        multi-part, and the check must not assume otherwise."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with TemporaryDirectory() as d:
+                save_segmentation(Path(d) / "segmentation", _overlay())
 
 
 if __name__ == "__main__":
