@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
+from acia.base import RotatedCropSpec
 from acia.registration import FrameTransform
 from acia.registration_persistence import (
     RegistrationManifest,
@@ -29,8 +30,9 @@ from acia.registration_persistence import (
 # fakes (assert laziness without pixel IO)
 # --------------------------------------------------------------------------- #
 class _FakeRegistered:
-    def __init__(self, transforms):
+    def __init__(self, transforms, on_missing="warn"):
         self.transforms = transforms
+        self.on_missing = on_missing
         self.frames_read = 0
 
     def get_frame(self, i):  # pragma: no cover - must not be called by load
@@ -39,8 +41,8 @@ class _FakeRegistered:
 
 
 class _FakeSource:
-    def register(self, transforms):
-        return _FakeRegistered(transforms)
+    def register(self, transforms, *, on_missing="warn"):
+        return _FakeRegistered(transforms, on_missing=on_missing)
 
 
 class _FakeSeqFile:
@@ -141,6 +143,101 @@ class TestRoundTrip(unittest.TestCase):
             nested = Path(d) / "nested" / "output"
             path = save_registration(m, nested)
             self.assertTrue(Path(path).exists())
+
+
+class TestBackwardCompatibility(unittest.TestCase):
+    """Older manifests must keep loading, and fixed-mode runs keep writing
+    exactly the JSON they always did -- the reference-policy and confidence
+    fields are purely additive in both directions."""
+
+    def test_pre_reference_mode_record_loads_as_fixed(self):
+        legacy = {
+            "position": 1,
+            "method": "GradientECC",
+            "transforms": {"0": {"dx": 1.0, "dy": 2.0, "theta": 0.0}},
+            "reference_frame": 0,
+            "failed_frames": {"4": "RegistrationError: no signal"},
+            "notes": "",
+        }
+        record = RegistrationRecord.from_dict(legacy)
+        self.assertEqual(record.reference_mode, "fixed")
+        self.assertEqual(record.reference_frames, {})
+        self.assertIsNone(record.transforms[0].confidence)
+
+    def test_fixed_mode_record_serializes_without_the_new_keys(self):
+        record = RegistrationRecord(
+            position=1,
+            method="GradientECC",
+            transforms={0: FrameTransform(1.0, 2.0, 0.0)},
+        )
+        data = record.to_dict()
+        self.assertNotIn("reference_mode", data)
+        self.assertNotIn("reference_frames", data)
+        self.assertNotIn("confidence", data["transforms"]["0"])
+
+    def test_manifest_without_method_params_loads(self):
+        manifest = RegistrationManifest.from_dict(
+            {"schema": "acia.registration/v1", "source": {}, "records": []}
+        )
+        self.assertEqual(manifest.method_params, {})
+        self.assertNotIn("method_params", manifest.to_dict())
+
+
+class TestReferencePolicyPersistence(unittest.TestCase):
+    """The reference policy and its per-frame anchors survive a round-trip."""
+
+    def test_record_roundtrips_reference_mode_and_anchors(self):
+        record = RegistrationRecord(
+            position=2,
+            method="GradientECC",
+            transforms={
+                0: FrameTransform(0.0, 0.0, 0.0),
+                9: FrameTransform(1.0, 2.0, 0.0, confidence=0.97),
+            },
+            failed_frames={5: "RegistrationError: blank"},
+            reference_mode="reanchor",
+            reference_frames={9: 8},
+        )
+        data = record.to_dict()
+        json.dumps(data)
+        self.assertEqual(data["reference_mode"], "reanchor")
+        self.assertEqual(data["reference_frames"], {"9": 8})
+
+        restored = RegistrationRecord.from_dict(data)
+        self.assertEqual(restored, record)
+        self.assertEqual(restored.reference_frames, {9: 8})
+        self.assertEqual(restored.transforms[9].confidence, 0.97)
+
+    def test_manifest_records_method_params(self):
+        manifest = _mk_manifest([(0, {0: (1.0, 2.0, 0.0)}, None)])
+        manifest.method_params = {"min_confidence": 0.9, "reference_mode": "reanchor"}
+        data = manifest.to_dict()
+        json.dumps(data)
+        restored = RegistrationManifest.from_dict(data)
+        self.assertEqual(restored.method_params["reference_mode"], "reanchor")
+
+    def test_non_jsonable_method_params_are_stringified_not_dropped(self):
+        """exclude_rects is a list of dataclasses; the manifest exists to make
+        a run legible, so record something rather than failing to save."""
+        manifest = _mk_manifest([(0, {0: (1.0, 2.0, 0.0)}, None)])
+        spec = RotatedCropSpec(center=(1.0, 2.0), size=(10, 20), angle=0.0)
+        manifest.method_params = {"exclude_rects": [spec]}
+        with tempfile.TemporaryDirectory() as d:
+            path = save_registration(manifest, d)
+            restored = RegistrationManifest.load(path)
+        self.assertIn("RotatedCropSpec", restored.method_params["exclude_rects"][0])
+
+
+class TestLoadRegistrationOnMissing(unittest.TestCase):
+    def test_on_missing_is_forwarded_to_each_view(self):
+        m = _mk_manifest([(0, {0: (1.0, 2.0, 0.0)}, None)])
+        sources = load_registration(m, source=_FakeSeqFile(1), on_missing="nearest")
+        self.assertEqual(sources[0].on_missing, "nearest")
+
+    def test_default_is_warn(self):
+        m = _mk_manifest([(0, {0: (1.0, 2.0, 0.0)}, None)])
+        sources = load_registration(m, source=_FakeSeqFile(1))
+        self.assertEqual(sources[0].on_missing, "warn")
 
 
 # --------------------------------------------------------------------------- #

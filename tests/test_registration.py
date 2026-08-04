@@ -28,10 +28,13 @@ from acia.registration import (
     HoughLineRigidFit,
     MaskedTemplateCorrelation,
     PhaseCorrelationHighpass,
+    ReanchoringReference,
     RegistrationError,
     _build_gray_pyramid,
     _parabolic_refine,
+    _rect_mask,
     apply_correction,
+    compose,
     run_comparison,
 )
 
@@ -117,6 +120,82 @@ def _single_line_frame(seed: int = 5, size: int = SIZE) -> np.ndarray:
 
 def _default_mask_rect() -> RotatedCropSpec:
     return RotatedCropSpec(center=(100.0, 100.0), size=(60, 60), angle=0.0)
+
+
+DEVICE_SIZE = 512
+
+# The two "growth channels": static rectangles whose *interiors* fill with
+# cells over time, while their borders (the channel walls) stay put.
+DEVICE_ROIS = ((120, 100, 90, 260), (300, 100, 90, 260))
+
+
+def _device_frame(seed: int = 11, size: int = DEVICE_SIZE) -> np.ndarray:
+    """Static microfluidic-like geometry: noise + irregularly spaced walls.
+
+    The wall spacing is deliberately irregular. An evenly-spaced grid aliases
+    under coarse-to-fine downsampling -- :class:`GradientECC`'s documented
+    wrong-by-one-period limitation -- which would make these tests flaky for a
+    reason that has nothing to do with what they are checking.
+    """
+    rng = np.random.default_rng(seed)
+    frame = rng.integers(0, 25, (size, size)).astype(np.float32)
+    for x in (40, 205, 250, 470):
+        cv2.line(frame, (x, 0), (x, size), 220, 2)
+    for y in (30, 480):
+        cv2.line(frame, (0, y), (size, y), 220, 2)
+    for x, y, w, h in DEVICE_ROIS:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), 255, 3)
+    return cv2.GaussianBlur(frame, (0, 0), 1.0)
+
+
+def _device_roi_specs() -> list[RotatedCropSpec]:
+    """:data:`DEVICE_ROIS` as the crop specs a caller would already have."""
+    return [
+        RotatedCropSpec(
+            center=(x + w / 2.0, y + h / 2.0), size=(int(w), int(h)), angle=0.0
+        )
+        for x, y, w, h in DEVICE_ROIS
+    ]
+
+
+def _growing_colony_series(
+    n_frames: int = 40, drift_per_frame: tuple[float, float] = (0.06, -0.04)
+) -> tuple[list[np.ndarray], list[tuple[float, float]]]:
+    """Frames with known linear drift *and* monotonically growing content.
+
+    Reproduces the field failure this module's ``exclude_rects`` support
+    exists for: cells accumulate inside :data:`DEVICE_ROIS` as time advances,
+    so a fixed-reference correlation coefficient decays with elapsed content
+    change even though the drift stays perfectly recoverable.
+
+    Returns:
+        tuple: ``(frames, ground_truth)`` where ``ground_truth[t]`` is the
+            ``(dx, dy)`` frame ``t`` was displaced by.
+    """
+    base = _device_frame()
+    frames, truth = [], []
+    for t in range(n_frames):
+        frame = base.copy()
+        # Same RNG stream every frame, so frame t's cells are a superset of
+        # frame t-1's -- growth, not a reshuffle.
+        rng = np.random.default_rng(100)
+        for x, y, w, h in DEVICE_ROIS:
+            for _ in range(int(t * 1.2)):
+                cx = int(rng.integers(x + 6, x + w - 6))
+                cy = int(rng.integers(y + 6, y + h - 6))
+                cv2.circle(frame, (cx, cy), int(rng.integers(3, 6)), 200, -1)
+        frame = cv2.GaussianBlur(frame, (0, 0), 1.0)
+        dx, dy = drift_per_frame[0] * t, drift_per_frame[1] * t
+        frames.append(
+            cv2.warpAffine(
+                frame,
+                np.float32([[1, 0, dx], [0, 1, dy]]),
+                (DEVICE_SIZE, DEVICE_SIZE),
+                borderMode=cv2.BORDER_REFLECT,
+            )
+        )
+        truth.append((dx, dy))
+    return frames, truth
 
 
 class TestFrameTransform(unittest.TestCase):
@@ -755,6 +834,383 @@ class TestRunComparisonProgress(unittest.TestCase):
         # through (a ragged/short list would mean the callback's exception
         # propagated out of the loop).
         self.assertEqual(len(results["GradientECC"]), 3)
+
+
+class TestFrameTransformConfidence(unittest.TestCase):
+    """The optional per-transform goodness-of-fit score."""
+
+    def test_defaults_to_none_and_is_omitted_from_to_dict(self):
+        transform = FrameTransform(dx=1.0, dy=2.0, theta=3.0)
+        self.assertIsNone(transform.confidence)
+        # Serialization of a score-less transform is unchanged, so manifests
+        # written by earlier versions stay byte-identical.
+        self.assertEqual(transform.to_dict(), {"dx": 1.0, "dy": 2.0, "theta": 3.0})
+
+    def test_roundtrips_when_set(self):
+        transform = FrameTransform(dx=1.0, dy=2.0, theta=3.0, confidence=0.87)
+        self.assertEqual(transform.to_dict()["confidence"], 0.87)
+        self.assertEqual(FrameTransform.from_dict(transform.to_dict()), transform)
+
+    def test_from_dict_without_confidence_yields_none(self):
+        transform = FrameTransform.from_dict({"dx": 1.0, "dy": 2.0, "theta": 0.0})
+        self.assertIsNone(transform.confidence)
+
+    def test_gradient_ecc_reports_a_confidence(self):
+        reference = _structured_frame()
+        moved = _warp(reference, dx=3.0, dy=-2.0, theta=0.0)
+        transform = GradientECC().estimate(reference, moved)
+        self.assertIsNotNone(transform.confidence)
+        self.assertGreater(transform.confidence, 0.95)
+
+    def test_phase_correlation_reports_no_confidence(self):
+        """A method with no honest scalar to report leaves it None."""
+        reference = _textured_frame()
+        moved = _warp(reference, dx=3.0, dy=-2.0, theta=0.0)
+        transform = PhaseCorrelationHighpass().estimate(reference, moved)
+        self.assertIsNone(transform.confidence)
+
+
+class TestCompose(unittest.TestCase):
+    """:func:`compose` against the matrix product it stands in for."""
+
+    @staticmethod
+    def _matrix(transform: FrameTransform, center: tuple[float, float]) -> np.ndarray:
+        matrix = cv2.getRotationMatrix2D(center, transform.theta, 1.0)
+        matrix[0, 2] += transform.dx
+        matrix[1, 2] += transform.dy
+        return np.vstack([matrix, [0.0, 0.0, 1.0]])
+
+    def _assert_close(self, actual: FrameTransform, expected: FrameTransform):
+        self.assertAlmostEqual(actual.dx, expected.dx, places=9)
+        self.assertAlmostEqual(actual.dy, expected.dy, places=9)
+        self.assertAlmostEqual(actual.theta, expected.theta, places=9)
+
+    def test_matches_matrix_product_for_any_pivot(self):
+        first = FrameTransform(dx=3.0, dy=-2.0, theta=4.0)
+        second = FrameTransform(dx=-1.5, dy=0.5, theta=-7.0)
+        composed = compose(first, second)
+        # Center-independence is the property that lets compose() take no
+        # frame shape: assert it against three different pivots.
+        for center in ((0.0, 0.0), (137.0, 42.0), (-11.0, 300.0)):
+            product = self._matrix(second, center) @ self._matrix(first, center)
+            np.testing.assert_allclose(
+                self._matrix(composed, center), product, atol=1e-9
+            )
+
+    def test_identity_is_a_left_and_right_unit(self):
+        identity = FrameTransform(dx=0.0, dy=0.0, theta=0.0)
+        transform = FrameTransform(dx=3.0, dy=-2.0, theta=4.0)
+        self._assert_close(compose(identity, transform), transform)
+        self._assert_close(compose(transform, identity), transform)
+
+    def test_is_associative(self):
+        a = FrameTransform(dx=3.0, dy=-2.0, theta=4.0)
+        b = FrameTransform(dx=-1.5, dy=0.5, theta=-7.0)
+        c = FrameTransform(dx=0.7, dy=9.0, theta=2.5)
+        self._assert_close(compose(compose(a, b), c), compose(a, compose(b, c)))
+
+    def test_confidence_is_the_weakest_link(self):
+        a = FrameTransform(dx=0.0, dy=0.0, theta=0.0, confidence=0.9)
+        b = FrameTransform(dx=0.0, dy=0.0, theta=0.0, confidence=0.7)
+        self.assertEqual(compose(a, b).confidence, 0.7)
+
+    def test_confidence_is_none_when_either_input_lacks_one(self):
+        scored = FrameTransform(dx=0.0, dy=0.0, theta=0.0, confidence=0.9)
+        unscored = FrameTransform(dx=0.0, dy=0.0, theta=0.0)
+        self.assertIsNone(compose(scored, unscored).confidence)
+        self.assertIsNone(compose(unscored, scored).confidence)
+
+
+class TestRectMask(unittest.TestCase):
+    """The ECC validity mask built from crop specs."""
+
+    def test_no_rects_yields_no_mask(self):
+        self.assertIsNone(_rect_mask((64, 64), []))
+
+    def test_excludes_the_rect_interior_and_keeps_everything_else(self):
+        spec = RotatedCropSpec(center=(50.0, 50.0), size=(20, 20), angle=0.0)
+        mask = _rect_mask((100, 100), [spec])
+        self.assertEqual(mask[50, 50], 0)  # inside
+        self.assertEqual(mask[10, 10], 255)  # outside
+
+    def test_shrink_keeps_a_band_just_inside_the_border(self):
+        """The border band is what makes the mask worth using -- a channel
+        wall's sharp edge is exactly the static feature to register on."""
+        spec = RotatedCropSpec(center=(50.0, 50.0), size=(40, 40), angle=0.0)
+        tight = _rect_mask((100, 100), [spec], shrink_px=0.0)
+        shrunk = _rect_mask((100, 100), [spec], shrink_px=5.0)
+        # A pixel 3 px inside the border: excluded without shrink, kept with.
+        self.assertEqual(tight[50, 33], 0)
+        self.assertEqual(shrunk[50, 33], 255)
+        self.assertEqual(shrunk[50, 50], 0)  # the interior is still excluded
+
+    def test_shrinking_a_rect_away_entirely_excludes_nothing(self):
+        spec = RotatedCropSpec(center=(50.0, 50.0), size=(10, 10), angle=0.0)
+        self.assertIsNone(_rect_mask((100, 100), [spec], shrink_px=20.0))
+
+    def test_scale_maps_the_rect_onto_a_pyramid_level(self):
+        spec = RotatedCropSpec(center=(100.0, 100.0), size=(40, 40), angle=0.0)
+        half = _rect_mask((100, 100), [spec], scale=0.5)
+        self.assertEqual(half[50, 50], 0)  # the rect center, halved
+        self.assertEqual(half[95, 95], 255)
+
+    def test_rotated_rect_is_masked_where_the_crop_would_be_taken(self):
+        """The mask must agree with RotatedCropSequenceSource's own geometry,
+        or an excluded region would drift away from the ROI it stands for."""
+        spec = RotatedCropSpec(center=(60.0, 50.0), size=(40, 16), angle=30.0)
+        mask = _rect_mask((120, 120), [spec])
+
+        # Reproduce the crop the same way acia.base does, and check the mask
+        # is zero exactly over the pixels that crop would have covered.
+        cx, cy = spec.center
+        w, h = spec.size
+        matrix = cv2.getRotationMatrix2D((cx, cy), spec.angle, 1.0)
+        matrix[0, 2] += w / 2 - cx
+        matrix[1, 2] += h / 2 - cy
+        cropped_mask = cv2.warpAffine(
+            mask, matrix, (w, h), flags=cv2.INTER_NEAREST, borderValue=255
+        )
+        # Allow a 1px rounding skin around the polygon edge.
+        self.assertLess(cropped_mask[2:-2, 2:-2].max(), 1)
+
+    def test_covering_the_whole_frame_raises(self):
+        spec = RotatedCropSpec(center=(50.0, 50.0), size=(400, 400), angle=0.0)
+        with self.assertRaises(RegistrationError) as ctx:
+            _rect_mask((100, 100), [spec])
+        self.assertIn("entire", str(ctx.exception))
+
+
+class TestSceneDriftFalseFailure(unittest.TestCase):
+    """The reported bug: content change, not misalignment, trips the gate.
+
+    Against a fixed reference, ECC's correlation coefficient measures scene
+    similarity. When the imaged content evolves, it decays with elapsed time
+    even though the fit stays accurate -- so ``min_confidence`` degrades into
+    a "how far into the run are we" gate and rejects good fits in a
+    contiguous tail of late frames.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.frames, cls.truth = _growing_colony_series(n_frames=40)
+
+    def test_late_frames_are_rejected_against_a_fixed_reference(self):
+        method = GradientECC()  # min_confidence=0.9
+        with self.assertRaises(RegistrationError) as ctx:
+            method.estimate(self.frames[0], self.frames[-1])
+        self.assertIn("correlation coefficient", str(ctx.exception))
+
+    def test_the_rejected_fits_were_actually_correct(self):
+        """With the gate off, the very frames it rejected land on target."""
+        method = GradientECC(min_confidence=0.0)
+        for t in (20, 30, 39):
+            transform = method.estimate(self.frames[0], self.frames[t])
+            dx, dy = self.truth[t]
+            self.assertAlmostEqual(transform.dx, dx, delta=0.5)
+            self.assertAlmostEqual(transform.dy, dy, delta=0.5)
+            self.assertAlmostEqual(transform.theta, 0.0, delta=0.5)
+
+    def test_confidence_decays_monotonically_with_elapsed_content_change(self):
+        method = GradientECC(min_confidence=0.0)
+        scores = [
+            method.estimate(self.frames[0], self.frames[t]).confidence
+            for t in range(0, 40, 8)
+        ]
+        for earlier, later in pairwise(scores):
+            self.assertLess(later, earlier)
+
+
+class TestGradientECCExcludeRects(unittest.TestCase):
+    """The fix: leave the regions whose content changes out of the objective."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.frames, cls.truth = _growing_colony_series(n_frames=40)
+        cls.specs = _device_roi_specs()
+
+    def test_every_frame_passes_the_default_gate(self):
+        """What the bug above breaks, this restores -- at the default
+        min_confidence, with no tolerance loosened anywhere."""
+        method = GradientECC(exclude_rects=self.specs, exclude_shrink_px=10.0)
+        for t in range(1, 40):
+            transform = method.estimate(self.frames[0], self.frames[t])
+            dx, dy = self.truth[t]
+            self.assertAlmostEqual(transform.dx, dx, delta=0.5)
+            self.assertAlmostEqual(transform.dy, dy, delta=0.5)
+
+    def test_confidence_stays_high_across_the_sequence(self):
+        method = GradientECC(exclude_rects=self.specs, exclude_shrink_px=10.0)
+        for t in (20, 30, 39):
+            confidence = method.estimate(self.frames[0], self.frames[t]).confidence
+            self.assertGreater(confidence, 0.9)
+
+    def test_no_exclusion_is_bit_identical_to_the_unmasked_path(self):
+        """Passing no rects must not perturb an existing calibration."""
+        reference = _structured_frame()
+        moved = _warp(reference, dx=3.0, dy=-2.0, theta=1.0)
+        plain = GradientECC(min_confidence=0.0).estimate(reference, moved)
+        empty = GradientECC(min_confidence=0.0, exclude_rects=[]).estimate(
+            reference, moved
+        )
+        self.assertEqual(plain, empty)
+
+    def test_excluding_everything_raises(self):
+        huge = [RotatedCropSpec(center=(256.0, 256.0), size=(2000, 2000), angle=0.0)]
+        method = GradientECC(exclude_rects=huge)
+        with self.assertRaises(RegistrationError):
+            method.estimate(self.frames[0], self.frames[10])
+
+
+class _RecordingMethod:
+    """A stub method capturing which reference each estimate was made against.
+
+    Frames are single-pixel arrays holding their own index, so a recorded
+    reference identifies the anchor unambiguously.
+    """
+
+    def __init__(self, fail_on=(), fail_against_reference=()):
+        self.fail_on = set(fail_on)
+        self.fail_against_reference = set(fail_against_reference)
+        self.calls: list[tuple[int, int]] = []
+
+    def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
+        ref_id, frame_id = int(reference[0, 0]), int(frame[0, 0])
+        self.calls.append((ref_id, frame_id))
+        if frame_id in self.fail_on:
+            raise RegistrationError("stub: unconditional failure")
+        if ref_id in self.fail_against_reference:
+            raise RegistrationError("stub: cannot estimate against this reference")
+        # A transform that encodes the *step* taken, so composition is checkable.
+        return FrameTransform(dx=float(frame_id - ref_id), dy=0.0, theta=0.0)
+
+
+def _id_frame(index: int) -> np.ndarray:
+    return np.full((1, 1), index, dtype=np.int32)
+
+
+class TestReanchoringReference(unittest.TestCase):
+    """The fallback reference policy."""
+
+    def test_rejects_an_unknown_mode(self):
+        with self.assertRaises(ValueError):
+            ReanchoringReference(_RecordingMethod(), _id_frame(0), mode="sideways")
+
+    def test_fixed_mode_always_uses_the_original_reference(self):
+        method = _RecordingMethod()
+        tracker = ReanchoringReference(method, _id_frame(0), mode="fixed")
+        for t in range(1, 5):
+            tracker.estimate(t, _id_frame(t))
+        self.assertEqual(method.calls, [(0, 1), (0, 2), (0, 3), (0, 4)])
+        self.assertEqual(tracker.reanchor_events, [])
+        self.assertEqual(tracker.anchors_used, {})
+
+    def test_fixed_mode_propagates_failures_without_retrying(self):
+        method = _RecordingMethod(fail_on={3})
+        tracker = ReanchoringReference(method, _id_frame(0), mode="fixed")
+        tracker.estimate(1, _id_frame(1))
+        with self.assertRaises(RegistrationError):
+            tracker.estimate(3, _id_frame(3))
+        self.assertEqual(method.calls, [(0, 1), (0, 3)])
+
+    def test_reanchor_only_fires_after_a_failure(self):
+        """A frame that succeeds against the reference must take the same path
+        it always did -- that is what makes this safe to enable by default."""
+        method = _RecordingMethod()
+        tracker = ReanchoringReference(method, _id_frame(0), mode="reanchor")
+        for t in range(1, 5):
+            tracker.estimate(t, _id_frame(t))
+        self.assertEqual(method.calls, [(0, 1), (0, 2), (0, 3), (0, 4)])
+        self.assertEqual(tracker.reanchor_events, [])
+
+    def test_reanchor_retries_against_the_last_good_frame_and_composes(self):
+        method = _RecordingMethod(fail_against_reference={0})
+        tracker = ReanchoringReference(method, _id_frame(0), mode="reanchor")
+        # Frame 1 has no fallback yet (last-good is still the reference).
+        with self.assertRaises(RegistrationError):
+            tracker.estimate(1, _id_frame(1))
+
+        method.fail_against_reference = set()
+        tracker.estimate(2, _id_frame(2))  # succeeds, becomes last-good
+        method.fail_against_reference = {0}
+
+        transform = tracker.estimate(5, _id_frame(5))
+        # 0->2 (dx=2) composed with 2->5 (dx=3) == 0->5 (dx=5), absolute.
+        self.assertAlmostEqual(transform.dx, 5.0)
+        self.assertEqual(method.calls[-2:], [(0, 5), (2, 5)])
+        self.assertEqual(tracker.reanchor_events, [(5, 2)])
+        self.assertEqual(tracker.anchors_used, {5: 2})
+
+    def test_an_unrecoverable_frame_stays_an_isolated_failure(self):
+        """An isolated bad frame must not poison the frames after it."""
+        method = _RecordingMethod(fail_on={3})
+        tracker = ReanchoringReference(method, _id_frame(0), mode="reanchor")
+        tracker.estimate(1, _id_frame(1))
+        tracker.estimate(2, _id_frame(2))
+        with self.assertRaises(RegistrationError):
+            tracker.estimate(3, _id_frame(3))
+        # The anchor is untouched, so frame 4 resolves normally.
+        self.assertEqual(tracker.estimate(4, _id_frame(4)).dx, 4.0)
+
+    def test_chained_mode_always_steps_from_the_previous_frame(self):
+        method = _RecordingMethod()
+        tracker = ReanchoringReference(method, _id_frame(0), mode="chained")
+        for t in range(1, 5):
+            transform = tracker.estimate(t, _id_frame(t))
+        self.assertEqual(method.calls, [(0, 1), (1, 2), (2, 3), (3, 4)])
+        # Composition still yields an absolute reference->frame transform.
+        self.assertAlmostEqual(transform.dx, 4.0)
+
+    def test_seed_restores_the_chain_for_a_resumed_run(self):
+        method = _RecordingMethod(fail_against_reference={0})
+        tracker = ReanchoringReference(method, _id_frame(0), mode="reanchor")
+        tracker.seed(7, _id_frame(7), FrameTransform(dx=7.0, dy=0.0, theta=0.0))
+        transform = tracker.estimate(8, _id_frame(8))
+        self.assertAlmostEqual(transform.dx, 8.0)
+        self.assertEqual(tracker.reanchor_events, [(8, 7)])
+
+
+class TestReanchoringOnGrowingColony(unittest.TestCase):
+    """The policy on the fixture that motivated it, with a real method."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.frames, cls.truth = _growing_colony_series(n_frames=40)
+
+    def _run(self, mode):
+        tracker = ReanchoringReference(GradientECC(), self.frames[0], mode=mode)
+        results, failures = {}, []
+        for t in range(1, len(self.frames)):
+            try:
+                results[t] = tracker.estimate(t, self.frames[t])
+            except RegistrationError:
+                failures.append(t)
+        return tracker, results, failures
+
+    def test_fixed_mode_reproduces_the_failure_tail(self):
+        _tracker, _results, failures = self._run("fixed")
+        self.assertTrue(failures, "expected the fixed reference to fail late")
+        # Contiguous tail, not scattered one-offs -- the signature of content
+        # change rather than of individual bad frames.
+        self.assertEqual(failures, list(range(failures[0], len(self.frames))))
+
+    def test_reanchor_mode_registers_every_frame_accurately(self):
+        tracker, results, failures = self._run("reanchor")
+        self.assertEqual(failures, [])
+        self.assertTrue(tracker.reanchor_events)
+        for t, transform in results.items():
+            dx, dy = self.truth[t]
+            self.assertAlmostEqual(transform.dx, dx, delta=0.5)
+            self.assertAlmostEqual(transform.dy, dy, delta=0.5)
+
+    def test_chained_mode_accumulation_stays_bounded(self):
+        """Chaining every frame works but accumulates composition error --
+        measured at ~0.006 px/frame here, hence the preference for reanchor."""
+        _tracker, results, failures = self._run("chained")
+        self.assertEqual(failures, [])
+        worst = max(
+            abs(transform.dx - self.truth[t][0]) for t, transform in results.items()
+        )
+        self.assertLess(worst, 1.0)
 
 
 if __name__ == "__main__":

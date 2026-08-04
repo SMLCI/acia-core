@@ -18,8 +18,9 @@ scope for this module.
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,19 +55,38 @@ class FrameTransform:
         theta: Rotation angle in degrees, counter-clockwise. Defaults to
             ``0.0`` for translation-only methods; always set explicitly
             (never omitted) so a translation-only result is unambiguous.
+        confidence: The estimating method's own goodness-of-fit score for
+            this transform, or ``None`` when the method has no honest scalar
+            to report. Purely diagnostic -- nothing in this module *acts* on
+            it; a method that wants to reject an unconfident fit raises
+            :class:`RegistrationError` instead. Scores are **not** comparable
+            across methods (an ECC correlation coefficient and a RANSAC
+            inlier fraction are different quantities), and for a method
+            comparing against a fixed reference a score is only comparable
+            across frames while the imaged content itself stays static --
+            see :class:`GradientECC`.
     """
 
     dx: float
     dy: float
     theta: float = 0.0
+    confidence: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain JSON-friendly dict representation.
 
+        ``confidence`` is emitted only when it is not ``None``, so a transform
+        from a method that reports no score serializes to exactly the
+        three-key dict it always has.
+
         Returns:
-            dict: ``{"dx": dx, "dy": dy, "theta": theta}``.
+            dict: ``{"dx": dx, "dy": dy, "theta": theta}``, plus
+                ``"confidence"`` when one is set.
         """
-        return {"dx": self.dx, "dy": self.dy, "theta": self.theta}
+        data: dict[str, Any] = {"dx": self.dx, "dy": self.dy, "theta": self.theta}
+        if self.confidence is not None:
+            data["confidence"] = self.confidence
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FrameTransform:
@@ -74,15 +94,20 @@ class FrameTransform:
 
         Args:
             data: A mapping as produced by :meth:`to_dict`. ``theta`` may be
-                omitted, defaulting to ``0.0``.
+                omitted, defaulting to ``0.0``; ``confidence`` may be omitted
+                (or ``null``), defaulting to ``None`` -- so a
+                ``registration_transforms.json`` written before confidences
+                were recorded loads unchanged.
 
         Returns:
             FrameTransform: The reconstructed transform.
         """
+        confidence = data.get("confidence")
         return cls(
             dx=float(data["dx"]),
             dy=float(data["dy"]),
             theta=float(data.get("theta", 0.0)),
+            confidence=None if confidence is None else float(confidence),
         )
 
 
@@ -410,6 +435,137 @@ def _decompose_similarity(
     return FrameTransform(dx=dx, dy=dy, theta=theta)
 
 
+def compose(first: FrameTransform, second: FrameTransform) -> FrameTransform:
+    """Chain two transforms into the single transform they are equivalent to.
+
+    If ``first`` was estimated as A->B and ``second`` as B->C, the result is
+    the A->C transform. Used by :class:`ReanchoringReference` to turn a
+    step estimated against a mid-sequence anchor back into an absolute
+    transform against the sequence's original reference frame.
+
+    The result is independent of the pivot point: writing a
+    :class:`FrameTransform` as the 2x3 matrix ``[R(theta) | (I - R(theta))c + d]``
+    (the ``cv2.getRotationMatrix2D``-about-``c``-then-translate convention this
+    module uses throughout), the matrix product works out to
+    ``theta = theta_1 + theta_2`` and ``d = d_2 + R(theta_2) @ d_1`` with the
+    pivot ``c`` cancelling exactly. So callers need not agree on a center, and
+    no frame shape is required here.
+
+    Args:
+        first: The A->B transform.
+        second: The B->C transform.
+
+    Returns:
+        FrameTransform: The equivalent A->C transform. ``confidence`` is the
+            minimum of the two inputs' confidences (a chain is only as
+            trustworthy as its weakest link), or ``None`` if either input has
+            none.
+    """
+    radians = np.radians(second.theta)
+    cos_t, sin_t = float(np.cos(radians)), float(np.sin(radians))
+    # R(theta) = [[cos, sin], [-sin, cos]] -- the getRotationMatrix2D convention,
+    # matching the 2x2 block _decompose_similarity reads back.
+    dx = second.dx + cos_t * first.dx + sin_t * first.dy
+    dy = second.dy - sin_t * first.dx + cos_t * first.dy
+
+    confidence = (
+        None
+        if first.confidence is None or second.confidence is None
+        else min(first.confidence, second.confidence)
+    )
+    return FrameTransform(
+        dx=dx,
+        dy=dy,
+        theta=first.theta + second.theta,
+        confidence=confidence,
+    )
+
+
+def _rect_mask(
+    shape: tuple[int, int],
+    rects: Sequence[RotatedCropSpec],
+    *,
+    shrink_px: float = 0.0,
+    scale: float = 1.0,
+) -> np.ndarray | None:
+    """Build an ECC validity mask that excludes the interior of each rectangle.
+
+    ``cv2.findTransformECC`` accepts an ``inputMask`` and computes its
+    correlation coefficient over the unmasked pixels only. That is what lets a
+    caller keep a region whose *content* changes over time -- a growth channel
+    filling with cells -- from dragging the correlation coefficient down even
+    when the alignment itself is perfect (see :class:`GradientECC`).
+
+    Args:
+        shape: ``(H, W)`` of the level the mask is for.
+        rects: Regions to exclude, in **full-resolution** image coordinates.
+            Built with the same rotation matrix
+            :class:`~acia.base.RotatedCropSequenceSource` uses to take the
+            crop, so an excluded region lands exactly where the corresponding
+            crop would.
+        shrink_px: Shrink each rectangle inward by this many full-resolution
+            pixels per side before excluding it, so a band of that width just
+            inside the rectangle's border stays in the objective. A rectangle's
+            border typically sits on static device geometry (a channel wall)
+            that is worth keeping; a rectangle that shrinks away to nothing is
+            simply not excluded.
+        scale: Multiplier mapping full-resolution coordinates onto this level
+            (``level_width / full_width``). Rectangles are scaled rather than
+            the finished mask being resized, so a thin retained border band
+            survives coarse pyramid levels instead of being interpolated away.
+
+    Returns:
+        np.ndarray | None: ``(H, W)`` ``uint8`` mask -- 255 to keep, 0 to
+            exclude -- or ``None`` when ``rects`` is empty or nothing ends up
+            excluded, so callers can pass ``None`` straight through and get
+            exactly the unmasked behavior.
+
+    Raises:
+        RegistrationError: If the rectangles cover the whole frame, leaving no
+            pixels to register on.
+    """
+    if not rects:
+        return None
+
+    height, width = int(shape[0]), int(shape[1])
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    excluded_any = False
+
+    for spec in rects:
+        cx, cy = spec.center[0] * scale, spec.center[1] * scale
+        rect_w = spec.size[0] * scale - 2.0 * shrink_px * scale
+        rect_h = spec.size[1] * scale - 2.0 * shrink_px * scale
+        if rect_w <= 0.0 or rect_h <= 0.0:
+            # Shrunk away entirely: this rectangle contributes no exclusion.
+            continue
+
+        # Same construction as RotatedCropSequenceSource._warp: map the region
+        # onto an axis-aligned (rect_w, rect_h) canvas, then invert to get the
+        # region's corner polygon back in image coordinates.
+        crop_matrix = cv2.getRotationMatrix2D((cx, cy), spec.angle, 1.0)
+        crop_matrix[0, 2] += rect_w / 2 - cx
+        crop_matrix[1, 2] += rect_h / 2 - cy
+        inverse = cv2.invertAffineTransform(crop_matrix)
+
+        corners = np.array(
+            [[0.0, 0.0], [rect_w, 0.0], [rect_w, rect_h], [0.0, rect_h]],
+            dtype=np.float64,
+        )
+        polygon = corners @ inverse[:, :2].T + inverse[:, 2]
+        cv2.fillPoly(mask, [np.round(polygon).astype(np.int32)], 0)
+        excluded_any = True
+
+    if not excluded_any:
+        return None
+    if not mask.any():
+        raise RegistrationError(
+            "_rect_mask: the excluded rectangles cover the entire "
+            f"{width}x{height} frame, leaving nothing to register on. Reduce "
+            "the excluded regions or increase shrink_px."
+        )
+    return mask
+
+
 class PhaseCorrelationHighpass(RegistrationMethod):
     """Translation-only registration via high-pass phase correlation.
 
@@ -597,7 +753,7 @@ class MaskedTemplateCorrelation(RegistrationMethod):
         dx = alpha * raw_dx - beta * raw_dy
         dy = beta * raw_dx + alpha * raw_dy
 
-        return FrameTransform(dx=dx, dy=dy, theta=0.0)
+        return FrameTransform(dx=dx, dy=dy, theta=0.0, confidence=float(max_val))
 
 
 def _parabolic_refine(c_minus: float, c_zero: float, c_plus: float) -> float:
@@ -1073,7 +1229,10 @@ class FeatureRANSACEuclidean(RegistrationMethod):
             )
 
         h, w = ref_gray.shape
-        return _decompose_similarity(matrix, (w / 2.0, h / 2.0))
+        transform = _decompose_similarity(matrix, (w / 2.0, h / 2.0))
+        # Inlier fraction: the share of ratio-test matches RANSAC kept. Not
+        # comparable to another method's score -- purely diagnostic.
+        return dataclasses.replace(transform, confidence=n_inliers / len(good))
 
 
 class GradientECC(RegistrationMethod):
@@ -1112,6 +1271,34 @@ class GradientECC(RegistrationMethod):
     stopping early trades some estimation precision for speed and should be
     enabled deliberately, not silently.
 
+    Important (``min_confidence`` on a sequence whose content changes):
+        ECC's correlation coefficient measures how similar the two gradient
+        images are *after* alignment. When every frame of a long time-lapse is
+        registered against one fixed reference and the imaged content itself
+        evolves -- a colony growing into the field of view, a channel filling
+        with cells -- the coefficient decays with elapsed *biology*, not with
+        misalignment, and a fixed ``min_confidence`` gate eventually rejects
+        perfectly good fits in a contiguous tail of late frames. On a synthetic
+        device fixture with growing content and known drift, the coefficient
+        fell from 0.96 to 0.75 over 120 frames while the recovered drift stayed
+        accurate to 0.03 px.
+
+        ``exclude_rects`` is the direct remedy: exclude the regions whose
+        content changes (the growth channels) so the coefficient is computed
+        only on static geometry. On that same fixture it then stayed above
+        0.95 for the whole sequence at identical accuracy. Where that is not
+        possible, register against a recent frame instead of a fixed one (see
+        :class:`ReanchoringReference`). Simply lowering ``min_confidence`` is
+        a poor substitute: once content changes, the coefficients of correct
+        and incorrect fits overlap, so the gate stops discriminating in either
+        direction.
+
+        Note also that with ``early_stop_delta_px`` set, the gated coefficient
+        is the one from whichever pyramid level estimation stopped at, not
+        necessarily the full-resolution one. Coarse levels tend to score
+        slightly higher, so early stopping makes the gate marginally more
+        lenient.
+
     Attributes:
         n_iterations: Maximum ECC iterations, applied at every pyramid level.
         epsilon: ECC convergence threshold, applied at every pyramid level.
@@ -1126,6 +1313,9 @@ class GradientECC(RegistrationMethod):
             tightly around ``0.98``-``0.99``, while silently-wrong fits
             (converged to the wrong local optimum) top out around ``0.87``
             -- ``0.9`` cleanly separates the two with margin on both sides.
+            That calibration holds only for a **static scene**; see the
+            "Important" note above before trusting it on a time-lapse whose
+            content evolves.
         max_pyramid_levels: Hard cap on the number of coarse-to-fine levels
             (see :func:`_build_gray_pyramid`); the finest level is always
             the full-resolution frame.
@@ -1147,6 +1337,20 @@ class GradientECC(RegistrationMethod):
             fewer parameters and converges more robustly when the true
             motion is known to be translation-only. ``False`` (default)
             matches prior behavior exactly.
+        exclude_rects: Regions to leave out of the ECC objective entirely
+            (see :func:`_rect_mask` and the "Important" note above), in
+            full-resolution image coordinates. The natural choice is the very
+            rectangles a caller has already marked as its regions of interest:
+            those are where the biology is, hence where the content changes.
+            ``None`` (default) registers on the whole frame, matching prior
+            behavior exactly.
+        exclude_shrink_px: Shrink each excluded rectangle inward by this many
+            pixels per side, keeping a band that wide just inside its border
+            in the objective. Those borders usually sit on static device
+            geometry (channel walls) whose sharp edges measurably improve
+            precision, so excluding a rectangle right up to its border throws
+            away the most useful features near it. Ignored when
+            ``exclude_rects`` is ``None``.
     """
 
     def __init__(
@@ -1159,6 +1363,8 @@ class GradientECC(RegistrationMethod):
         min_pyramid_size: int = 128,
         early_stop_delta_px: float | None = None,
         translation_only: bool = False,
+        exclude_rects: Sequence[RotatedCropSpec] | None = None,
+        exclude_shrink_px: float = 0.0,
     ):
         self.n_iterations = n_iterations
         self.epsilon = epsilon
@@ -1168,6 +1374,8 @@ class GradientECC(RegistrationMethod):
         self.min_pyramid_size = min_pyramid_size
         self.early_stop_delta_px = early_stop_delta_px
         self.translation_only = translation_only
+        self.exclude_rects = tuple(exclude_rects) if exclude_rects else ()
+        self.exclude_shrink_px = exclude_shrink_px
 
     def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
         """See :meth:`RegistrationMethod.estimate`."""
@@ -1215,6 +1423,26 @@ class GradientECC(RegistrationMethod):
         for level_idx in range(len(ref_pyr) - 1, -1, -1):
             level_ref_grad = _gradient_magnitude(ref_pyr[level_idx])
             level_frm_grad = _gradient_magnitude(frm_pyr[level_idx])
+
+            # Rebuild the exclusion mask at this level's resolution by scaling
+            # the rectangles (rather than resizing a full-resolution mask),
+            # so a thin retained border band survives coarse levels.
+            level_h, level_w = ref_pyr[level_idx].shape[:2]
+            level_mask = _rect_mask(
+                (level_h, level_w),
+                self.exclude_rects,
+                shrink_px=self.exclude_shrink_px,
+                scale=level_w / full_w,
+            )
+            if level_mask is not None:
+                # Blank the excluded region in the gradient images too: the
+                # coarse phase-correlation seed below reads them directly, and
+                # NORM_MINMAX would otherwise let excluded content set the
+                # normalization range for the ECC inputs.
+                keep = level_mask.astype(bool)
+                level_ref_grad = np.where(keep, level_ref_grad, 0.0).astype(np.float32)
+                level_frm_grad = np.where(keep, level_frm_grad, 0.0).astype(np.float32)
+
             level_ref_norm = cv2.normalize(  # type: ignore[call-overload]
                 level_ref_grad, None, 0, 1, cv2.NORM_MINMAX
             )
@@ -1256,12 +1484,18 @@ class GradientECC(RegistrationMethod):
                 warp_matrix[1, 2] *= cur_h / prev_h
 
             try:
+                # 7-argument form: `inputMask` restricts the correlation
+                # coefficient to the pixels worth trusting. Passing
+                # (None, 5) is bit-identical to the 5-argument call, since
+                # 5 is findTransformECC's own default gaussFiltSize.
                 cc, warp_matrix = cv2.findTransformECC(
                     level_ref_norm,
                     level_frm_norm,
                     warp_matrix,
                     motion_type,
                     criteria,
+                    level_mask,  # type: ignore[arg-type] # None is accepted
+                    5,
                 )
             except cv2.error as exc:
                 raise RegistrationError(
@@ -1300,10 +1534,22 @@ class GradientECC(RegistrationMethod):
                 prev = (dx, dy, theta)
 
         if cc < self.min_confidence:
+            hint = (
+                ""
+                if self.exclude_rects
+                else (
+                    " If this happens for a contiguous tail of late frames "
+                    "with a steadily decaying coefficient, the imaged content "
+                    "is most likely changing over time rather than the fit "
+                    "going wrong -- pass exclude_rects to leave those regions "
+                    "out of the objective, or register against a recent frame "
+                    "(ReanchoringReference)."
+                )
+            )
             raise RegistrationError(
                 f"GradientECC: final correlation coefficient {cc:.3f} is "
                 f"below min_confidence={self.min_confidence}; rejecting a "
-                "low-confidence fit rather than returning it."
+                f"low-confidence fit rather than returning it.{hint}"
             )
 
         # warp_matrix's translation is in whichever level was last processed
@@ -1319,4 +1565,175 @@ class GradientECC(RegistrationMethod):
             # rather than trust floating-point noise, matching how the
             # module's other translation-only methods report theta.
             theta=0.0 if self.translation_only else transform.theta,
+            confidence=float(cc),
         )
+
+
+class ReanchoringReference:
+    """Estimate every frame against a reference, re-anchoring when that fails.
+
+    A time-lapse is normally registered by estimating each frame against one
+    fixed reference (frame 0). That breaks down when the imaged content itself
+    evolves: a method comparing frame 400 against frame 0 may legitimately fail
+    to find them similar enough to trust, even though the *drift* between them
+    is perfectly recoverable (see :class:`GradientECC`'s note on
+    ``min_confidence``).
+
+    This class wraps any :class:`RegistrationMethod` with a reference policy
+    that handles that case without abandoning the fixed reference where it
+    works:
+
+    - ``"fixed"`` -- always estimate against the original reference. Exactly
+      what a caller gets from ``method.estimate(reference, frame)`` directly;
+      this class adds nothing but bookkeeping.
+    - ``"reanchor"`` (default) -- estimate against the original reference; if
+      that raises, retry **once** against the most recent successfully
+      estimated frame and :func:`compose` the result back into an absolute
+      reference->frame transform. Purely a fallback: a frame that succeeds
+      against the original reference never takes the second path, so enabling
+      this cannot change an estimate that already worked.
+    - ``"chained"`` -- always estimate against the previous frame and compose.
+      Maximally robust to slow content change, but composition error
+      accumulates over the sequence, so prefer ``"reanchor"`` unless a
+      sequence changes so fast that the fixed reference is useless from the
+      start.
+
+    A frame that fails even after re-anchoring raises, exactly as the bare
+    method would, and leaves the anchor untouched -- so an isolated bad frame
+    (a focus blip, a lamp flicker) stays an isolated failure instead of
+    poisoning every frame after it.
+
+    Attributes:
+        reference_frame: Index of the original reference frame; every
+            transform returned by :meth:`estimate` is expressed relative to it,
+            whatever anchor was actually used to compute it.
+        anchor_frame: Index of the frame currently being estimated against.
+        reanchor_events: ``(frame, anchor)`` pairs recorded each time
+            estimation fell back to a mid-sequence anchor -- how often the
+            fallback fired, and where.
+        anchors_used: ``frame -> anchor index`` for every frame that was
+            estimated against something other than :attr:`reference_frame`.
+    """
+
+    MODES = ("fixed", "reanchor", "chained")
+
+    def __init__(
+        self,
+        method: RegistrationMethod,
+        reference: np.ndarray,
+        *,
+        reference_frame: int = 0,
+        mode: str = "reanchor",
+    ):
+        """Initialize the policy.
+
+        Args:
+            method: The registration method to drive.
+            reference: The original reference frame's pixel data.
+            reference_frame: That frame's index in the sequence.
+            mode: One of :data:`MODES`.
+
+        Raises:
+            ValueError: If ``mode`` is not one of :data:`MODES`.
+        """
+        if mode not in self.MODES:
+            raise ValueError(
+                f"Unknown reference mode {mode!r}; expected one of "
+                f"{', '.join(self.MODES)}."
+            )
+        self.method = method
+        self.mode = mode
+        self.reference_frame = reference_frame
+        self._reference = reference
+        self.reanchor_events: list[tuple[int, int]] = []
+        self.anchors_used: dict[int, int] = {}
+
+        # The most recent successfully-estimated frame: its index, pixels, and
+        # absolute (reference->it) transform. Seeded with the reference itself,
+        # whose absolute transform is the identity by definition.
+        self._last_good_frame: int = reference_frame
+        self._last_good_image: np.ndarray = reference
+        self._last_good_absolute: FrameTransform = FrameTransform(0.0, 0.0, 0.0)
+
+    @property
+    def anchor_frame(self) -> int:
+        """Index of the frame the next estimate will be made against."""
+        if self.mode == "chained":
+            return self._last_good_frame
+        return self.reference_frame
+
+    def seed(self, index: int, image: np.ndarray, absolute: FrameTransform) -> None:
+        """Restore the last-good state, so a resumed run continues the chain.
+
+        Without this, resuming a partially-registered position would treat the
+        first frame of the resumed run as if nothing had been registered yet
+        and re-anchor from the original reference again.
+
+        Args:
+            index: The frame index to treat as the most recent success.
+            image: That frame's pixel data.
+            absolute: Its reference->frame transform, as already recorded.
+        """
+        self._last_good_frame = index
+        self._last_good_image = image
+        self._last_good_absolute = absolute
+
+    def estimate(self, index: int, frame: np.ndarray) -> FrameTransform:
+        """Estimate ``frame``'s transform relative to the original reference.
+
+        Args:
+            index: ``frame``'s index in the sequence, used for bookkeeping and
+                to decide whether a fallback anchor is even available.
+            frame: The frame's pixel data.
+
+        Returns:
+            FrameTransform: The absolute reference->``frame`` transform.
+
+        Raises:
+            RegistrationError: If the frame cannot be estimated against the
+                reference nor (where applicable) against the fallback anchor.
+        """
+        if self.mode == "chained":
+            return self._estimate_against_last_good(index, frame)
+
+        try:
+            transform = self.method.estimate(self._reference, frame)
+        except RegistrationError:
+            no_fallback = (
+                self.mode == "fixed"
+                or self._last_good_frame == self.reference_frame
+                or index <= self._last_good_frame
+            )
+            if no_fallback:
+                # Nothing better to try: report the failure as the bare method
+                # would, leaving last-good untouched so the next frame still
+                # has a usable anchor.
+                raise
+            anchor = self._last_good_frame
+            transform = self._estimate_against_last_good(index, frame)
+            self.reanchor_events.append((index, anchor))
+            return transform
+
+        self._remember(index, frame, transform)
+        return transform
+
+    def _estimate_against_last_good(
+        self, index: int, frame: np.ndarray
+    ) -> FrameTransform:
+        """Estimate against the last good frame and compose back to absolute."""
+        anchor = self._last_good_frame
+        step = self.method.estimate(self._last_good_image, frame)
+        absolute = compose(self._last_good_absolute, step)
+        if anchor != self.reference_frame:
+            self.anchors_used[index] = anchor
+        self._remember(index, frame, absolute)
+        return absolute
+
+    def _remember(
+        self, index: int, image: np.ndarray, absolute: FrameTransform
+    ) -> None:
+        """Record a success as the new fallback anchor, if it is the latest."""
+        if index >= self._last_good_frame:
+            self._last_good_frame = index
+            self._last_good_image = image
+            self._last_good_absolute = absolute

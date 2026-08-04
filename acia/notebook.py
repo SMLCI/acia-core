@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import inspect
 import io
 import logging
 import os
@@ -3080,7 +3081,13 @@ if _HAS_ANYWIDGET:
         _esm = _REGISTRATION_DASHBOARD_ESM
 
         def __init__(
-            self, source, *, method_name: str = "GradientECC", **kwargs
+            self,
+            source,
+            *,
+            method_name: str = "GradientECC",
+            method_kwargs: dict | None = None,
+            reference_mode: str = "reanchor",
+            **kwargs,
         ) -> None:
             """Build the dashboard from a source (no pixel reads at construction).
 
@@ -3090,14 +3097,39 @@ if _HAS_ANYWIDGET:
                 method_name: The initially-selected
                     :class:`~acia.registration.RegistrationMethod` name; one of
                     :data:`_REGISTRATION_METHOD_NAMES`.
+                method_kwargs: Constructor keyword arguments for the chosen
+                    method, e.g. ``{"min_confidence": 0.8}`` or
+                    ``{"exclude_rects": [...]}`` for
+                    :class:`~acia.registration.GradientECC`. Deliberately a
+                    plain attribute rather than a synced trait: arbitrary
+                    Python objects (``RotatedCropSpec`` instances) must not be
+                    pushed across the widget comm.
+                reference_mode: The reference policy batch-apply registers
+                    under; one of
+                    :data:`~acia.registration.ReanchoringReference.MODES`.
+                    Defaults to ``"reanchor"``, which only changes what happens
+                    to a frame that would otherwise be recorded as a failure.
+                    Pass ``"fixed"`` to always compare against frame 0.
                 **kwargs: Forwarded to ``anywidget.AnyWidget``.
+
+            Raises:
+                ValueError: If ``reference_mode`` is not a known mode.
             """
+            from acia.registration import ReanchoringReference
             from acia.segm.open import open_sequence
+
+            if reference_mode not in ReanchoringReference.MODES:
+                raise ValueError(
+                    f"Unknown reference_mode {reference_mode!r}; expected one "
+                    f"of {', '.join(ReanchoringReference.MODES)}."
+                )
 
             if isinstance(source, (str, os.PathLike)):
                 source = open_sequence(source)
             self._file = source
             self._records: dict[int, RegistrationRecord] = {}
+            self._method_kwargs: dict = dict(method_kwargs or {})
+            self._reference_mode = reference_mode
 
             meta = source.metadata
             positions = [{"index": p.index, "name": p.name} for p in source.positions]
@@ -3198,15 +3230,27 @@ if _HAS_ANYWIDGET:
                 self.send({"type": "saved", "path": path})
 
         def _build_method(
-            self, method_name: str, mask_rect: RotatedCropSpec | None = None
+            self,
+            method_name: str,
+            mask_rect: RotatedCropSpec | None = None,
+            **overrides,
         ):
             """Construct a fresh :class:`~acia.registration.RegistrationMethod`.
 
+            Settings are layered: this dashboard's ``method_kwargs``, then
+            ``overrides``. That is what lets batch-apply pass per-position
+            settings (an ``exclude_rects`` list differing per position) without
+            the caller having to reach into the method object afterwards.
+
             Args:
                 method_name: One of :data:`_REGISTRATION_METHOD_NAMES`.
-                mask_rect: The mask rect to use for ``MaskedTemplateCorrelation``;
-                    defaults to :attr:`mask_rect` when ``None``. Ignored for the
-                    other 4 methods, which run directly on raw frame pairs.
+                mask_rect: The mask rect to use for a method that accepts one
+                    (currently ``MaskedTemplateCorrelation``); defaults to
+                    :attr:`mask_rect` when ``None``. Silently ignored by
+                    methods whose constructor has no ``mask_rect`` parameter,
+                    which run directly on raw frame pairs.
+                **overrides: Constructor keyword arguments taking precedence
+                    over this dashboard's ``method_kwargs``.
 
             Raises:
                 ValueError: If ``method_name`` is unknown, or if
@@ -3215,15 +3259,22 @@ if _HAS_ANYWIDGET:
             """
             classes = _registration_method_classes()
             cls = classes[method_name]
-            if method_name == "MaskedTemplateCorrelation":
+
+            kwargs = {**self._method_kwargs, **overrides}
+
+            # Pass mask_rect to whichever methods actually accept one, rather
+            # than naming a single class here.
+            accepts_mask = "mask_rect" in inspect.signature(cls).parameters
+            if accepts_mask and "mask_rect" not in kwargs:
                 rect = mask_rect if mask_rect is not None else self.mask_rect
                 if rect is None:
                     raise ValueError(
-                        "MaskedTemplateCorrelation requires a mask rect -- draw "
+                        f"{method_name} requires a mask rect -- draw "
                         "one (click >=3 points on the mask editor) first."
                     )
-                return cls(mask_rect=rect)
-            return cls()
+                kwargs["mask_rect"] = rect
+
+            return cls(**kwargs)
 
         @property
         def mask_rect(self) -> RotatedCropSpec | None:
@@ -3340,6 +3391,11 @@ if _HAS_ANYWIDGET:
                 "frame_indices": frame_indices,
                 "transforms": [t.to_dict() if t else None for t in transforms],
                 "has_correction": has_correction,
+                # Per-frame goodness-of-fit, where the method reports one. A
+                # monotone decay across the sequence is the signature of
+                # changing content rather than of a worsening fit -- see
+                # GradientECC's note on min_confidence.
+                "confidences": [t.confidence if t else None for t in transforms],
             }
             return payload, buffers
 
@@ -3355,6 +3411,7 @@ if _HAS_ANYWIDGET:
             positions_remaining_after: int = 0,
             progress_state: dict | None = None,
             on_checkpoint: Callable[[RegistrationRecord], None] | None = None,
+            method_kwargs: dict | None = None,
         ) -> RegistrationRecord:
             """Estimate a per-frame transform for every not-yet-computed frame.
 
@@ -3403,13 +3460,19 @@ if _HAS_ANYWIDGET:
                     a fresh one is created if ``None`` (single-position use).
                 on_checkpoint: Optional callback invoked with the
                     record-so-far every ``CHECKPOINT_INTERVAL`` frames.
+                method_kwargs: Per-position constructor overrides for the
+                    method, layered over the dashboard's own ``method_kwargs``.
             """
+            from acia.registration import ReanchoringReference
             from acia.registration_persistence import RegistrationRecord
 
-            method = self._build_method(method_name, mask_rect)
+            method = self._build_method(method_name, mask_rect, **(method_kwargs or {}))
             source = source if source is not None else self._file.position(pos)
             num_frames = source.size_t
             reference = np.asarray(source.get_frame(0).raw)
+            tracker = ReanchoringReference(
+                method, reference, reference_frame=0, mode=self._reference_mode
+            )
 
             transforms: dict[int, FrameTransform] = (
                 dict(existing_record.transforms) if existing_record else {}
@@ -3417,7 +3480,20 @@ if _HAS_ANYWIDGET:
             failed: dict[int, str] = (
                 dict(existing_record.failed_frames) if existing_record else {}
             )
+            if existing_record:
+                tracker.anchors_used.update(existing_record.reference_frames)
             start_frame = len(transforms) + len(failed)
+
+            if transforms:
+                # Resuming: hand the tracker the last frame that succeeded, so
+                # the chain continues from there instead of behaving as though
+                # nothing had been registered yet. Costs one extra frame read.
+                last_good = max(transforms)
+                tracker.seed(
+                    last_good,
+                    np.asarray(source.get_frame(last_good).raw),
+                    transforms[last_good],
+                )
 
             state = (
                 progress_state
@@ -3430,7 +3506,7 @@ if _HAS_ANYWIDGET:
             for t in range(start_frame, num_frames):
                 try:
                     frame = np.asarray(source.get_frame(t).raw)
-                    transforms[t] = method.estimate(reference, frame)
+                    transforms[t] = tracker.estimate(t, frame)
                 except Exception as exc:  # noqa: BLE001 -- isolate per-frame failures
                     failed[t] = f"{type(exc).__name__}: {exc}"
 
@@ -3448,6 +3524,8 @@ if _HAS_ANYWIDGET:
                             transforms=dict(transforms),
                             reference_frame=0,
                             failed_frames=dict(failed),
+                            reference_mode=self._reference_mode,
+                            reference_frames=dict(tracker.anchors_used),
                         )
                     )
                     since_checkpoint = 0
@@ -3481,9 +3559,37 @@ if _HAS_ANYWIDGET:
                 transforms=transforms,
                 reference_frame=0,
                 failed_frames=failed,
+                reference_mode=self._reference_mode,
+                reference_frames=dict(tracker.anchors_used),
             )
 
-        def batch_apply(self, directory=None, positions=None, sources=None) -> dict:
+        def _mode_resumable(self, record: RegistrationRecord) -> bool:
+            """Whether ``record``'s frames are valid progress under this mode.
+
+            Transforms are only resumable under the policy that produced them,
+            with one exception worth honoring: a ``"fixed"`` record with no
+            failed frames is exactly what ``"reanchor"`` would have produced,
+            since re-anchoring is a pure fallback that never fires on a frame
+            that succeeded against the reference. Accepting that case keeps a
+            long run recorded before ``"reanchor"`` became the default from
+            being silently thrown away and recomputed.
+
+            A record with failures is *not* resumable across that boundary --
+            re-anchoring exists precisely to turn some of those failures into
+            successes, so continuing past them would bake in failures the
+            current settings would have avoided.
+            """
+            if record.reference_mode == self._reference_mode:
+                return True
+            return (
+                record.reference_mode == "fixed"
+                and self._reference_mode == "reanchor"
+                and not record.failed_frames
+            )
+
+        def batch_apply(
+            self, directory=None, positions=None, sources=None, method_kwargs=None
+        ) -> dict:
             """Estimate transforms for every (or a subset of) position, live.
 
             For the currently-selected :attr:`method_name`, processes every
@@ -3526,6 +3632,13 @@ if _HAS_ANYWIDGET:
                     only the first 30 frames of position 2. A position absent
                     from ``sources`` (or when ``sources`` is ``None``) falls
                     back to the whole position, unchanged from before.
+                method_kwargs: Constructor overrides for the registration
+                    method, applied to **this call only** and layered over the
+                    dashboard's own ``method_kwargs``. The intended use is
+                    settings that differ per position -- calling this once per
+                    position with that position's own
+                    :class:`~acia.registration.GradientECC` ``exclude_rects``.
+                    Recorded in the manifest's ``method_params``.
 
             Returns:
                 dict: ``{"num_positions", "completed", "skipped",
@@ -3591,13 +3704,15 @@ if _HAS_ANYWIDGET:
                 for idx, i in enumerate(target_positions):
                     pos_source = (sources or {}).get(i)
                     existing_record = records.get(i)
-                    if (
-                        existing_record is not None
-                        and existing_record.method != method_name
+                    if existing_record is not None and (
+                        existing_record.method != method_name
+                        or not self._mode_resumable(existing_record)
                     ):
-                        # Progress recorded under a different method is not valid
-                        # resume/skip data for the currently-selected method --
-                        # treat the position as if it had no prior record at all
+                        # Progress recorded under a different method -- or under
+                        # an incompatible reference policy, which changes what a
+                        # transform is measured against just as much -- is not
+                        # valid resume/skip data for the current settings. Treat
+                        # the position as if it had no prior record at all
                         # rather than silently merging frames across methods.
                         existing_record = None
                     if existing_record is not None:
@@ -3643,6 +3758,7 @@ if _HAS_ANYWIDGET:
                             positions_remaining_after=positions_remaining_after,
                             progress_state=progress_state,
                             on_checkpoint=_checkpoint,
+                            method_kwargs=method_kwargs,
                         )
                     except Exception as exc:  # noqa: BLE001 -- isolate whole-position failures
                         from acia.registration_persistence import RegistrationRecord
@@ -3666,6 +3782,7 @@ if _HAS_ANYWIDGET:
                                 transforms={},
                                 reference_frame=0,
                                 notes=note,
+                                reference_mode=self._reference_mode,
                             )
                         )
                         failed_positions.append(i)
@@ -3700,6 +3817,10 @@ if _HAS_ANYWIDGET:
                 source=make_source_block(self._file),
                 records=sorted(self._records.values(), key=lambda r: r.position),
                 method=self.method_name,
+                method_params={
+                    **self._method_kwargs,
+                    "reference_mode": self._reference_mode,
+                },
             )
 
         def save(self, directory=None) -> str:

@@ -11,6 +11,34 @@ section to a dated version entry automatically.
 ## [Unreleased]
 
 ### Added
+- Registration on time-lapses whose content changes (a colony growing into the
+  field of view), where a fixed-reference correlation coefficient decays with
+  elapsed biology rather than with misalignment and a confidence gate starts
+  rejecting perfectly good fits in a contiguous tail of late frames:
+  - `GradientECC(exclude_rects=..., exclude_shrink_px=...)` leaves the regions
+    whose content changes (typically the ROIs a caller already marked) out of
+    the ECC objective, via `cv2.findTransformECC`'s `inputMask`.
+    `exclude_shrink_px` keeps a band just inside each rectangle's border, whose
+    static device geometry measurably helps precision.
+  - `acia.registration.ReanchoringReference` wraps any `RegistrationMethod`
+    with a reference policy: `"fixed"` (today's behavior), `"reanchor"`
+    (fall back to the last successfully registered frame and compose, only
+    where a frame would otherwise be recorded as a failure), or `"chained"`.
+  - `acia.registration.compose(first, second)` chains two `FrameTransform`s;
+    pivot-independent, so it needs no frame shape.
+  - `FrameTransform.confidence`: the estimating method's own goodness-of-fit
+    score, persisted per frame so a run's confidence trend is auditable.
+    Reported by `GradientECC`, `MaskedTemplateCorrelation` and
+    `FeatureRANSACEuclidean`; `None` elsewhere.
+  - `RegistrationDashboard(method_kwargs=..., reference_mode=...)` and
+    `batch_apply(..., method_kwargs=...)` for per-position settings —
+    registration method settings are now a supported argument rather than
+    something a caller has to reach in and patch.
+  - `ImageSequenceSource.register(..., on_missing=...)`, also on
+    `load_registration`: `"warn"` (default), `"nearest"` (correct a failed
+    frame with its neighbor's transform instead of exporting it uncorrected,
+    which is off by the full accumulated drift), or `"error"`.
+    `RegisteredSequenceSource.missing_frames` reports every gap at once.
 - `FlowposeRTSegmenter` (`acia.segm.processor.flowpose_rt`): omnipose-compatible
   segmentation backed by the lightweight `flowpose-rt` package (no
   cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.
@@ -39,6 +67,23 @@ section to a dated version entry automatically.
   automatically by the extractors (explicit `input_unit` still overrides).
 
 ### Changed
+- `RegistrationDashboard` now defaults to `reference_mode="reanchor"`, so a
+  frame that cannot be estimated against the reference is retried against the
+  last successfully registered one instead of being recorded as a failure. This
+  is a pure fallback — a frame that already succeeded takes exactly the path it
+  always did — and `reference_mode="fixed"` restores the prior behavior.
+  Resuming a partial run recorded under a different policy re-registers the
+  position rather than merging incompatible transforms; a *clean* fixed-mode
+  record (no failed frames) is still reused under `"reanchor"`, since
+  re-anchoring would have produced it identically.
+- `registration_transforms.json` gained optional `reference_mode`,
+  `reference_frames`, per-transform `confidence`, and `method_params` fields.
+  All are additive in both directions: older manifests load unchanged, and a
+  fixed-reference run still writes exactly the JSON it always did (schema stays
+  `acia.registration/v1`).
+- `RegisteredSequenceSource` now warns once per missing frame index instead of
+  once per read, so a lazy multi-pass consumer (crop → write) no longer repeats
+  the same warning on every pass.
 - Migrated CI/CD to GitHub Actions with automated, OIDC-based PyPI releases and
   GitHub Pages documentation.
 

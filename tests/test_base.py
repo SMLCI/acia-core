@@ -1,6 +1,7 @@
 """Test acia base functionality"""
 
 import unittest
+import warnings
 
 import cv2
 import numpy as np
@@ -192,6 +193,78 @@ class TestRegisteredSequenceSource:
         registered = parent.register({})
 
         assert registered.pixel_size == parent.pixel_size
+
+
+class TestRegisteredSequenceSourceOnMissing:
+    """`on_missing` policy for frames with no stored transform."""
+
+    def test_rejects_an_unknown_policy(self):
+        parent = _GraySource(np.stack([_textured_frame(seed=0)]))
+        with pytest.raises(ValueError, match="on_missing"):
+            parent.register({}, on_missing="improvise")
+
+    def test_error_policy_raises_instead_of_degrading(self):
+        parent = _GraySource(np.stack([_textured_frame(seed=1)]))
+        registered = parent.register({}, on_missing="error")
+        with pytest.raises(KeyError, match="no stored correction"):
+            registered.get_frame(0)
+
+    def test_nearest_policy_corrects_with_a_neighbours_transform(self):
+        """A missing frame left uncorrected is off by the *full* accumulated
+        drift; a neighbour's transform is far closer to right."""
+        reference = _textured_frame(seed=2)
+        dx, dy, theta = 6.0, -4.0, 3.0
+        drifted = _warp(reference, dx, dy, theta)
+
+        # Frame 1 has a transform; frame 2 (same drift) has none.
+        stack = np.stack([reference, drifted, drifted])
+        parent = _GraySource(stack)
+        registered = parent.register(
+            {1: FrameTransform(dx=dx, dy=dy, theta=theta)}, on_missing="nearest"
+        )
+
+        with pytest.warns(UserWarning, match="nearest available"):
+            corrected = registered.get_frame(2).raw
+
+        uncorrected_diff = np.abs(
+            drifted.astype(float) - reference.astype(float)
+        ).mean()
+        corrected_diff = np.abs(
+            corrected.astype(float) - reference.astype(float)
+        ).mean()
+        assert corrected_diff < uncorrected_diff * 0.5
+
+    def test_nearest_policy_falls_back_to_uncorrected_when_nothing_is_stored(self):
+        reference = _textured_frame(seed=3)
+        parent = _GraySource(np.stack([reference]))
+        registered = parent.register({}, on_missing="nearest")
+        with pytest.warns(UserWarning, match="no stored correction"):
+            frame = registered.get_frame(0).raw
+        np.testing.assert_array_equal(frame, reference)
+
+    def test_warns_once_per_index_not_once_per_read(self):
+        """A lazy crop -> write pipeline reads each frame on every pass; one
+        warning per pass would bury the signal it is meant to carry."""
+        reference = _textured_frame(seed=4)
+        parent = _GraySource(np.stack([reference, reference]))
+        registered = parent.register({})
+
+        with pytest.warns(UserWarning, match="no stored correction"):
+            registered.get_frame(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            registered.get_frame(0)  # same index again: already reported
+
+    def test_missing_frames_collects_every_gap_for_one_summary(self):
+        reference = _textured_frame(seed=5)
+        parent = _GraySource(np.stack([reference, reference, reference]))
+        registered = parent.register({1: FrameTransform(dx=1.0, dy=0.0, theta=0.0)})
+
+        assert registered.missing_frames == set()
+        with pytest.warns(UserWarning):
+            registered.get_frame(0)
+            registered.get_frame(2)
+        assert registered.missing_frames == {0, 2}
 
 
 if __name__ == "__main__":

@@ -28,8 +28,13 @@ pytest.importorskip("anywidget")
 
 import traitlets  # noqa: E402
 
+from acia.base import RotatedCropSpec  # noqa: E402
 from acia.notebook import RegistrationDashboard  # noqa: E402
-from acia.registration_persistence import RegistrationManifest  # noqa: E402
+from acia.registration import FrameTransform  # noqa: E402
+from acia.registration_persistence import (  # noqa: E402
+    RegistrationManifest,
+    RegistrationRecord,
+)
 from acia.segm.open import open_sequence  # noqa: E402
 
 
@@ -807,6 +812,258 @@ class TestImportSafety(unittest.TestCase):
                 else:
                     sys.modules.pop(name, None)
             importlib.reload(importlib.import_module("acia.notebook"))
+
+
+def _tif_growing_colony(d, n_frames=24, size=256):
+    """A TIFF whose ROI interiors fill with cells while the whole field drifts.
+
+    A scaled-down twin of ``tests/test_registration.py``'s
+    ``_growing_colony_series`` fixture, written to disk so it can be driven
+    through the real ``batch_apply`` path the notebook uses.
+    """
+    rois = ((60, 50, 45, 130), (150, 50, 45, 130))
+    rng = np.random.default_rng(11)
+    base = rng.integers(0, 25, (size, size)).astype(np.float32)
+    for x in (20, 102, 125, 235):
+        cv2.line(base, (x, 0), (x, size), 220, 2)
+    for y in (15, 240):
+        cv2.line(base, (0, y), (size, y), 220, 2)
+    for x, y, w, h in rois:
+        cv2.rectangle(base, (x, y), (x + w, y + h), 255, 3)
+    base = cv2.GaussianBlur(base, (0, 0), 1.0)
+
+    frames = []
+    for t in range(n_frames):
+        frame = base.copy()
+        cells = np.random.default_rng(100)
+        for x, y, w, h in rois:
+            for _ in range(int(t * 2.0)):
+                cx = int(cells.integers(x + 5, x + w - 5))
+                cy = int(cells.integers(y + 5, y + h - 5))
+                cv2.circle(frame, (cx, cy), int(cells.integers(2, 5)), 200, -1)
+        frame = cv2.GaussianBlur(frame, (0, 0), 1.0)
+        frames.append(
+            cv2.warpAffine(
+                frame,
+                np.float32([[1, 0, 0.10 * t], [0, 1, -0.07 * t]]),
+                (size, size),
+                borderMode=cv2.BORDER_REFLECT,
+            ).astype(np.uint16)
+        )
+
+    path = Path(d) / "colony.tif"
+    tifffile.imwrite(path, np.stack(frames))
+    specs = [
+        RotatedCropSpec(
+            center=(x + w / 2.0, y + h / 2.0), size=(int(w), int(h)), angle=0.0
+        )
+        for x, y, w, h in rois
+    ]
+    return path, specs
+
+
+class TestMethodKwargs(unittest.TestCase):
+    """Constructor settings for the registration method, without monkeypatching."""
+
+    def test_method_kwargs_reach_the_constructed_method(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(
+                open_sequence(_tif_random(d)),
+                method_kwargs={"early_stop_delta_px": 0.5, "min_confidence": 0.8},
+            )
+            method = dash._build_method("GradientECC")
+        self.assertEqual(method.early_stop_delta_px, 0.5)
+        self.assertEqual(method.min_confidence, 0.8)
+
+    def test_per_call_overrides_win_over_instance_kwargs(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(
+                open_sequence(_tif_random(d)), method_kwargs={"min_confidence": 0.8}
+            )
+            method = dash._build_method("GradientECC", min_confidence=0.5)
+        self.assertEqual(method.min_confidence, 0.5)
+
+    def test_no_kwargs_builds_the_method_with_its_own_defaults(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(open_sequence(_tif_random(d)))
+            method = dash._build_method("GradientECC")
+        self.assertEqual(method.min_confidence, 0.9)
+        self.assertIsNone(method.early_stop_delta_px)
+
+    def test_mask_rect_still_required_by_the_method_that_needs_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(open_sequence(_tif_random(d)))
+            with self.assertRaises(ValueError):
+                dash._build_method("MaskedTemplateCorrelation")
+
+    def test_mask_rect_is_passed_to_any_method_accepting_one(self):
+        rect = RotatedCropSpec(center=(10.0, 10.0), size=(8, 8), angle=0.0)
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(open_sequence(_tif_random(d)))
+            method = dash._build_method("MaskedTemplateCorrelation", rect)
+        self.assertEqual(method.mask_rect, rect)
+
+
+class TestReferenceMode(unittest.TestCase):
+    """The reference policy batch-apply registers under."""
+
+    def test_defaults_to_reanchor(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(open_sequence(_tif_random(d)))
+        self.assertEqual(dash._reference_mode, "reanchor")
+
+    def test_rejects_an_unknown_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = open_sequence(_tif_random(d))
+            with self.assertRaises(ValueError):
+                RegistrationDashboard(source, reference_mode="sideways")
+
+    def test_mode_is_recorded_on_every_record_and_in_method_params(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = RegistrationDashboard(
+                open_sequence(_tif_translating(d)), reference_mode="fixed"
+            )
+            dash.send = _Recorder()
+            dash.batch_apply(directory=d)
+            manifest = RegistrationManifest.load(
+                Path(d) / "registration_transforms.json"
+            )
+        self.assertEqual(manifest.method_params["reference_mode"], "fixed")
+        for record in manifest.records:
+            self.assertEqual(record.reference_mode, "fixed")
+
+
+class TestGrowingColonyEndToEnd(unittest.TestCase):
+    """The reported failure and its fix, at the layer the notebook calls."""
+
+    def _run(self, directory, path, *, reference_mode, method_kwargs=None):
+        dash = RegistrationDashboard(open_sequence(path), reference_mode=reference_mode)
+        dash.send = _Recorder()
+        dash.batch_apply(directory=directory, method_kwargs=method_kwargs)
+        return dash.manifest.records[0]
+
+    def test_fixed_reference_without_exclusion_fails_on_late_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, _specs = _tif_growing_colony(d)
+            record = self._run(d, path, reference_mode="fixed")
+        self.assertTrue(
+            record.failed_frames,
+            "expected a fixed reference on changing content to reject late frames",
+        )
+
+    def test_excluding_the_roi_interiors_registers_every_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, specs = _tif_growing_colony(d)
+            record = self._run(
+                d,
+                path,
+                reference_mode="fixed",
+                method_kwargs={"exclude_rects": specs, "exclude_shrink_px": 8.0},
+            )
+        self.assertEqual(record.failed_frames, {})
+
+    def test_reanchoring_alone_also_clears_the_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, _specs = _tif_growing_colony(d)
+            record = self._run(d, path, reference_mode="reanchor")
+        self.assertEqual(record.failed_frames, {})
+        # ...and records which frames needed a mid-sequence anchor.
+        self.assertTrue(record.reference_frames)
+
+    def test_confidences_are_persisted_for_auditing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, specs = _tif_growing_colony(d)
+            self._run(
+                d, path, reference_mode="fixed", method_kwargs={"exclude_rects": specs}
+            )
+            reloaded = RegistrationManifest.load(
+                Path(d) / "registration_transforms.json"
+            ).records[0]
+        self.assertTrue(
+            all(t.confidence is not None for t in reloaded.transforms.values())
+        )
+
+
+class TestReferenceModeResume(unittest.TestCase):
+    """Progress is only reused where the policy that produced it still applies."""
+
+    N_FRAMES = 4
+
+    def _seed_manifest(self, directory, path, *, reference_mode, failed_frames=None):
+        """Write a *complete* prior record under ``reference_mode``.
+
+        Built by hand rather than by running batch-apply, so the record's
+        contents (and specifically whether it holds any failures) are exactly
+        what each case is about, independent of whether the small fixture
+        happens to satisfy the method's own confidence gate.
+        """
+        failed_frames = failed_frames or {}
+        n_transforms = self.N_FRAMES - len(failed_frames)
+        record = RegistrationRecord(
+            position=0,
+            method="GradientECC",
+            transforms={
+                t: FrameTransform(dx=float(t), dy=0.0, theta=0.0)
+                for t in range(n_transforms)
+            },
+            failed_frames=failed_frames,
+            reference_mode=reference_mode,
+        )
+        manifest = RegistrationManifest(
+            source={"path": str(path)}, records=[record], method="GradientECC"
+        )
+        manifest.save(Path(directory) / "registration_transforms.json")
+
+    def _rerun(self, directory, path, mode):
+        dash = RegistrationDashboard(open_sequence(path), reference_mode=mode)
+        dash.send = _Recorder()
+        return dash.batch_apply(directory=directory)
+
+    def test_same_mode_record_is_reused(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=self.N_FRAMES)
+            self._seed_manifest(d, path, reference_mode="reanchor")
+            summary = self._rerun(d, path, "reanchor")
+        self.assertEqual(summary["skipped"], [0])
+
+    def test_a_clean_fixed_record_is_reused_under_reanchor(self):
+        """Changing the default policy must not silently discard a long run
+        whose frames re-anchoring would have produced identically anyway --
+        re-anchoring is a pure fallback, so it never fires on a frame that
+        already succeeded against the reference."""
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=self.N_FRAMES)
+            self._seed_manifest(d, path, reference_mode="fixed")
+            summary = self._rerun(d, path, "reanchor")
+        self.assertEqual(summary["skipped"], [0])
+
+    def test_a_fixed_record_with_failures_is_not_reused_under_reanchor(self):
+        """Those failures are exactly what re-anchoring exists to retry."""
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=self.N_FRAMES)
+            self._seed_manifest(
+                d, path, reference_mode="fixed", failed_frames={3: "boom"}
+            )
+            summary = self._rerun(d, path, "reanchor")
+        self.assertEqual(summary["skipped"], [])
+        self.assertEqual(summary["completed"], [0])
+
+    def test_a_chained_record_is_never_reused_under_reanchor(self):
+        """Chained transforms are measured against the previous frame, so they
+        are not a valid prefix of a reference-anchored run at all."""
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=self.N_FRAMES)
+            self._seed_manifest(d, path, reference_mode="chained")
+            summary = self._rerun(d, path, "reanchor")
+        self.assertEqual(summary["skipped"], [])
+        self.assertEqual(summary["completed"], [0])
+
+    def test_a_reanchor_record_is_not_reused_under_fixed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif_translating(d, t=self.N_FRAMES)
+            self._seed_manifest(d, path, reference_mode="reanchor")
+            summary = self._rerun(d, path, "fixed")
+        self.assertEqual(summary["skipped"], [])
 
 
 if __name__ == "__main__":

@@ -823,25 +823,26 @@ class ImageSequenceSource(Iterable[BaseImage], Sized):
         return RotatedCropSequenceSource(self, spec)
 
     def register(
-        self, transforms: dict[int, FrameTransform]
+        self, transforms: dict[int, FrameTransform], *, on_missing: str = "warn"
     ) -> RegisteredSequenceSource:
         """Return a lazy drift-corrected view of this source.
 
         Each frame is corrected on demand via
         :func:`acia.registration.apply_correction` using the transform stored
-        for that frame index; a frame missing from ``transforms`` is returned
-        uncorrected with a printed warning.
+        for that frame index.
 
         Args:
             transforms: Frame index -> :class:`~acia.registration.FrameTransform`
                 (within this source), as estimated by a
                 :class:`~acia.registration.RegistrationMethod` and persisted via
                 :mod:`acia.registration_persistence`.
+            on_missing: How to handle a frame with no stored transform — see
+                :class:`RegisteredSequenceSource`. Defaults to ``"warn"``.
 
         Returns:
             RegisteredSequenceSource: A lazy corrected view of this source.
         """
-        return RegisteredSequenceSource(self, transforms)
+        return RegisteredSequenceSource(self, transforms, on_missing=on_missing)
 
     def to_rgb(
         self, *, channel: int = 0, colors: dict[int, str] | None = None
@@ -1087,32 +1088,95 @@ class RegisteredSequenceSource(ImageSequenceSource):
     ``num_channels`` simply delegate straight to the parent -- no dimension
     recomputation.
 
-    A frame missing from ``transforms`` (e.g. one that failed during
-    batch-apply) is returned unchanged, with a warning -- never a hard crash,
-    so a segmentation/tracking notebook consuming this source can keep going
-    even if a handful of frames never got a stored correction.
+    ``on_missing`` decides what happens to a frame that has no stored transform
+    (one that failed during batch-apply):
+
+    - ``"warn"`` (default) -- return it unchanged with a warning. Never a hard
+      crash, so a segmentation/tracking notebook consuming this source can keep
+      going even if a handful of frames never got a stored correction. Note
+      that an uncorrected frame is off by the *full* accumulated drift, so in a
+      sequence that has drifted it reads as a visible jump.
+    - ``"nearest"`` -- correct it with the nearest available frame's transform
+      instead. Drift between neighboring frames is usually far smaller than
+      drift since the reference, so this is normally much closer to right than
+      leaving the frame alone; it is still an approximation, and warns as such.
+    - ``"error"`` -- raise ``KeyError``. For callers that would rather stop than
+      consume a partially-corrected sequence.
+
+    Warnings are emitted once per frame index rather than once per call, so a
+    lazy multi-pass consumer (crop -> write) does not repeat them on every pass.
+    :attr:`missing_frames` lets a caller report the whole set once instead.
     """
 
+    MISSING_POLICIES = ("warn", "nearest", "error")
+
     def __init__(
-        self, parent: ImageSequenceSource, transforms: dict[int, FrameTransform]
+        self,
+        parent: ImageSequenceSource,
+        transforms: dict[int, FrameTransform],
+        *,
+        on_missing: str = "warn",
     ):
+        if on_missing not in self.MISSING_POLICIES:
+            raise ValueError(
+                f"Unknown on_missing policy {on_missing!r}; expected one of "
+                f"{', '.join(self.MISSING_POLICIES)}."
+            )
         self.parent = parent
         self.transforms = transforms
+        self.on_missing = on_missing
+        self._missing: set[int] = set()
+
+    @property
+    def missing_frames(self) -> set[int]:
+        """Frame indices requested so far that had no stored transform."""
+        return set(self._missing)
+
+    def _nearest_transform(self, idx: int) -> FrameTransform | None:
+        """The transform of the stored frame index closest to ``idx``."""
+        if not self.transforms:
+            return None
+        nearest = min(self.transforms, key=lambda stored: (abs(stored - idx), stored))
+        return self.transforms[nearest]
 
     def get_frame(self, frame: int) -> BaseImage:
         idx = self._resolve_t_index(frame)
-        if idx not in self.transforms:
-            warnings.warn(
-                f"RegisteredSequenceSource: no stored correction for frame "
-                f"{idx}; returning it uncorrected.",
-                stacklevel=2,
-            )
-            return self.parent.get_frame(idx)
+        transform = self.transforms.get(idx)
+
+        if transform is None:
+            first_time = idx not in self._missing
+            self._missing.add(idx)
+
+            if self.on_missing == "error":
+                raise KeyError(
+                    f"RegisteredSequenceSource: no stored correction for frame "
+                    f"{idx} (on_missing='error')."
+                )
+
+            if self.on_missing == "nearest":
+                transform = self._nearest_transform(idx)
+
+            if transform is None:
+                if first_time:
+                    warnings.warn(
+                        f"RegisteredSequenceSource: no stored correction for "
+                        f"frame {idx}; returning it uncorrected.",
+                        stacklevel=2,
+                    )
+                return self.parent.get_frame(idx)
+
+            if first_time:
+                warnings.warn(
+                    f"RegisteredSequenceSource: no stored correction for frame "
+                    f"{idx}; correcting it with the nearest available frame's "
+                    "transform instead (approximate).",
+                    stacklevel=2,
+                )
 
         from acia.registration import apply_correction
 
         raw = np.asarray(self.parent.get_frame(idx).raw)
-        corrected = apply_correction(raw, self.transforms[idx])
+        corrected = apply_correction(raw, transform)
         return ArrayImage(corrected, frame=idx)
 
     @property
