@@ -767,8 +767,12 @@ class HoughLineRigidFit(RegistrationMethod):
         if raw is None:
             return []
 
+        # OpenCV <5 returns (N, 1, 4); OpenCV 5 returns (N, 4). Reshape rather
+        # than indexing a fixed layout, so this works on both.
+        segments = np.asarray(raw).reshape(-1, 4)
+
         candidates = []
-        for x1, y1, x2, y2 in raw[:, 0, :]:
+        for x1, y1, x2, y2 in segments:
             length = float(np.hypot(x2 - x1, y2 - y1))
             angle = _wrap_angle(float(np.degrees(np.arctan2(y2 - y1, x2 - x1))))
             mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0

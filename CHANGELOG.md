@@ -43,6 +43,10 @@ section to a dated version entry automatically.
   GitHub Pages documentation.
 
 ### Fixed
+- `HoughLineRigidFit` raised `IndexError` on every call under OpenCV 5, which
+  changed `cv2.HoughLinesP`'s output from `(N, 1, 4)` to `(N, 4)`. Detected
+  segments are now reshaped instead of indexed at a fixed layout, so both
+  layouts work.
 - `LocalSequenceSource.get_frame()`/indexing now honor `normalize_image` (previously
   only `__iter__` did), and the 2D-frame-to-3-channel duplication in `prepare_image`
   is gated by it too. TIFFs opened via `open_sequence` (which already requests
