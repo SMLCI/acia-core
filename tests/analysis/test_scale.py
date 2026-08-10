@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from acia.analysis import default_execution_naming, scale
+from acia.analysis import _source_label, default_execution_naming, scale
 
 
 def _make_script(tmp_path):
@@ -114,6 +114,65 @@ def test_scale_warns_on_name_collision(tmp_path, caplog):
         scale(out, script, image_ids=paths, exist_ok=True)
 
     assert any("maps to multiple sources" in rec.message for rec in caplog.records)
+
+
+def test_source_label_prefers_input_file_name():
+    # path/URL sources: the file name (not the execution folder name)
+    assert _source_label("/data/exp/pos1_roi2.tiff", "pos1_roi2") == "pos1_roi2.tiff"
+    assert (
+        _source_label("smb://srv/data/pos3.ome.tif?a=1", "pos3.ome") == "pos3.ome.tif"
+    )
+    # ids and dicts have no file name -> the execution name identifies them
+    assert _source_label(42, "execution_42") == "execution_42"
+    assert _source_label({"path": "x"}, "my_run") == "my_run"
+
+
+class _StubBar:
+    """Minimal tqdm stand-in that records the descriptions it is given."""
+
+    def __init__(self, iterable=None, **kwargs):
+        self._iterable = iterable
+        self.descriptions: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(self._iterable)
+
+    def set_description(self, desc, **kwargs):
+        self.descriptions.append(desc)
+
+    def update(self, n=1):
+        pass
+
+
+def test_scale_progress_reports_stage_and_source(tmp_path):
+    """The bar says which stage notebook runs on which input, not just a count."""
+    stages = []
+    for name in ("01_Segment.ipynb", "02_Track.ipynb"):
+        script = tmp_path / name
+        script.write_text("{}")
+        stages.append(script)
+    bars = []
+
+    def _bar(*args, **kwargs):
+        bars.append(_StubBar(*args, **kwargs))
+        return bars[-1]
+
+    with (
+        patch("acia.analysis.pm.execute_notebook"),
+        patch("acia.analysis.tqdm", _bar),
+    ):
+        scale(tmp_path / "out", stages, image_ids=["/data/exp/pos1_roi2.tiff"])
+
+    descriptions = bars[0].descriptions
+    assert descriptions[0] == "pos1_roi2.tiff"  # source, before the first stage
+    assert "01_Segment.ipynb | pos1_roi2.tiff" in descriptions
+    assert "02_Track.ipynb | pos1_roi2.tiff" in descriptions
 
 
 def _make_marker_script(tmp_path, name="marker.ipynb", fail_on_bad=False):

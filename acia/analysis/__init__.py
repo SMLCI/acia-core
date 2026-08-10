@@ -769,6 +769,18 @@ def default_execution_naming(source) -> str:
     )
 
 
+def _source_label(image_id, name: str) -> str:
+    """Short, human-readable label for one scaled source, for progress output.
+
+    Path/URL entries show the input **file name** (``/data/pos1_roi2.tiff`` ->
+    ``pos1_roi2.tiff``); ids and parameter dicts fall back to the execution folder
+    name, which is the only thing that identifies them.
+    """
+    if isinstance(image_id, str):
+        return Path(image_id.split("?", 1)[0]).name or name
+    return name
+
+
 def _scale_execute_one(
     job,
     additional_parameters,
@@ -776,6 +788,7 @@ def _scale_execute_one(
     exist_skip,
     kernel_name,
     storage_parameter_name,
+    on_stage=None,
 ):
     """Run every analysis script for one image entry.
 
@@ -783,6 +796,11 @@ def _scale_execute_one(
     ``job`` is a dict with ``image_id``, ``output_parent`` (str), ``source_parameters``
     (dict) and ``scripts`` (list of ``(src, dst)`` path-string pairs). Returns the
     list of execution records; raises ``PapermillExecutionError`` if a notebook fails.
+
+    ``on_stage`` (if given) is called with the name of each stage notebook just
+    before it is executed, so the caller can report what is running. Only used on
+    the sequential path -- the parallel one runs this in a child process, from
+    which the parent's progress bar is not reachable.
     """
     output_parent = Path(job["output_parent"])
     os.makedirs(output_parent, exist_ok=exist_ok)
@@ -793,6 +811,9 @@ def _scale_execute_one(
         # the notebook already exists and we should skip it
         if dst.exists() and exist_skip:
             continue
+
+        if on_stage is not None:
+            on_stage(dst.name)
 
         shutil.copy(src, dst)
 
@@ -937,10 +958,12 @@ def scale(
         else:
             source_parameters = {parameter_name: image_id}
 
-        output_parent = output_path / execution_naming(image_id)
+        name = execution_naming(image_id)
+        output_parent = output_path / name
         jobs.append(
             {
                 "image_id": image_id,
+                "label": _source_label(image_id, name),
                 "output_parent": str(output_parent),
                 "source_parameters": source_parameters,
                 "scripts": [
@@ -950,21 +973,27 @@ def scale(
         )
 
     if max_workers == 1:
-        # sequential (default) -- unchanged behaviour
-        for job in tqdm(jobs):
-            try:
-                experiment_executions.extend(
-                    _scale_execute_one(
-                        job,
-                        additional_parameters,
-                        exist_ok,
-                        exist_skip,
-                        kernel_name,
-                        storage_parameter_name,
+        # sequential (default) -- the bar reports the notebook currently running
+        # and the source it runs on, e.g. "02_Track.ipynb | pos001_roi002.tiff".
+        with tqdm(jobs, unit="source") as pbar:
+            for job in pbar:
+                pbar.set_description(job["label"])
+                try:
+                    experiment_executions.extend(
+                        _scale_execute_one(
+                            job,
+                            additional_parameters,
+                            exist_ok,
+                            exist_skip,
+                            kernel_name,
+                            storage_parameter_name,
+                            on_stage=lambda stage, label=job["label"]: (
+                                pbar.set_description(f"{stage} | {label}")
+                            ),
+                        )
                     )
-                )
-            except pm.PapermillExecutionError:
-                failed_ids.append(job["image_id"])
+                except pm.PapermillExecutionError:
+                    failed_ids.append(job["image_id"])
     else:
         # Run several notebooks in parallel. A *process* pool (spawn) is required,
         # not threads: papermill sets the working directory with a process-global
@@ -982,15 +1011,23 @@ def scale(
                     exist_skip,
                     kernel_name,
                     storage_parameter_name,
-                ): job["image_id"]
+                ): job
                 for job in jobs
             }
-            for future in tqdm(as_completed(futures), total=len(futures)):
-                image_id = futures[future]
-                try:
-                    experiment_executions.extend(future.result())
-                except pm.PapermillExecutionError:
-                    failed_ids.append(image_id)
+            # several sources run at once, so "currently running" is not a single
+            # thing: report the one that just finished (and whether it failed)
+            # rather than pretending there is one active source.
+            with tqdm(total=len(futures), unit="source") as pbar:
+                for future in as_completed(futures):
+                    job = futures[future]
+                    status = "done"
+                    try:
+                        experiment_executions.extend(future.result())
+                    except pm.PapermillExecutionError:
+                        failed_ids.append(job["image_id"])
+                        status = "FAILED"
+                    pbar.set_description(f"{status} {job['label']}")
+                    pbar.update(1)
 
     if len(failed_ids) > 0:
         error_ratio = len(failed_ids) / len(image_ids) * 100
