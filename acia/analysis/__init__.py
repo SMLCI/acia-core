@@ -28,6 +28,12 @@ from acia import Q_, U_
 from acia.analysis.growth_rate import AggMode as AggMode
 from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
 from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
+from acia.analysis.stage import DEFAULT_KEY_PATTERN as DEFAULT_KEY_PATTERN
+from acia.analysis.stage import MANIFEST_NAME as MANIFEST_NAME
+from acia.analysis.stage import StageContext as StageContext
+from acia.analysis.stage import population_id_of as population_id_of
+from acia.analysis.stage import read_manifest as read_manifest
+from acia.analysis.stage import stages_run as stages_run
 from acia.analysis.units import UNIT_ATTR, units_in_header
 from acia.analysis.units import attach_units as attach_units
 from acia.analysis.units import from_header as from_header
