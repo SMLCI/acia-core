@@ -16,14 +16,17 @@ stages:
   - lint
   - build
   - test
+  - deploy
 
 # Lint and format check with Ruff
 lint:
   stage: lint
   script:
     - pip install ruff
-    - ruff check acia tests
-    - ruff format --check acia tests
+    # docs/ is included because ruff lints .ipynb by default -- the tutorial
+    # notebooks are real source and regress like any other code.
+    - ruff check acia tests docs
+    - ruff format --check acia tests docs
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
@@ -102,10 +105,54 @@ test:
         path: coverage.xml
       junit: report.xml
 
-# NOTE: documentation is built and published by GitHub Actions
-# (.github/workflows/docs.yml) to https://smlci.github.io/acia-core, which is the
-# URL declared in pyproject.toml's [project.urls]. The GitLab Pages job that used
-# to live here was removed: it installed neither `acia` (which docs/conf.py
-# imports for __version__) nor the MyST/notebook dependencies, so it could not
-# have produced a working site, and a second publish target for the same content
-# is a maintenance trap.
+# Build the documentation and publish it to GitLab Pages.
+#
+# The tutorials under docs/tutorials/ are committed WITHOUT outputs and executed
+# by myst-nb during the build, so this job needs everything they import -- which
+# is why it installs the package itself plus a segmentation backend, unlike the
+# job that used to live here (it installed neither `acia`, which docs/conf.py
+# imports for __version__, nor myst-parser, so it cannot have worked).
+#
+# Only ONE segmentation backend can be installed: cellpose<4, cellpose>=4 and
+# omnipose pin conflicting versions. The getting-started path uses Cellpose-SAM.
+#
+# On the biggpu runner the notebooks detect CUDA and process every 4th frame; on
+# a CPU runner they fall back to every 20th automatically, so this job is correct
+# either way -- it just produces a finer-grained tutorial when a GPU is present.
+#
+# Note this publishes a SECOND copy of the site; GitHub Pages
+# (https://smlci.github.io/acia-core) remains the URL declared in
+# pyproject.toml's [project.urls]. Keep them from drifting.
+pages:
+  stage: deploy
+  image: python:3.12
+  tags:
+    - biggpu
+  variables:
+    # GitLab can only cache paths inside CI_PROJECT_DIR, so move Cellpose's
+    # model store (~300 MB, default ~/.cellpose/models) into the project.
+    CELLPOSE_LOCAL_MODELS_PATH: "$CI_PROJECT_DIR/.cellpose-models"
+  cache:
+    - key: pip-${CI_JOB_IMAGE}
+      paths:
+        - .cache/pip/
+    # ~42 MB Cell Tracking Challenge sample the notebooks download themselves
+    - key: docs-tutorial-data-v1
+      paths:
+        - docs/tutorials/data/
+    - key: docs-cellpose-weights-v1
+      paths:
+        - .cellpose-models/
+    # myst-nb re-executes only notebooks whose source changed
+    - key: docs-jupyter-cache-v1
+      paths:
+        - docs/_build/.jupyter_cache/
+  script:
+    - pip install -e ".[docs,cellpose-sam]"
+    # -W: the build must stay warning-free, exactly as it does on GitHub
+    - sphinx-build -b html -W --keep-going docs public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

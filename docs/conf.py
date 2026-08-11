@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -73,6 +74,12 @@ myst_heading_anchors = 3
 # CPU-minutes -- the reader turns the knob back up on Colab.
 
 nb_execution_mode = "cache"
+# Pin the cache location. Left to its default it is derived from the *output*
+# directory, so `sphinx-build docs public` (GitLab Pages) and
+# `sphinx-build docs docs/_build/html` (GitHub Pages, make docs) would each use a
+# different one -- and a CI cache key pointing at the wrong path silently
+# re-executes every notebook on every pipeline.
+nb_execution_cache_path = str(Path(__file__).parent / "_build" / ".jupyter_cache")
 nb_execution_timeout = 900
 nb_execution_raise_on_error = True
 # Escape hatch: add a glob here if a notebook ever becomes too heavy for CI.
