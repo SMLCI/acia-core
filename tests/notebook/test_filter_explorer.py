@@ -53,12 +53,11 @@ def _overlay():
 
 
 def _explorer(filters=None):
+    if filters is None:
+        filters = [AreaFilter(), LengthFilter(), CircularityFilter()]
+    overlay, images = _overlay(), _source()
     return FilterExplorer(
-        _overlay(),
-        _source(),
-        filters
-        if filters is not None
-        else [AreaFilter(), LengthFilter(), CircularityFilter()],
+        overlay, images, filters, _properties(overlay, images, filters)
     )
 
 
@@ -149,22 +148,27 @@ def test_below_range_upper_bound_is_lossless():
 
 
 def test_non_finite_value_is_sanitised_to_zero():
-    """A NaN/Inf magnitude would serialize as invalid JSON; coerce it to 0."""
-    from acia import Q_
-    from acia.segm.filter import CellFilter
+    """A NaN magnitude would serialize as invalid JSON; coerce it to 0.
 
-    class _NaNFilter(CellFilter):
-        name = "nan"
+    ``nan`` is what an extractor reports for a contour it cannot measure. The
+    widget still has to ship a number to the browser, but the contour is
+    genuinely unfilterable -- see the companion assertion that
+    ``filtered_overlay`` drops it regardless of where the handles sit.
+    """
+    import numpy as np
 
-        def value(self, cont, *, images):
-            return Q_(float("nan"), "micrometer")
+    filters = [AreaFilter()]
+    overlay, images = _overlay(), _source()
+    table = _properties(overlay, images, filters)
+    table.loc["mid", "area"] = np.nan
 
-    fe = FilterExplorer(_overlay(), _source(), [_NaNFilter()])
-    for rec in fe.contours:
-        assert rec["values"][0] == 0.0  # not NaN
-    # data range stays finite
-    assert fe.filter_specs[0]["lo"] == 0.0
-    assert fe.filter_specs[0]["hi"] == pytest.approx(1.0)
+    fe = FilterExplorer(overlay, images, filters, table)
+    values = [rec["values"][0] for rec in fe.contours]
+    assert values[1] == 0.0  # not NaN
+    assert all(np.isfinite(v) for v in values)
+
+    # and it never survives filtering, however the handles are set
+    assert "mid" not in {c.id for c in fe.filtered_overlay().contours}
 
 
 # --- calibration guard -------------------------------------------------------
@@ -172,16 +176,18 @@ def test_non_finite_value_is_sanitised_to_zero():
 
 def test_requires_calibrated_source():
     with pytest.raises(ValueError, match="pixel_size"):
-        FilterExplorer(_overlay(), None, [AreaFilter()])
+        FilterExplorer(_overlay(), None, [AreaFilter()], None)
     with pytest.raises(ValueError, match="pixel_size"):
-        FilterExplorer(_overlay(), _source(pixel_size=None), [AreaFilter()])
+        FilterExplorer(_overlay(), _source(pixel_size=None), [AreaFilter()], None)
 
 
 # --- empty overlay -----------------------------------------------------------
 
 
 def test_empty_overlay_builds_controls_with_fallback_range():
-    fe = FilterExplorer(Overlay([]), _source(), [AreaFilter(), LengthFilter()])
+    filters = [AreaFilter(), LengthFilter()]
+    empty, images = Overlay([]), _source()
+    fe = FilterExplorer(empty, images, filters, _properties(empty, images, filters))
     assert len(fe.filter_specs) == 2
     assert fe.contours == []
     for spec in fe.filter_specs:
@@ -224,7 +230,10 @@ def test_configured_filters_and_filtered_overlay_match_apply():
     assert {c.id for c in got.contours} == {"small", "mid"}
 
     # equals a direct apply_cell_filters with the same configured filters
-    expected = apply_cell_filters(_overlay(), configured, images=_source())
+    overlay, images = _overlay(), _source()
+    expected = apply_cell_filters(
+        overlay, configured, properties=_properties(overlay, images, configured)
+    )
     assert {c.id for c in got.contours} == {c.id for c in expected.contours}
 
 
@@ -276,22 +285,26 @@ def _properties(overlay, images, filters):
     return ExtractorExecutor().execute(overlay, images, ordered)
 
 
-def test_properties_backed_specs_match_the_row_wise_ones():
-    """Seeding sliders from the table must not move a single handle."""
+def test_specs_match_the_per_contour_measurement():
+    """Slider seeding from the table must match measuring each contour.
+
+    ``CellFilter.value()`` remains the single-contour reference; the widget now
+    reads columns instead, and the two must agree or the handles would land in
+    different places than the thresholds they represent.
+    """
     filters = [AreaFilter(), LengthFilter(), CircularityFilter()]
     overlay, images = _overlay(), _source()
+    fe = FilterExplorer(overlay, images, filters, _properties(overlay, images, filters))
 
-    row_wise = FilterExplorer(overlay, images, filters)
-    from_table = FilterExplorer(
-        overlay,
-        images,
-        filters,
-        properties=_properties(overlay, images, filters),
-    )
-
-    assert from_table.filter_specs == row_wise.filter_specs
-    assert from_table.contours == row_wise.contours
-    assert from_table.selection == row_wise.selection
+    for spec, f in zip(fe.filter_specs, filters, strict=True):
+        measured = [float(f.value(c, images=images).magnitude) for c in overlay]
+        assert spec["lo"] == pytest.approx(min(measured))
+        if max(measured) > min(measured):
+            assert spec["hi"] == pytest.approx(max(measured))
+        else:
+            # `_axis` gives a single-valued track a non-zero width
+            assert spec["hi"] == pytest.approx(min(measured) + 1.0)
+        assert spec["unit"] == f"{f.value(next(iter(overlay)), images=images).units}"
 
 
 def test_properties_backed_filtered_overlay_matches():
@@ -299,7 +312,7 @@ def test_properties_backed_filtered_overlay_matches():
     overlay, images = _overlay(), _source()
     table = _properties(overlay, images, filters)
 
-    fe = FilterExplorer(overlay, images, filters, properties=table)
+    fe = FilterExplorer(overlay, images, filters, table)
     got = fe.filtered_overlay()
 
     expected = apply_cell_filters(overlay, fe.configured_filters(), properties=table)

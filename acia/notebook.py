@@ -2509,8 +2509,8 @@ if _HAS_ANYWIDGET:
             overlay,
             images,
             filters,
+            properties,
             *,
-            properties=None,
             frame: int = 0,
             channel: int | None = None,
             **kwargs,
@@ -2525,10 +2525,8 @@ if _HAS_ANYWIDGET:
                     -- one slider control is built per filter.
                 properties: The extractor table for ``overlay`` (see
                     :meth:`~acia.analysis.ExtractorExecutor.execute`). Each
-                    filter's slider is seeded from its own column instead of
-                    re-measuring every contour, which is what building the widget
-                    otherwise spends its time on. Without it the widget falls back
-                    to the row-wise measurement, once per filter.
+                    filter's slider is seeded from its own column, so it must
+                    contain a column named after every filter passed in.
                 frame: Frame to preview (image + its contours). Defaults to ``0``.
                 channel: Display channel for a multi-channel frame. Defaults to 0.
                 **kwargs: Forwarded to ``anywidget.AnyWidget``.
@@ -2598,37 +2596,14 @@ if _HAS_ANYWIDGET:
         def _measure(self, f, conts):
             """Return ``(unit_str, [magnitude per contour])`` for filter ``f``.
 
-            Reads filter ``f``'s own column from the ``properties`` table when one
-            was passed -- the same values, already computed. Without a table it
-            falls back to ``CellFilter.value()`` per contour, which is the same
-            measurement done once per filter per contour.
+            Reads filter ``f``'s own column out of the ``properties`` table --
+            the values the extractors already produced, rather than measuring
+            every contour again once per filter.
 
             All contours of a filter share one unit. For an empty overlay the
             unit is inferred from the filter's existing bound, else falls back to
             dimensionless.
             """
-            import math
-
-            if self._properties is not None:
-                return self._measure_from_table(f, conts)
-
-            unit = None
-            mags = []
-            for c in conts:
-                q = f.value(c, images=self._images)
-                if unit is None:
-                    unit = f"{q.units}"
-                m = float(q.to(unit).magnitude)
-                # a non-finite magnitude would serialize as invalid JSON (NaN /
-                # Infinity) and break the browser trait sync; coerce to 0, the
-                # same convention the built-in filters use for degenerate cells.
-                mags.append(m if math.isfinite(m) else 0.0)
-            if unit is None:
-                unit = self._unit_of(f.vmin) or self._unit_of(f.vmax) or ""
-            return unit, mags
-
-        def _measure_from_table(self, f, conts):
-            """``_measure`` backed by the extractor table."""
             import math
 
             from acia.segm.filter import _column_magnitudes
@@ -2640,8 +2615,11 @@ if _HAS_ANYWIDGET:
             mags = []
             for c in conts:
                 m = float(values[position[c.id]])
-                # same non-finite coercion as the row-wise path: a NaN would
-                # serialize as invalid JSON and break the browser trait sync
+                # a non-finite magnitude would serialize as invalid JSON (NaN /
+                # Infinity) and break the browser trait sync. nan means the
+                # property could not be measured; 0 keeps the slider usable, and
+                # `filtered_overlay` still drops the contour because the Python
+                # filters reject a non-finite value outright.
                 mags.append(m if math.isfinite(m) else 0.0)
 
             unit_str = f"{unit}" if unit is not None else ""
@@ -2742,14 +2720,10 @@ if _HAS_ANYWIDGET:
             """Return the whole overlay filtered by the current thresholds."""
             from acia.segm.filter import apply_cell_filters
 
-            if self._properties is not None:
-                return apply_cell_filters(
-                    self._overlay,
-                    self.configured_filters(),
-                    properties=self._properties,
-                )
             return apply_cell_filters(
-                self._overlay, self.configured_filters(), images=self._images
+                self._overlay,
+                self.configured_filters(),
+                properties=self._properties,
             )
 
         def save(self, path):

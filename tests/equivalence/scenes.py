@@ -357,10 +357,17 @@ COLUMN_TOLERANCE: dict[str, float | None] = {
     "perimeter": None,
     "length": None,
     "width": None,
-    "position_x": None,
-    "position_y": None,
     "frame": None,
     "time": None,
     # a division, so float-noise is permitted -- measured at 4.4e-16 today
     "circularity": 1e-15,
+    # Positions were originally computed in single precision: `Contour.center`
+    # is float32 and pint carried that magnitude through the unit conversion.
+    # Converting the column in float64 is more accurate and moves every value by
+    # up to ~1e-7 relative. Accepted deliberately (2026-08-11): the column is in
+    # micrometres, so this is sub-picometre and below any physical relevance.
+    # This is the one tolerance here that permits a *changed* value rather than
+    # float-noise around an unchanged one.
+    "position_x": 1e-6,
+    "position_y": 1e-6,
 }

@@ -6,6 +6,7 @@ import numpy as np
 import pint
 
 from acia import Q_
+from acia.analysis import AreaEx, ExtractorExecutor
 from acia.base import Contour, Overlay
 from acia.segm.filter import (
     AreaFilter,
@@ -41,6 +42,52 @@ def _source(h: int = 200, w: int = 200, t: int = 1, pixel_size="0.5 micrometer")
     )
 
 
+def _filter(overlay, filters, images):
+    """Extract the properties ``filters`` need, then filter on them.
+
+    ``apply_cell_filters`` reads each filter's value out of an extractor table
+    rather than measuring the contours itself, so a test that checks *which
+    cells survive* has to produce that table first. These tests are about filter
+    semantics, so the two steps are wrapped here.
+    """
+    from acia.analysis import (
+        AreaEx,
+        BoundaryClosenessEx,
+        CircularityEx,
+        ExtractorExecutor,
+        LengthEx,
+        PerimeterEx,
+        WidthEx,
+    )
+
+    by_name = {
+        "area": AreaEx,
+        "perimeter": PerimeterEx,
+        "length": LengthEx,
+        "width": WidthEx,
+        "circularity": CircularityEx,
+        "boundary_closeness": BoundaryClosenessEx,
+    }
+    needed = {f.name for f in filters}
+    if "circularity" in needed:
+        # CircularityEx is derived from the area/perimeter columns
+        needed |= {"area", "perimeter"}
+    # dict order keeps area/perimeter ahead of circularity, as it requires
+    extractors = [cls() for name, cls in by_name.items() if name in needed]
+
+    table = ExtractorExecutor().execute(overlay, images, extractors)
+    for f in filters:
+        if f.name not in table.columns:
+            # a custom filter with no matching extractor: measure it directly
+            table[f.name] = [
+                float(f.value(c, images=images).magnitude) for c in overlay
+            ]
+            table.attrs.setdefault("units", {})[f.name] = str(
+                f.value(next(iter(overlay)), images=images).units
+            )
+    return apply_cell_filters(overlay, filters, properties=table)
+
+
 class TestAreaFilter(unittest.TestCase):
     def test_physical_area_keeps_right_contours(self):
         # at 0.5 µm/px: 4px square -> 2µm side -> 4µm²; 8px -> 4µm side -> 16µm²;
@@ -54,7 +101,7 @@ class TestAreaFilter(unittest.TestCase):
             ]
         )
 
-        result = apply_cell_filters(
+        result = _filter(
             overlay,
             [AreaFilter(Q_(2, "um**2"), Q_(20, "um**2"))],
             images=images,
@@ -77,9 +124,7 @@ class TestAreaFilter(unittest.TestCase):
                 _square(12, x0=50, id="big"),  # 36 µm²
             ]
         )
-        result = apply_cell_filters(
-            overlay, [AreaFilter(vmin=Q_(10, "um**2"))], images=images
-        )
+        result = _filter(overlay, [AreaFilter(vmin=Q_(10, "um**2"))], images=images)
         self.assertEqual({c.id for c in result.contours}, {"big"})
 
     def test_camera_invariance(self):
@@ -109,12 +154,8 @@ class TestAreaFilter(unittest.TestCase):
 
         cell_filter = AreaFilter(Q_(2, "um**2"), Q_(20, "um**2"))
 
-        kept_a = {
-            c.id for c in apply_cell_filters(overlay_a, [cell_filter], images=images_a)
-        }
-        kept_b = {
-            c.id for c in apply_cell_filters(overlay_b, [cell_filter], images=images_b)
-        }
+        kept_a = {c.id for c in _filter(overlay_a, [cell_filter], images=images_a)}
+        kept_b = {c.id for c in _filter(overlay_b, [cell_filter], images=images_b)}
 
         self.assertEqual(kept_a, kept_b)
         self.assertEqual(kept_a, {"c2um", "c4um"})
@@ -138,9 +179,7 @@ class TestLengthWidthFilters(unittest.TestCase):
                 Contour([[0, 0], [4, 0], [4, 4], [0, 4]], -1, 0, "short"),  # 2 µm
             ]
         )
-        result = apply_cell_filters(
-            overlay, [LengthFilter(vmin=Q_(3, "um"))], images=images
-        )
+        result = _filter(overlay, [LengthFilter(vmin=Q_(3, "um"))], images=images)
         self.assertEqual({c.id for c in result.contours}, {"long"})
 
 
@@ -159,9 +198,7 @@ class TestCircularityFilter(unittest.TestCase):
             "circ",
         )
         overlay = Overlay([square, circle])
-        result = apply_cell_filters(
-            overlay, [CircularityFilter(vmin=0.9)], images=images
-        )
+        result = _filter(overlay, [CircularityFilter(vmin=0.9)], images=images)
         self.assertEqual({c.id for c in result.contours}, {"circ"})
 
     def test_circularity_value_is_dimensionless(self):
@@ -179,7 +216,7 @@ class TestMultipleFilters(unittest.TestCase):
             [[0, 0], [40, 0], [40, 3], [0, 3]], -1, 0, "thin"
         )  # area 120px²=30µm², circ low
         overlay = Overlay([square, thin])
-        result = apply_cell_filters(
+        result = _filter(
             overlay,
             [AreaFilter(vmin=Q_(20, "um**2")), CircularityFilter(vmin=0.6)],
             images=images,
@@ -203,9 +240,7 @@ class TestMultiFrameTimeModel(unittest.TestCase):
         before = overlay.timepoints
         self.assertIsNotNone(before)
 
-        result = apply_cell_filters(
-            overlay, [AreaFilter(vmin=Q_(10, "um**2"))], images=images
-        )
+        result = _filter(overlay, [AreaFilter(vmin=Q_(10, "um**2"))], images=images)
 
         self.assertEqual(
             {c.id for c in result.contours}, {"f0_keep", "f1_keep", "f2_keep"}
@@ -229,9 +264,7 @@ class TestMultiFrameTimeModel(unittest.TestCase):
             ],
             timepoints=tp,
         )
-        result = apply_cell_filters(
-            overlay, [AreaFilter(vmin=Q_(1, "um**2"))], images=images
-        )
+        result = _filter(overlay, [AreaFilter(vmin=Q_(1, "um**2"))], images=images)
         np.testing.assert_allclose(
             result.timepoints.to("minute").magnitude, [0.0, 42.0]
         )
@@ -247,9 +280,7 @@ class TestBoundaryClosenessFilter(unittest.TestCase):
                 _square(4, x0=0, y0=8, id="left_edge"),  # touches x=0
             ]
         )
-        result = apply_cell_filters(
-            overlay, [BoundaryClosenessFilter(Q_(1, "um"))], images=images
-        )
+        result = _filter(overlay, [BoundaryClosenessFilter(Q_(1, "um"))], images=images)
         self.assertEqual({c.id for c in result.contours}, {"center"})
 
     def test_range_is_open_above(self):
@@ -266,25 +297,53 @@ class TestBoundaryClosenessFilter(unittest.TestCase):
 
 
 class TestErrorHandling(unittest.TestCase):
-    def test_images_none_raises(self):
-        overlay = Overlay([_square(8)])
-        with self.assertRaises(ValueError):
-            apply_cell_filters(overlay, [AreaFilter()], images=None)
+    def test_missing_column_raises_and_names_the_extractor(self):
+        """A filter with no column in the table fails loudly.
 
-    def test_uncalibrated_source_raises(self):
+        Replaces the old calibration guard: ``apply_cell_filters`` no longer
+        takes an image source, so it cannot check ``pixel_size`` itself.
+        Calibration now happens during extraction, and what this function must
+        catch is a table that does not describe every filter.
+        """
+        images = _source(pixel_size="0.5 micrometer")
+        overlay = Overlay([_square(8, id="c")])
+        table = ExtractorExecutor().execute(overlay, images, [AreaEx()])
+
+        with self.assertRaises(KeyError) as ctx:
+            apply_cell_filters(
+                overlay, [LengthFilter(vmin=Q_(1, "um"))], properties=table
+            )
+        self.assertIn("length", str(ctx.exception))
+
+    def test_table_not_describing_the_overlay_raises(self):
+        images = _source(pixel_size="0.5 micrometer")
+        overlay = Overlay([_square(8, id="a"), _square(8, x0=20, id="b")])
+        table = ExtractorExecutor().execute(overlay, images, [AreaEx()])
+
+        with self.assertRaises(ValueError):
+            apply_cell_filters(overlay, [AreaFilter()], properties=table.iloc[:1])
+
+    def test_uncalibrated_source_is_reported_during_extraction(self):
+        """An uncalibrated source is still flagged, one step earlier.
+
+        Filtering used to refuse a source with no ``pixel_size``, because a µm²
+        bound against pixel values is meaningless. It no longer sees the source,
+        so the warning belongs where the ambiguity is created: the extractor
+        labels the column µm² while the values are really px².
+        """
         images = _source(pixel_size=None)
         overlay = Overlay([_square(8)])
-        with self.assertRaises(ValueError):
-            apply_cell_filters(overlay, [AreaFilter()], images=images)
+
+        with self.assertWarns(UserWarning) as ctx:
+            ExtractorExecutor().execute(overlay, images, [AreaEx()])
+        self.assertIn("pixel_size", str(ctx.warning))
 
     def test_dimensionality_mismatch_raises(self):
         images = _source(pixel_size="0.5 micrometer")
         overlay = Overlay([_square(8)])
         # area filter given a length (µm) range -> pint dimensionality error
         with self.assertRaises(pint.DimensionalityError):
-            apply_cell_filters(
-                overlay, [AreaFilter(Q_(2, "um"), Q_(20, "um"))], images=images
-            )
+            _filter(overlay, [AreaFilter(Q_(2, "um"), Q_(20, "um"))], images=images)
 
     def test_base_value_not_implemented(self):
         images = _source()
@@ -296,9 +355,7 @@ class TestEmptyResult(unittest.TestCase):
     def test_empty_overlay_no_crash(self):
         images = _source(pixel_size="0.5 micrometer")
         overlay = Overlay([_square(4, id="tiny")])  # 4 µm²
-        result = apply_cell_filters(
-            overlay, [AreaFilter(vmin=Q_(1000, "um**2"))], images=images
-        )
+        result = _filter(overlay, [AreaFilter(vmin=Q_(1000, "um**2"))], images=images)
         self.assertIsInstance(result, Overlay)
         self.assertEqual(len(result.contours), 0)
 
@@ -322,9 +379,7 @@ class TestCustomFilter(unittest.TestCase):
                 _square(4, x0=100, id="right"),  # centroid x=102px -> 51 µm
             ]
         )
-        result = apply_cell_filters(
-            overlay, [XPositionFilter(vmin=Q_(10, "um"))], images=images
-        )
+        result = _filter(overlay, [XPositionFilter(vmin=Q_(10, "um"))], images=images)
         self.assertEqual({c.id for c in result.contours}, {"right"})
 
 
@@ -344,7 +399,7 @@ class TestDegenerateGeometry(unittest.TestCase):
             WidthFilter(vmin=Q_(0.5, "um")),
             CircularityFilter(vmin=0.1),
         ):
-            result = apply_cell_filters(overlay, [cell_filter], images=images)
+            result = _filter(overlay, [cell_filter], images=images)
             self.assertEqual(
                 {c.id for c in result.contours}, {"ok"}, msg=cell_filter.name
             )

@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import shutil
+import warnings
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import reduce
@@ -95,7 +96,20 @@ class PropertyExtractor:
             self.input_unit = iu
             self.output_unit = iu.units
         else:
-            # no source calibration -> use the configured defaults
+            # No source calibration. The configured default is used, which
+            # labels the column µm (or µm²) while the values are really pixels
+            # -- a physical-unit filter or plot downstream would then compare
+            # against a scale that does not exist. Filtering used to refuse
+            # uncalibrated sources outright; now that it reads this table
+            # instead of the source, the ambiguity has to be reported here.
+            warnings.warn(
+                f"{type(self).__name__}: the image source has no pixel_size, so "
+                f"{self.name!r} is measured in pixels but labelled "
+                f"{self._default_output_unit!r}. Load the source with "
+                "pixel_size=... for physically meaningful values.",
+                UserWarning,
+                stacklevel=3,
+            )
             self.input_unit = self._default_input_unit
             self.output_unit = self._default_output_unit
 
@@ -258,11 +272,12 @@ def _rect_edge_lengths(polygons: list) -> np.ndarray:
     than one per contour per extractor, which had ``LengthEx`` and ``WidthEx``
     each deriving the same rectangle independently.
 
-    A degenerate outline (collinear or zero-extent) has a rectangle that
-    collapses to a ``LineString``/``Point``. The per-contour code raised
-    ``AttributeError`` reaching for its missing ``exterior``; that is reproduced
-    here rather than quietly turning into a different error or a 0, so making
-    the extractors degenerate-tolerant stays a separate, deliberate change.
+    A degenerate outline (collinear, zero-extent, or absent) has a rectangle
+    that collapses to a ``LineString``/``Point`` with no ``exterior``, so it has
+    no length or width to report and measures ``nan``. Reporting 0 instead would
+    be a claim -- and a 0-length cell passes any open-below bound, letting junk
+    through -- whereas ``nan`` states that the property is undefined, and the
+    filters drop what they cannot measure.
     """
     if not polygons:
         return np.empty((0, 4), dtype=float)
@@ -270,12 +285,12 @@ def _rect_edge_lengths(polygons: list) -> np.ndarray:
     rectangles = shapely.oriented_envelope(np.array(polygons, dtype=object))
 
     # a rectangle ring is 5 coordinates (closed); anything else is degenerate
-    if not np.all(shapely.get_num_coordinates(rectangles) == 5):
-        for rectangle in rectangles:
-            rectangle.exterior.coords  # noqa: B018 - raises as the old path did
-
-    coords = shapely.get_coordinates(rectangles).reshape(-1, 5, 2)
-    return np.asarray(np.linalg.norm(np.diff(coords, axis=1), axis=2), dtype=float)
+    edges = np.full((len(polygons), 4), np.nan, dtype=float)
+    intact = shapely.get_num_coordinates(rectangles) == 5
+    if intact.any():
+        coords = shapely.get_coordinates(rectangles[intact]).reshape(-1, 5, 2)
+        edges[intact] = np.linalg.norm(np.diff(coords, axis=1), axis=2)
+    return edges
 
 
 def _value_frame(overlay: Overlay, name: str, values: np.ndarray) -> pd.DataFrame:
@@ -343,9 +358,13 @@ class PerimeterEx(PropertyExtractor):
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         self._calibrate(images)
-        # scalar `.length` access: a bulk shapely call would save ~1% here and
-        # would return nan for an empty polygon where this raises, as it always has
-        perimeters = [cont.polygon.length for cont in overlay]
+        polygons = _polygons(overlay)
+        if polygons:
+            # shapely.length yields nan for an absent polygon, which is exactly
+            # right: there is no outline, so there is no perimeter to report
+            perimeters = shapely.length(np.array(polygons, dtype=object))
+        else:
+            perimeters = np.empty(0)
         df = _value_frame(overlay, self.name, self.convert_array(perimeters))
 
         return df, {self.name: self.output_unit}
@@ -364,9 +383,17 @@ class CircularityEx(PropertyExtractor):
         )
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
-        circularities = (4 * np.pi * np.array(df["area"])) / np.array(
-            df["perimeter"]
-        ) ** 2
+        areas = np.asarray(df["area"], dtype=float)
+        perimeters = np.asarray(df["perimeter"], dtype=float)
+
+        # a degenerate contour has no perimeter to divide by, so its circularity
+        # is undefined rather than 0 or inf (nan also propagates in from an
+        # undefined perimeter on its own)
+        circularities = np.full_like(areas, np.nan)
+        measurable = perimeters != 0
+        circularities[measurable] = (4 * np.pi * areas[measurable]) / perimeters[
+            measurable
+        ] ** 2
 
         df = pd.DataFrame({self.name: circularities, "id": df.index}).set_index("id")
 
@@ -695,19 +722,15 @@ class PositionEx(PropertyExtractor):
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         self._calibrate(images)
-        # Deliberately NOT using convert_array here. Contour.center is float32
-        # (it is derived from the float32 `coordinates`), and pint carries that
-        # magnitude through the conversion, so these two columns have always
-        # been computed in single precision. Converting them as a float64 array
-        # is more accurate but changes every value by ~1e-7 relative, which is a
-        # quality change rather than a speed one -- it belongs in its own commit.
-        positions_x = []
-        positions_y = []
-        ids = []
-        for cont in overlay:
-            positions_x.append(self.convert(cont.center[0]))
-            positions_y.append(self.convert(cont.center[1]))
-            ids.append(cont.id)
+        # `Contour.center` is float32 (derived from the float32 `coordinates`)
+        # and pint used to carry that magnitude through, so these two columns
+        # were computed in single precision. Converting the array in float64
+        # shifts them by ~1e-7 relative -- sub-picometre on a micrometre
+        # coordinate, so the added accuracy is free of consequence here.
+        centers = [cont.center for cont in overlay]
+        positions_x = self.convert_array([c[0] for c in centers])
+        positions_y = self.convert_array([c[1] for c in centers])
+        ids = [cont.id for cont in overlay]
 
         return pd.DataFrame(
             {"position_x": positions_x, "position_y": positions_y, "id": ids}

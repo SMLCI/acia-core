@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import unittest
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -153,18 +152,6 @@ class TestGoldenEquivalence(unittest.TestCase):
                         f"{scene_name}/{battery_name}: different cells survive",
                     )
 
-    def test_deprecated_images_path_still_matches_golden(self):
-        """The row-wise ``images=`` path keeps working while it is deprecated."""
-        for scene_name, build in GOLDEN_SCENES.items():
-            overlay, images = build()
-            for battery_name, filters in filter_battery().items():
-                with self.subTest(scene=scene_name, filters=battery_name):
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", DeprecationWarning)
-                        result = apply_cell_filters(overlay, filters, images=images)
-                    got = sorted(str(c.id) for c in result)
-                    self.assertEqual(got, self.meta[scene_name]["kept"][battery_name])
-
     def test_boundary_closeness_column_matches_the_filter(self):
         """The new column reproduces ``BoundaryClosenessFilter.value()`` exactly.
 
@@ -189,6 +176,66 @@ class TestGoldenEquivalence(unittest.TestCase):
                     [c.id for c in overlay], "boundary_closeness"
                 ].to_numpy(dtype=float)
                 np.testing.assert_array_equal(from_column, measured)
+
+
+class TestBoundUnitConversion(unittest.TestCase):
+    """A bound in a different unit than its column must still select correctly.
+
+    Every bound in the golden battery is already expressed in its column's unit
+    (µm against a µm column), so the conversion in
+    :func:`~acia.segm.filter._bound_magnitude` is an identity there and a bug in
+    it would go unseen. These express the same thresholds in other units.
+    """
+
+    def test_equivalent_bounds_in_other_units_select_the_same_cells(self):
+        from acia.segm.filter import AreaFilter, LengthFilter
+
+        overlay, images = GOLDEN_SCENES["instance_basic"]()
+        table = ExtractorExecutor().execute(overlay, images, filter_extractors())
+
+        for micrometre, equivalent in (
+            (
+                LengthFilter(Q_(0.5, "um"), Q_(4.0, "um")),
+                LengthFilter(Q_(500, "nm"), Q_(4000, "nm")),
+            ),
+            (
+                LengthFilter(Q_(0.5, "um"), Q_(4.0, "um")),
+                LengthFilter(Q_(5e-4, "mm"), Q_(4e-3, "mm")),
+            ),
+            (
+                AreaFilter(Q_(0.1, "um**2"), Q_(4.0, "um**2")),
+                AreaFilter(Q_(1e5, "nm**2"), Q_(4e6, "nm**2")),
+            ),
+        ):
+            with self.subTest(unit=str(equivalent.vmin.units)):
+                reference = apply_cell_filters(overlay, [micrometre], properties=table)
+                other = apply_cell_filters(overlay, [equivalent], properties=table)
+                self.assertEqual(
+                    {c.id for c in reference},
+                    {c.id for c in other},
+                    "the bound's unit changed which cells survive",
+                )
+
+    def test_a_bound_that_ignores_units_would_select_differently(self):
+        """Confirms the check above can actually fail.
+
+        A nanometre bound compared as if it were micrometres keeps everything;
+        if that were indistinguishable from correct behaviour, the test would be
+        vacuous.
+        """
+        from acia.segm.filter import LengthFilter
+
+        overlay, images = GOLDEN_SCENES["instance_basic"]()
+        table = ExtractorExecutor().execute(overlay, images, filter_extractors())
+
+        correct = apply_cell_filters(
+            overlay, [LengthFilter(Q_(500, "nm"), Q_(4000, "nm"))], properties=table
+        )
+        # the same numbers taken as micrometres select nothing like the same set
+        as_raw_numbers = apply_cell_filters(
+            overlay, [LengthFilter(Q_(500, "um"), Q_(4000, "um"))], properties=table
+        )
+        self.assertNotEqual({c.id for c in correct}, {c.id for c in as_raw_numbers})
 
 
 class TestHarnessIsMeaningful(unittest.TestCase):
@@ -445,41 +492,69 @@ class TestEdgeSceneBehaviour(unittest.TestCase):
             overlay, list(filter_battery()[battery_name]), properties=table
         )
 
-    def test_row_wise_path_tolerates_degenerate_contours(self):
+    def test_unmeasurable_geometry_extracts_as_nan(self):
+        """A contour with no measurable outline reports nan, not 0.
+
+        0 would be a claim -- and a 0-length cell passes any open-below bound,
+        so junk would survive filtering and skew the histograms. nan says the
+        property is undefined.
+        """
         overlay, images = scene_degenerate()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            result = apply_cell_filters(
-                overlay, list(filter_battery()["length_two_sided"]), images=images
-            )
-        self.assertEqual(sorted(str(c.id) for c in result), ["triangle"])
+        table = ExtractorExecutor().execute(overlay, images, filter_extractors())
 
-    def test_row_wise_path_tolerates_absent_label(self):
+        for column in ("length", "width"):
+            self.assertTrue(np.isnan(table.loc["collinear", column]))
+            self.assertTrue(np.isnan(table.loc["point", column]))
+            self.assertFalse(np.isnan(table.loc["triangle", column]))
+
+        # a real, if degenerate, measurement stays a number: a collinear outline
+        # genuinely encloses zero area
+        self.assertEqual(table.loc["collinear", "area"], 0.0)
+
+    def test_absent_label_extracts_as_nan(self):
         overlay, images = scene_absent_label()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            result = apply_cell_filters(
-                overlay, list(filter_battery()["boundary_only"]), images=images
-            )
-        self.assertEqual(list(result), [])
+        table = ExtractorExecutor().execute(overlay, images, filter_extractors())
+        for column in ("perimeter", "length", "width", "circularity"):
+            self.assertTrue(np.isnan(table.loc[9, column]), column)
 
-    def test_table_path_cannot_filter_what_extraction_cannot_measure(self):
-        """The inherited limitation, stated explicitly rather than discovered."""
+    def test_unmeasurable_cells_are_dropped_by_every_bound_shape(self):
+        """nan never survives a filter, whichever way the bounds are set.
+
+        This is the property 0 could not give: an open-below length filter keeps
+        a 0-length contour, so junk detections would pass through.
+        """
+        from acia.segm.filter import LengthFilter
+
+        overlay, images = scene_degenerate()
+        table = ExtractorExecutor().execute(overlay, images, filter_extractors())
+
+        for label, cell_filter in (
+            ("both bounds", LengthFilter(Q_(0.1, "um"), Q_(50, "um"))),
+            ("open below", LengthFilter(None, Q_(50, "um"))),
+            ("open above", LengthFilter(Q_(0.1, "um"), None)),
+            ("no bounds", LengthFilter(None, None)),
+        ):
+            with self.subTest(bounds=label):
+                kept = apply_cell_filters(overlay, [cell_filter], properties=table)
+                self.assertEqual(
+                    sorted(str(c.id) for c in kept),
+                    ["triangle"],
+                    "an unmeasurable contour survived filtering",
+                )
+
+    def test_degenerate_scenes_no_longer_fail_extraction(self):
+        """Extraction survives what it used to crash on.
+
+        ``LengthEx``/``WidthEx`` raised ``AttributeError`` on a collapsed
+        rectangle and ``PerimeterEx`` on an absent polygon, which -- once
+        filtering reads the table -- meant one junk detection failed the whole
+        run instead of being filtered out.
+        """
         for scene in (scene_degenerate, scene_absent_label):
             with self.subTest(scene=scene.__name__):
                 overlay, images = scene()
-                with self.assertRaises(AttributeError):
-                    self._filter_via_table(overlay, images, "length_two_sided")
-
-    def test_extractors_fail_on_degenerate_contours(self):
-        overlay, images = scene_degenerate()
-        with self.assertRaises(AttributeError):
-            ExtractorExecutor().execute(overlay, images, extractors())
-
-    def test_extractors_fail_on_absent_label(self):
-        overlay, images = scene_absent_label()
-        with self.assertRaises(AttributeError):
-            ExtractorExecutor().execute(overlay, images, extractors())
+                table = ExtractorExecutor().execute(overlay, images, extractors())
+                self.assertEqual(len(table), len(overlay.contours))
 
     def test_empty_overlay_extracts_and_filters(self):
         overlay, images = scene_empty()

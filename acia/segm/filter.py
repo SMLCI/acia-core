@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import warnings
 from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -370,9 +369,17 @@ class CellFilter:
                 :meth:`~acia.analysis.ExtractorExecutor.execute`) that contains a
                 column named :attr:`name`.
 
+        A row whose value is not finite is **always** dropped, including by a
+        filter with no bounds at all. ``nan`` is what an extractor reports for a
+        contour whose geometry it cannot measure -- a collinear outline, a mask
+        with no pixels -- and a cell whose length is unknown cannot be asserted
+        to lie within a length range. Dropping it here is what the row-wise
+        filters effectively did before, and it keeps such a detection from
+        surviving a one-sided bound.
+
         Returns:
             A boolean ``np.ndarray`` of ``len(properties)``, ``True`` where the
-            row is within the ``(vmin, vmax)`` range.
+            row is finite and within the ``(vmin, vmax)`` range.
 
         Raises:
             KeyError: if ``properties`` has no column for this filter.
@@ -382,12 +389,12 @@ class CellFilter:
         """
         values, unit = _column_magnitudes(properties, self.name)
 
-        keep = np.ones(len(values), dtype=bool)
+        keep = np.isfinite(values)
         if self.vmin is not None:
             keep &= values >= _bound_magnitude(self.vmin, unit)
         if self.vmax is not None:
             keep &= values <= _bound_magnitude(self.vmax, unit)
-        return keep
+        return np.asarray(keep, dtype=bool)
 
 
 class _ExtractorCalibratedFilter(CellFilter):
@@ -544,16 +551,15 @@ def apply_cell_filters(
     overlay: Overlay,
     filters: Sequence[CellFilter],
     *,
-    properties: pd.DataFrame | None = None,
-    images: ImageSequenceSource | None = None,
+    properties: pd.DataFrame,
 ) -> Overlay:
     """Keep contours accepted by ALL filters, preserving the overlay time model.
 
-    Pass ``properties`` -- the table an
-    :class:`~acia.analysis.ExtractorExecutor` already produced for this overlay.
-    Each filter reads its own column from it, so the contours are measured once
-    (during extraction) rather than a second time here. Calibration comes from
-    the table's units, which is why no image source is needed.
+    ``properties`` is the table an :class:`~acia.analysis.ExtractorExecutor`
+    already produced for this overlay. Each filter reads its own column from it,
+    so the contours are measured once (during extraction) rather than a second
+    time here. Calibration comes from the table's units, which is why no image
+    source is needed.
 
     Args:
         overlay: the overlay to filter.
@@ -561,58 +567,34 @@ def apply_cell_filters(
             accepts it (logical AND). An empty filter list keeps everything.
         properties: the extractor table describing ``overlay``, indexed by
             contour id. Every filter needs a column named after it.
-        images: **deprecated** -- the calibrated image source, selecting the old
-            row-wise path that re-measures every contour. Only used when
-            ``properties`` is not given.
 
     Returns:
         A new :class:`~acia.base.Overlay` with the kept contours and the same
         time model (timepoints / frame_interval). The result may be empty.
 
     Raises:
-        ValueError: if neither ``properties`` nor a calibrated ``images`` is
-            given, or if ``properties`` does not describe every contour.
+        ValueError: if ``properties`` does not describe every contour.
         KeyError: if a filter has no matching column in ``properties``.
     """
-    if properties is None:
-        if images is None or getattr(images, "pixel_size", None) is None:
-            raise ValueError(
-                "apply_cell_filters needs `properties` (the extractor table for "
-                "this overlay). A calibrated `images` source still works but is "
-                "deprecated: it re-measures every contour, which is what the "
-                "table already did."
-            )
-        warnings.warn(
-            "apply_cell_filters(images=...) re-measures every contour and is "
-            "deprecated; pass properties=<ExtractorExecutor table> instead.",
-            DeprecationWarning,
-            stacklevel=2,
+    keep = np.ones(len(properties), dtype=bool)
+    for cell_filter in filters:
+        keep &= cell_filter.mask(properties)
+
+    kept_ids = set(properties.index[keep])
+
+    # A contour the table does not describe cannot be judged. Dropping it
+    # silently would quietly shrink the overlay, so say so instead.
+    missing = [c.id for c in overlay.contours if c.id not in properties.index]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} contour(s) are missing from the properties "
+            f"table (first: {missing[:3]}). It must describe the overlay "
+            "being filtered -- extract before filtering, on the unfiltered "
+            "overlay."
         )
-        kept: list = [
-            cont
-            for cont in overlay.contours
-            if all(f.accepts(cast(Contour, cont), images=images) for f in filters)
-        ]
-    else:
-        keep = np.ones(len(properties), dtype=bool)
-        for cell_filter in filters:
-            keep &= cell_filter.mask(properties)
 
-        kept_ids = set(properties.index[keep])
-
-        # A contour the table does not describe cannot be judged. Dropping it
-        # silently would quietly shrink the overlay, so say so instead.
-        missing = [c.id for c in overlay.contours if c.id not in properties.index]
-        if missing:
-            raise ValueError(
-                f"{len(missing)} contour(s) are missing from the properties "
-                f"table (first: {missing[:3]}). It must describe the overlay "
-                "being filtered -- extract before filtering, on the unfiltered "
-                "overlay."
-            )
-
-        # iterate the overlay, not the table, so contour order is preserved
-        kept = [cont for cont in overlay.contours if cont.id in kept_ids]
+    # iterate the overlay, not the table, so contour order is preserved
+    kept = [cont for cont in overlay.contours if cont.id in kept_ids]
 
     # preserve the overlay's time model (private attrs, since Overlay exposes
     # only the resolved `timepoints` property, not `frame_interval`)
