@@ -4,6 +4,7 @@ import unittest
 from itertools import product
 
 import numpy as np
+import pytest
 
 from acia import ureg
 from acia.analysis import (
@@ -181,9 +182,12 @@ class TestPropertyExtractors(unittest.TestCase):
 
     def test_parallel_fluorescence_extraction(self):
         squared_num = 30
+        # ids must be unique across the whole overlay, not per frame
         contours = [
             Contour([[0, 0], [2, 0], [2, 2], [0, 2]], -1, frame=frame, id=id)
-            for id, frame in product(list(range(squared_num)), list(range(squared_num)))
+            for id, (_, frame) in enumerate(
+                product(list(range(squared_num)), list(range(squared_num)))
+            )
         ]
         overlay = Overlay(contours)
 
@@ -237,3 +241,58 @@ def test_extractor_executor_empty_overlay_returns_empty_typed_frame():
     )
     assert len(df) == 0
     assert {"area", "perimeter", "position_x", "position_y"} <= set(df.columns)
+
+
+def _square_overlay_source():
+    """Overlay with 1/2/3 well-separated 10x10 cells and a matching 1 um/px source."""
+    import numpy as np
+
+    from acia.base import Contour, Overlay
+    from acia.segm.local import THWCSequenceSource
+
+    def square(x, y, frame, cont_id, size=10.0):
+        coords = [[x, y], [x + size, y], [x + size, y + size], [x, y + size]]
+        return Contour(np.array(coords, dtype=float), 1.0, frame, cont_id)
+
+    contours = [square(10, 10, 0, 0)]
+    contours += [square(10, 10, 1, 1), square(200, 200, 1, 2)]
+    contours += [square(10, 10, 2, 3), square(200, 200, 2, 4), square(400, 400, 2, 5)]
+
+    source = THWCSequenceSource(
+        np.zeros((3, 512, 512, 1), dtype=np.uint8),
+        pixel_size="1 um",
+        frame_interval="5 min",
+    )
+    return Overlay(contours), source
+
+
+def test_extractor_executor_rejects_duplicate_ids():
+    """Joining extractor results on a duplicated id would silently multiply rows"""
+    from acia.analysis import AreaEx, ExtractorExecutor, FrameEx
+
+    overlay, source = _square_overlay_source()
+    for cont in overlay:
+        cont.id = cont.frame  # what merge_cells_to_colonies used to do
+
+    with pytest.raises(ValueError, match="duplicate contour id"):
+        ExtractorExecutor().execute(overlay, source, [AreaEx(), FrameEx()])
+
+
+def test_colony_areas_are_not_inflated_by_multiple_blobs_per_frame():
+    """Regression: total colony area per timepoint must be the plain sum of its blobs"""
+    from acia.analysis import AreaEx, ExtractorExecutor, FrameEx, TimeEx
+    from acia.segm.utils import merge_cells_to_colonies
+
+    overlay, source = _square_overlay_source()
+    colonies = merge_cells_to_colonies(overlay, expand=2)
+
+    df = ExtractorExecutor().execute(colonies, source, [AreaEx(), FrameEx(), TimeEx()])
+
+    # one row per colony blob -- no cartesian blow-up from the id join
+    assert len(df) == len(colonies)
+
+    per_frame = df.groupby("frame")["area"].sum()
+    # 1, 2 and 3 separated cells of 10x10 um each
+    assert per_frame.loc[0.0] == pytest.approx(100, rel=1e-3)
+    assert per_frame.loc[1.0] == pytest.approx(200, rel=1e-3)
+    assert per_frame.loc[2.0] == pytest.approx(300, rel=1e-3)

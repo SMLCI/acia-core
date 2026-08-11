@@ -1,5 +1,6 @@
 """Utils for segmentation data handling"""
 
+from itertools import count
 from typing import Any
 
 import numpy as np
@@ -71,12 +72,22 @@ def merge_cells_to_colonies(overlay: Overlay, expand=10) -> Overlay:
         Overlay: Overlay of colony blobs
     """
 
-    merged_contours = []
+    merged_contours: list[Contour] = []
+    next_id = count()
 
     # iterate over frames and all the cell instances
-    for frame_ind, frame_overlay in enumerate(
-        tqdm(overlay.timeIterator(), desc="Merging cells to colonies...")
+    for frame_overlay in tqdm(
+        overlay.timeIterator(), desc="Merging cells to colonies..."
     ):
+        if len(frame_overlay) == 0:
+            # a frame without detections yields no colony blob
+            continue
+
+        # the real frame number, taken from the detections themselves -- the
+        # position in the iteration is *not* it (timeIterator starts at
+        # min(frames()), so a sliced overlay would get silently renumbered)
+        frame = int(frame_overlay.contours[0].frame)
+
         # get all polygons
         cont_polys = [cont.polygon for cont in frame_overlay]
 
@@ -94,9 +105,16 @@ def merge_cells_to_colonies(overlay: Overlay, expand=10) -> Overlay:
         if isinstance(i, MultiPolygon):
             polygons = list(i.geoms)
 
+        # ids must be unique across the whole overlay, not per frame: a frame can
+        # yield several blobs (separate colonies), and property extraction joins
+        # extractor results on `id` -- duplicates silently multiply the rows and
+        # blow up any per-frame sum (e.g. total colony area)
         contours = [
             Contour(
-                np.array(list(zip(p.exterior.xy))).T.squeeze(), -1, frame_ind, frame_ind
+                np.array(list(zip(p.exterior.xy))).T.squeeze(),
+                -1,
+                frame,
+                next(next_id),
             )
             for p in polygons
         ]
@@ -106,8 +124,9 @@ def merge_cells_to_colonies(overlay: Overlay, expand=10) -> Overlay:
         # add merged contour to results
         merged_contours += contours
 
-    # return new overlay with merged contours
-    return Overlay(merged_contours)
+    # return new overlay with merged contours, carrying the input's time model so
+    # the colony overlay stays calibrated on its own
+    return Overlay(merged_contours, timepoints=overlay.timepoints)
 
 
 def _bbox_from_mask(

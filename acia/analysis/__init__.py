@@ -233,6 +233,20 @@ class ExtractorExecutor:
         df["id"] = [c.id for c in overlay]
         df = df.set_index("id")
 
+        # extractor results are joined on `id`, and a join on a non-unique index
+        # is a cartesian product: k detections sharing an id turn into k**2 rows
+        # per extractor, silently inflating every downstream sum. Fail loudly
+        # instead of returning a table that is wrong by orders of magnitude.
+        if not df.index.is_unique:
+            duplicated = df.index[df.index.duplicated()].unique()
+            examples = ", ".join(repr(i) for i in duplicated[:5])
+            raise ValueError(
+                f"The overlay has {len(duplicated)} duplicate contour id(s) "
+                f"(e.g. {examples}). Property extraction joins the extractor "
+                "results on `id`, so duplicates multiply the rows. Give every "
+                "contour in the overlay a unique id."
+            )
+
         # the bar names the property currently being extracted; it used to also
         # print one line per extractor to stdout, which a notebook re-running
         # this over many sources drowns in
