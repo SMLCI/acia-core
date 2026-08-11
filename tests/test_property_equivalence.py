@@ -253,6 +253,99 @@ class TestGeometryInvariants(unittest.TestCase):
                 "Instance.polygon depends on the frame it sits in",
             )
 
+    def test_supplied_bbox_matches_the_derived_one(self):
+        """A caller-supplied bounding box must give the same geometry as none.
+
+        ``overlay_from_masks`` hands each instance the box ``find_objects``
+        found, skipping the per-instance scan. An off-by-one there would shift
+        or clip an outline, so assert the two routes agree exactly.
+        """
+        mask = np.zeros((96, 96), np.int32)
+        mask[13:27, 41:52] = 4
+        mask[60:64, 5:9] = 4  # a second, disconnected part
+
+        derived = Instance(mask=mask, frame=0, label=4, id=4)
+        supplied = Instance(
+            mask=mask,
+            frame=0,
+            label=4,
+            id=4,
+            bbox=(slice(13, 64), slice(5, 52)),
+        )
+
+        self.assertTrue(derived.polygon.equals(supplied.polygon))
+        self.assertEqual(derived.area, supplied.area)
+        self.assertEqual(derived.center, supplied.center)
+
+    def test_overlay_from_masks_matches_per_instance_derivation(self):
+        """The bulk path and the lazy path agree, cell for cell."""
+        from acia.segm.formats import overlay_from_masks
+
+        rng = np.random.default_rng(7)
+        stack = np.zeros((2, 80, 80), np.int32)
+        for frame in range(2):
+            for label in range(1, 9):
+                y = int(rng.integers(0, 70))
+                x = int(rng.integers(0, 70))
+                stack[frame, y : y + 6, x : x + 9] = label
+
+        from_bulk = overlay_from_masks(stack)
+        for contour in from_bulk:
+            lazy = Instance(
+                mask=stack[contour.frame], frame=contour.frame, label=contour.label
+            )
+            self.assertTrue(contour.polygon.equals(lazy.polygon))
+            self.assertEqual(contour.area, lazy.area)
+
+    def test_geometry_survives_mask_reassignment(self):
+        """Changing mask/label must drop the cached box, not reuse a stale one."""
+        first = np.zeros((64, 64), np.int32)
+        first[10:14, 10:14] = 1
+        second = np.zeros((64, 64), np.int32)
+        second[40:50, 30:44] = 1
+
+        instance = Instance(mask=first, frame=0, label=1, id=1)
+        self.assertEqual(instance.area, 16.0)
+
+        instance.mask = second
+        self.assertEqual(instance.area, 140.0)
+        self.assertTrue(
+            instance.polygon.equals(Instance(mask=second, frame=0, label=1).polygon)
+        )
+
+    def test_supplied_bbox_is_dropped_when_mask_changes(self):
+        """A passed-in box describes one (mask, label) pair only."""
+        first = np.zeros((64, 64), np.int32)
+        first[10:14, 10:14] = 1
+        second = np.zeros((64, 64), np.int32)
+        second[40:50, 30:44] = 1
+
+        instance = Instance(
+            mask=first, frame=0, label=1, id=1, bbox=(slice(10, 14), slice(10, 14))
+        )
+        self.assertEqual(instance.area, 16.0)
+
+        instance.mask = second  # the old box now points at empty pixels
+        self.assertEqual(instance.area, 140.0)
+
+    def test_contour_polygon_cache_follows_coordinates(self):
+        """The cached ``Contour`` polygon must track a coordinate change."""
+        from acia.base import Contour
+
+        contour = Contour(
+            np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]]),
+            score=-1,
+            frame=0,
+            id=1,
+        )
+        self.assertEqual(contour.area, 16.0)
+
+        contour.scale(2.0)
+        self.assertEqual(contour.area, 64.0)
+
+        contour.coordinates = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+        self.assertEqual(contour.area, 4.0)
+
     def test_raster_polygon_area_equals_pixel_count(self):
         """``polygon.area`` equals the mask pixel count, exactly.
 

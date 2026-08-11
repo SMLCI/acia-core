@@ -215,6 +215,8 @@ class TestRenderOverlayFrameWithContours(unittest.TestCase):
         # Create a small square mask
         mock_mask[50:100, 50:100] = True
         mock_contour.toMask = Mock(return_value=mock_mask)
+        # models the toMask()-only protocol: no outline to fill from
+        mock_contour.coordinates = None
         mock_contour.label = None
         mock_contour.frame = 0
         mock_contour.id = 0
@@ -240,6 +242,8 @@ class TestRenderOverlayFrameWithContours(unittest.TestCase):
             y_start = i * 50
             mock_mask[y_start : y_start + 50, i * 50 : (i + 1) * 50] = True
             mock_contour.toMask = Mock(return_value=mock_mask)
+            # models the toMask()-only protocol: no outline to fill from
+            mock_contour.coordinates = None
             mock_contour.label = None
             mock_contour.frame = 0
             mock_contour.id = i
@@ -264,6 +268,8 @@ class TestRenderOverlayFrameWithContours(unittest.TestCase):
         mock_mask = np.zeros((100, 100), dtype=bool)
         mock_mask[25:75, 25:75] = True  # Center square
         mock_contour.toMask = Mock(return_value=mock_mask)
+        # models the toMask()-only protocol: no outline to fill from
+        mock_contour.coordinates = None
         mock_contour.label = None
         mock_contour.frame = 0
         mock_contour.id = 0

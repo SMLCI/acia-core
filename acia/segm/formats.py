@@ -350,6 +350,8 @@ def overlay_from_masks(segm_masks: np.ndarray) -> Overlay:
     Returns:
         Overlay: returns the multi-frame overly with cell instances
     """
+    from scipy import ndimage
+
     overlay = Overlay([], frames=list(range(len(segm_masks))))
 
     # unique id for instances
@@ -360,9 +362,18 @@ def overlay_from_masks(segm_masks: np.ndarray) -> Overlay:
         # Find all cell labels (except 0)
         labels = np.unique(mask)[1:]
 
+        # One pass over the frame yields every label's bounding box, so no
+        # instance has to scan the frame again to find its own pixels. Each
+        # instance then derives its geometry inside that box; without this the
+        # whole frame is touched once per cell, per property.
+        boxes = ndimage.find_objects(mask)
+
         # for every label create an instance and add it to the contour
         for label in labels:
-            instance = Instance(mask=mask, frame=frame_id, label=label, id=uid)
+            bbox = boxes[label - 1] if label - 1 < len(boxes) else None
+            instance = Instance(
+                mask=mask, frame=frame_id, label=label, id=uid, bbox=bbox
+            )
             overlay.add_contour(instance)
             uid += 1
 

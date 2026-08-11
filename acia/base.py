@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
 import cv2
 import numpy as np
+import shapely.affinity
 import tqdm
 from PIL import Image, ImageDraw
 from shapely.geometry import MultiPolygon, Polygon
@@ -43,6 +44,7 @@ class Instance:
         label: int,
         id=None,
         score: float | None = None,
+        bbox: tuple[slice, slice] | None = None,
     ):
         """Create an object instance
 
@@ -52,10 +54,20 @@ class Instance:
             label (int): label of the object (as marked in the mask)
             id (_type_, optional): Unique identifier for the object. Defaults to None.
             score (float, optional): E.g. confidence of the detection method. Defaults to None.
+            bbox (tuple[slice, slice], optional): this label's ``(rows, cols)``
+                bounding box within ``mask``, as returned by
+                ``scipy.ndimage.find_objects``. Every derived geometry is
+                computed inside it, so supplying it saves locating the label --
+                the only step that still has to look at the whole frame. One
+                ``find_objects`` call yields the boxes for a whole frame at once
+                (see :func:`~acia.segm.formats.overlay_from_masks`). Derived
+                lazily when omitted.
         """
         # derived-value caches; invalidated by the mask/label setters below
         self._polygon: Polygon | MultiPolygon | None = None
         self._center: tuple[float, float] | None = None
+        self._bbox: tuple[int, int, int, int] | None = None
+        self._crop: np.ndarray | None = None
 
         self.mask = mask
         self.frame = frame
@@ -63,6 +75,12 @@ class Instance:
         self.id = id  # id is unique in an overlay
         self.score = score
         self.time = None  # pint timestamp, set when the overlay carries a time model
+
+        # set last: assigning mask/label above runs _invalidate(), which would
+        # otherwise drop the box the caller just handed us
+        if bbox is not None:
+            rows, cols = bbox
+            self._bbox = (rows.start, rows.stop, cols.start, cols.stop)
 
     @property
     def mask(self) -> np.ndarray:
@@ -86,22 +104,77 @@ class Instance:
         """Drop cached values derived from ``mask``/``label``."""
         self._polygon = None
         self._center = None
+        # a bounding box belongs to one (mask, label) pair, including one that
+        # was passed in: after either changes it points at the wrong pixels
+        self._bbox = None
+        self._crop = None
+
+    @property
+    def _bounds(self) -> tuple[int, int, int, int] | None:
+        """Half-open ``(y0, y1, x0, x1)`` box of this label, or ``None`` if absent.
+
+        Derived with a single full-frame pass and then cached, so the frame is
+        scanned once per instance rather than once per geometry access.
+        """
+        if self._bbox is None:
+            matches = self.mask == self.label
+            rows = np.flatnonzero(matches.any(axis=1))
+            if len(rows) == 0:
+                return None
+            cols = np.flatnonzero(matches.any(axis=0))
+            self._bbox = (
+                int(rows[0]),
+                int(rows[-1]) + 1,
+                int(cols[0]),
+                int(cols[-1]) + 1,
+            )
+        return self._bbox
+
+    @property
+    def _cropped_mask(self) -> np.ndarray | None:
+        """Binary mask of this label, cropped to :attr:`_bounds` (cached).
+
+        Everything derived from the object's shape reads this instead of the
+        full-frame :attr:`binary_mask`, which is what made every geometry access
+        cost O(frame) rather than O(cell).
+        """
+        if self._crop is None:
+            bounds = self._bounds
+            if bounds is None:
+                return None
+            y0, y1, x0, x1 = bounds
+            self._crop = self.mask[y0:y1, x0:x1] == self.label
+        return self._crop
 
     @property
     def binary_mask(self):
+        """Full-frame boolean mask of this instance.
+
+        Kept frame-sized because callers overlay it on the image (see
+        :meth:`toMask` and the fluorescence extractor). Shape-derived properties
+        use :attr:`_cropped_mask` instead.
+        """
         return self.mask == self.label
 
     @property
     def center(self):
         # compute (x,y) center on pixel level
 
-        # cached: deriving the center touches the full-frame mask, and callers
-        # (e.g. viz.render_tracking) ask for it once per edge per frame
+        # cached: callers (e.g. viz.render_tracking) ask for it once per edge
+        # per frame
         if self._center is None:
-            bin_mask = self.binary_mask
-
-            x = np.median(np.nonzero(np.max(bin_mask, axis=0)))
-            y = np.median(np.nonzero(np.max(bin_mask, axis=1)))
+            crop = self._cropped_mask
+            if crop is None:
+                # empty mask: keep the historical nan, via the same expression
+                bin_mask = self.binary_mask
+                x = np.median(np.nonzero(np.max(bin_mask, axis=0)))
+                y = np.median(np.nonzero(np.max(bin_mask, axis=1)))
+            else:
+                y0, _, x0, _ = self._bounds  # type: ignore[misc]
+                # median of (offset + indices) == offset + median(indices), so
+                # cropping shifts the result without changing it
+                x = x0 + np.median(np.nonzero(np.max(crop, axis=0)))
+                y = y0 + np.median(np.nonzero(np.max(crop, axis=1)))
 
             self._center = (x, y)
 
@@ -114,7 +187,12 @@ class Instance:
         Returns:
             [float]: area
         """
-        return float(np.sum(self.binary_mask))
+        crop = self._cropped_mask
+        if crop is None:
+            return 0.0
+        # every pixel of the label lies inside its bounding box, so the cropped
+        # count equals the full-frame one (fragmented masks included)
+        return float(np.sum(crop))
 
     def toMask(self, height, width):
         """
@@ -134,8 +212,23 @@ class Instance:
 
     @property
     def polygon(self) -> Polygon | MultiPolygon | None:
+        """Outline of this instance, traced from its mask.
+
+        Traced inside the label's bounding box and then shifted back into frame
+        coordinates. Polygonising the full frame instead -- which is what this
+        did -- costs O(frame) per cell, so the same cell got ~4x more expensive
+        each time the image dimensions doubled.
+        """
         if self._polygon is None:
-            self._polygon = mask_to_polygons(self.binary_mask)
+            crop = self._cropped_mask
+            if crop is None:
+                return None
+            polygon = mask_to_polygons(crop)
+            if polygon is not None:
+                y0, _, x0, _ = self._bounds  # type: ignore[misc]
+                if (x0, y0) != (0, 0):
+                    polygon = shapely.affinity.translate(polygon, xoff=x0, yoff=y0)
+            self._polygon = polygon
         return self._polygon
 
     @property
@@ -221,12 +314,30 @@ class Contour:
             id (any): unique id
             label: class-defining label of the contour
         """
+        # derived-value cache; dropped by the `coordinates` setter below
+        self._polygon: Polygon | None = None
+
         self.coordinates = np.array(coordinates, dtype=np.float32)
         self.score = score
         self.frame = frame
         self.id = id
         self.label = label
         self.time = None  # pint timestamp, set when the overlay carries a time model
+
+    @property
+    def coordinates(self) -> np.ndarray:
+        """The contour outline as an ``(N, 2)`` array of ``(x, y)`` points.
+
+        Note that mutating the returned array **in place** (``cont.coordinates[0]
+        = ...``) does not invalidate the cached :attr:`polygon`; assign to the
+        attribute instead, as :meth:`scale` does.
+        """
+        return self._coordinates
+
+    @coordinates.setter
+    def coordinates(self, value: np.ndarray):
+        self._coordinates = np.array(value, dtype=np.float32)
+        self._polygon = None
 
     def _toMask(self, height: int, width: int) -> np.ndarray:
         """
@@ -279,11 +390,12 @@ class Contour:
         Args:
             scale (float): the multplication factor
         """
-        self.coordinates *= scale
+        # assign rather than mutate in place, so the cached polygon is dropped
+        self.coordinates = self.coordinates * scale
 
     @property
     def center(self):
-        return np.array(Polygon(self.coordinates).centroid.coords[0], dtype=np.float32)
+        return np.array(self.polygon.centroid.coords[0], dtype=np.float32)
 
     @property
     def area(self) -> float:
@@ -296,7 +408,15 @@ class Contour:
 
     @property
     def polygon(self) -> Polygon:
-        return Polygon(self.coordinates)
+        """Shapely outline built from :attr:`coordinates` (cached).
+
+        Cached because a single extraction run reads it several times per
+        contour -- once per geometry property, plus once per filter -- and
+        rebuilding the polygon each time was a measurable share of that.
+        """
+        if self._polygon is None:
+            self._polygon = Polygon(self.coordinates)
+        return self._polygon
 
     def __repr__(self) -> str:
         return str(self.id)
