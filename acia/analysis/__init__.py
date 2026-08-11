@@ -299,6 +299,57 @@ class CircularityEx(PropertyExtractor):
         return df, {self.name: self.output_unit}
 
 
+class BoundaryClosenessEx(PropertyExtractor):
+    """Distance from each cell's bounding box to the nearest image border.
+
+    The backing property for
+    :class:`~acia.segm.filter.BoundaryClosenessFilter`, which filters on how
+    close a cell sits to the edge of the field of view (a cell that is partly
+    outside it has unreliable size and shape). Extracting it as a column means
+    the filter reads it like every other filter reads its own property, and it
+    becomes plottable next to them in
+    :func:`~acia.analysis.properties.plot_property_histograms`.
+
+    The frame extent comes from the source (``size_w`` / ``size_h``), so a cell
+    whose bounding box touches a border measures 0.
+    """
+
+    _dim = 1
+
+    def __init__(
+        self,
+        input_unit: UnitLike | None = None,
+        output_unit: UnitLike | None = None,
+    ):
+        self._auto_unit = input_unit is None
+        PropertyExtractor.__init__(
+            self,
+            "boundary_closeness",
+            input_unit=input_unit if input_unit is not None else DEFAULT_UNIT_LENGTH,
+            output_unit=output_unit if output_unit is not None else DEFAULT_UNIT_LENGTH,
+        )
+
+    def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
+        self._calibrate(images)
+        size_w, size_h = images.size_w, images.size_h
+
+        data = []
+        for cont in overlay:
+            polygon = cont.polygon
+            if polygon is None or polygon.is_empty:
+                # degenerate contour -> distance 0 (treated as at-border)
+                raw = 0.0
+            else:
+                minx, miny, maxx, maxy = polygon.bounds
+                # the bounding box is the closest part of the contour to a border
+                raw = float(min(minx, miny, size_w - maxx, size_h - maxy))
+            data.append({"id": cont.id, self.name: self.convert(raw)})
+
+        df = _id_indexed(data, [self.name])
+
+        return df, {self.name: self.output_unit}
+
+
 class LengthEx(PropertyExtractor):
     """Extracts width of cells based on the shorter edge of a minimum rotated bbox approximation"""
 

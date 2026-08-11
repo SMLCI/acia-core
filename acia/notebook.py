@@ -2510,6 +2510,7 @@ if _HAS_ANYWIDGET:
             images,
             filters,
             *,
+            properties=None,
             frame: int = 0,
             channel: int | None = None,
             **kwargs,
@@ -2522,6 +2523,12 @@ if _HAS_ANYWIDGET:
                     (must expose a non-``None`` ``pixel_size``).
                 filters: A list of :class:`~acia.segm.filter.CellFilter` instances
                     -- one slider control is built per filter.
+                properties: The extractor table for ``overlay`` (see
+                    :meth:`~acia.analysis.ExtractorExecutor.execute`). Each
+                    filter's slider is seeded from its own column instead of
+                    re-measuring every contour, which is what building the widget
+                    otherwise spends its time on. Without it the widget falls back
+                    to the row-wise measurement, once per filter.
                 frame: Frame to preview (image + its contours). Defaults to ``0``.
                 channel: Display channel for a multi-channel frame. Defaults to 0.
                 **kwargs: Forwarded to ``anywidget.AnyWidget``.
@@ -2539,6 +2546,7 @@ if _HAS_ANYWIDGET:
             self._overlay = overlay
             self._images = images
             self._filters = list(filters)
+            self._properties = properties
             self._frame = frame
 
             img_b64, frame_w, frame_h = _encode_frame_png(images, frame, channel)
@@ -2590,12 +2598,19 @@ if _HAS_ANYWIDGET:
         def _measure(self, f, conts):
             """Return ``(unit_str, [magnitude per contour])`` for filter ``f``.
 
-            Reuses the goal-E ``CellFilter.value()`` (calibrated from the source
-            ``pixel_size``); all contours of a filter share one unit. For an empty
-            overlay the unit is inferred from the filter's existing bound, else
-            falls back to dimensionless.
+            Reads filter ``f``'s own column from the ``properties`` table when one
+            was passed -- the same values, already computed. Without a table it
+            falls back to ``CellFilter.value()`` per contour, which is the same
+            measurement done once per filter per contour.
+
+            All contours of a filter share one unit. For an empty overlay the
+            unit is inferred from the filter's existing bound, else falls back to
+            dimensionless.
             """
             import math
+
+            if self._properties is not None:
+                return self._measure_from_table(f, conts)
 
             unit = None
             mags = []
@@ -2611,6 +2626,28 @@ if _HAS_ANYWIDGET:
             if unit is None:
                 unit = self._unit_of(f.vmin) or self._unit_of(f.vmax) or ""
             return unit, mags
+
+        def _measure_from_table(self, f, conts):
+            """``_measure`` backed by the extractor table."""
+            import math
+
+            from acia.segm.filter import _column_magnitudes
+
+            values, unit = _column_magnitudes(self._properties, f.name)
+            position = {
+                contour_id: i for i, contour_id in enumerate(self._properties.index)
+            }
+            mags = []
+            for c in conts:
+                m = float(values[position[c.id]])
+                # same non-finite coercion as the row-wise path: a NaN would
+                # serialize as invalid JSON and break the browser trait sync
+                mags.append(m if math.isfinite(m) else 0.0)
+
+            unit_str = f"{unit}" if unit is not None else ""
+            if not mags and not unit_str:
+                unit_str = self._unit_of(f.vmin) or self._unit_of(f.vmax) or ""
+            return unit_str, mags
 
         @staticmethod
         def _unit_of(bound) -> str | None:
@@ -2705,6 +2742,12 @@ if _HAS_ANYWIDGET:
             """Return the whole overlay filtered by the current thresholds."""
             from acia.segm.filter import apply_cell_filters
 
+            if self._properties is not None:
+                return apply_cell_filters(
+                    self._overlay,
+                    self.configured_filters(),
+                    properties=self._properties,
+                )
             return apply_cell_filters(
                 self._overlay, self.configured_filters(), images=self._images
             )

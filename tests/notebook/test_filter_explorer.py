@@ -242,3 +242,66 @@ def test_save_writes_filter_params_json(tmp_path):
     assert area["unit"] == "micrometer ** 2"
     assert area["vmin"] is None  # open
     assert area["vmax"] == pytest.approx(20.0)
+
+
+# --- properties-backed construction ------------------------------------------
+
+
+def _properties(overlay, images, filters):
+    """Extractor table covering every filter in ``filters``."""
+    from acia.analysis import (
+        AreaEx,
+        BoundaryClosenessEx,
+        CircularityEx,
+        ExtractorExecutor,
+        LengthEx,
+        PerimeterEx,
+        WidthEx,
+    )
+
+    by_name = {
+        "area": AreaEx,
+        "perimeter": PerimeterEx,
+        "length": LengthEx,
+        "width": WidthEx,
+        "circularity": CircularityEx,
+        "boundary_closeness": BoundaryClosenessEx,
+    }
+    # circularity is derived from the area/perimeter columns, so those two must
+    # run before it regardless of the order the filters were given in
+    needed = {f.name for f in filters}
+    if "circularity" in needed:
+        needed |= {"area", "perimeter"}
+    ordered = [by_name[n]() for n in by_name if n in needed]
+    return ExtractorExecutor().execute(overlay, images, ordered)
+
+
+def test_properties_backed_specs_match_the_row_wise_ones():
+    """Seeding sliders from the table must not move a single handle."""
+    filters = [AreaFilter(), LengthFilter(), CircularityFilter()]
+    overlay, images = _overlay(), _source()
+
+    row_wise = FilterExplorer(overlay, images, filters)
+    from_table = FilterExplorer(
+        overlay,
+        images,
+        filters,
+        properties=_properties(overlay, images, filters),
+    )
+
+    assert from_table.filter_specs == row_wise.filter_specs
+    assert from_table.contours == row_wise.contours
+    assert from_table.selection == row_wise.selection
+
+
+def test_properties_backed_filtered_overlay_matches():
+    filters = [AreaFilter(Q_(2, "um**2"), Q_(20, "um**2"))]
+    overlay, images = _overlay(), _source()
+    table = _properties(overlay, images, filters)
+
+    fe = FilterExplorer(overlay, images, filters, properties=table)
+    got = fe.filtered_overlay()
+
+    expected = apply_cell_filters(overlay, fe.configured_filters(), properties=table)
+    assert {c.id for c in got.contours} == {c.id for c in expected.contours}
+    assert {c.id for c in got.contours} == {"small", "mid"}

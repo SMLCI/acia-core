@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -14,11 +15,13 @@ from rtree import index
 from shapely.geometry import Polygon
 from shapely.validation import make_valid
 
-from acia import Q_
+from acia import Q_, ureg
 from acia.base import Contour, ImageSequenceSource, Overlay
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    import pandas as pd
 
 
 def bbox_to_rectangle(bbox: tuple[float, float, float, float]):
@@ -187,6 +190,70 @@ class EllipsoidFilter:
         return result_overlay
 
 
+def _unit_is_dimensionless(unit) -> bool:
+    """Whether ``unit`` (a unit string / pint unit / ``None``) has no dimension."""
+    if unit is None:
+        return True
+    try:
+        return bool(ureg.Quantity(str(unit)).dimensionless)
+    except Exception:
+        return False
+
+
+def _column_magnitudes(
+    properties: pd.DataFrame, name: str
+) -> tuple[np.ndarray, object | None]:
+    """Return ``(magnitudes, unit)`` for the ``name`` column of ``properties``.
+
+    Handles both representations an extractor table can be in: plain floats with
+    the unit map in ``df.attrs["units"]``, and ``pint``-dtype columns (the
+    ``units="pint"`` form), whose unit lives on the dtype instead.
+    """
+    from acia.analysis.units import UNIT_ATTR
+
+    if name not in properties.columns:
+        raise KeyError(
+            f"Filter {name!r} needs a {name!r} column in the properties table, "
+            f"but it has {sorted(map(str, properties.columns))}. Add the matching "
+            f"property extractor (e.g. the one whose `name` is {name!r}) to the "
+            "ExtractorExecutor call that produced this table."
+        )
+
+    series = properties[name]
+
+    # pint-dtype column: the unit is on the dtype, not in attrs
+    try:
+        import pint_pandas
+
+        if isinstance(series.dtype, pint_pandas.PintType):
+            return (
+                np.asarray(series.pint.magnitude, dtype=float),
+                series.pint.units,
+            )
+    except ImportError:  # pragma: no cover - pint_pandas is a hard dependency
+        pass
+
+    unit = properties.attrs.get(UNIT_ATTR, {}).get(name)
+    return np.asarray(series.to_numpy(), dtype=float), unit
+
+
+def _bound_magnitude(bound, unit) -> float:
+    """Express ``bound`` as a plain number in ``unit``.
+
+    Converting the two bounds once per run replaces the per-contour pint
+    comparison the row-wise path used to do. The dimensionality check that the
+    comparison provided is preserved -- it simply happens here, once, and so
+    fails before any measurement rather than on the first contour.
+    """
+    if isinstance(bound, ureg.Quantity):
+        if _unit_is_dimensionless(unit):
+            # a dimensionless column only accepts a dimensionless bound; .to()
+            # raises pint.DimensionalityError otherwise, as the old path did
+            return float(bound.to("dimensionless").magnitude)
+        return float(bound.to(unit).magnitude)
+    return float(bound)
+
+
 def _rotated_rect_coords(polygon) -> np.ndarray | None:
     """Min-rotated-rectangle vertices of ``polygon``; ``None`` if degenerate.
 
@@ -288,6 +355,39 @@ class CellFilter:
         return (self.vmin is None or v >= self.vmin) and (
             self.vmax is None or v <= self.vmax
         )
+
+    def mask(self, properties: pd.DataFrame) -> np.ndarray:
+        """Boolean keep-mask over ``properties``, aligned with its row order.
+
+        This is the path :func:`apply_cell_filters` uses. The values come from
+        the column named after this filter -- the one its matching
+        :class:`~acia.analysis.PropertyExtractor` already produced -- instead of
+        being measured again from the contours, which is both the expensive part
+        and a second, independent implementation of the same measurement.
+
+        Args:
+            properties: an extractor table (see
+                :meth:`~acia.analysis.ExtractorExecutor.execute`) that contains a
+                column named :attr:`name`.
+
+        Returns:
+            A boolean ``np.ndarray`` of ``len(properties)``, ``True`` where the
+            row is within the ``(vmin, vmax)`` range.
+
+        Raises:
+            KeyError: if ``properties`` has no column for this filter.
+            pint.DimensionalityError: if a bound's dimension does not match the
+                column's -- the same guard :meth:`accepts` provides, applied once
+                per run instead of once per contour.
+        """
+        values, unit = _column_magnitudes(properties, self.name)
+
+        keep = np.ones(len(values), dtype=bool)
+        if self.vmin is not None:
+            keep &= values >= _bound_magnitude(self.vmin, unit)
+        if self.vmax is not None:
+            keep &= values <= _bound_magnitude(self.vmax, unit)
+        return keep
 
 
 class _ExtractorCalibratedFilter(CellFilter):
@@ -444,38 +544,75 @@ def apply_cell_filters(
     overlay: Overlay,
     filters: Sequence[CellFilter],
     *,
-    images: ImageSequenceSource | None,
+    properties: pd.DataFrame | None = None,
+    images: ImageSequenceSource | None = None,
 ) -> Overlay:
     """Keep contours accepted by ALL filters, preserving the overlay time model.
 
-    Physical-unit filtering requires calibration: ``images`` must be provided
-    and carry a non-``None`` ``pixel_size``. A raw-pixel fallback is out of
-    scope (it would reintroduce the unit ambiguity this abstraction removes).
+    Pass ``properties`` -- the table an
+    :class:`~acia.analysis.ExtractorExecutor` already produced for this overlay.
+    Each filter reads its own column from it, so the contours are measured once
+    (during extraction) rather than a second time here. Calibration comes from
+    the table's units, which is why no image source is needed.
 
     Args:
         overlay: the overlay to filter.
         filters: the cell filters to apply; a contour is kept iff every filter
             accepts it (logical AND). An empty filter list keeps everything.
-        images: the calibrated image source (must expose ``pixel_size``).
+        properties: the extractor table describing ``overlay``, indexed by
+            contour id. Every filter needs a column named after it.
+        images: **deprecated** -- the calibrated image source, selecting the old
+            row-wise path that re-measures every contour. Only used when
+            ``properties`` is not given.
 
     Returns:
         A new :class:`~acia.base.Overlay` with the kept contours and the same
         time model (timepoints / frame_interval). The result may be empty.
 
     Raises:
-        ValueError: if ``images`` is ``None`` or its ``pixel_size`` is ``None``.
+        ValueError: if neither ``properties`` nor a calibrated ``images`` is
+            given, or if ``properties`` does not describe every contour.
+        KeyError: if a filter has no matching column in ``properties``.
     """
-    if images is None or getattr(images, "pixel_size", None) is None:
-        raise ValueError(
-            "apply_cell_filters requires a calibrated source (pixel_size); "
-            "physical-unit filtering cannot run on uncalibrated data."
+    if properties is None:
+        if images is None or getattr(images, "pixel_size", None) is None:
+            raise ValueError(
+                "apply_cell_filters needs `properties` (the extractor table for "
+                "this overlay). A calibrated `images` source still works but is "
+                "deprecated: it re-measures every contour, which is what the "
+                "table already did."
+            )
+        warnings.warn(
+            "apply_cell_filters(images=...) re-measures every contour and is "
+            "deprecated; pass properties=<ExtractorExecutor table> instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
+        kept: list = [
+            cont
+            for cont in overlay.contours
+            if all(f.accepts(cast(Contour, cont), images=images) for f in filters)
+        ]
+    else:
+        keep = np.ones(len(properties), dtype=bool)
+        for cell_filter in filters:
+            keep &= cell_filter.mask(properties)
 
-    kept = [
-        cont
-        for cont in overlay.contours
-        if all(f.accepts(cast(Contour, cont), images=images) for f in filters)
-    ]
+        kept_ids = set(properties.index[keep])
+
+        # A contour the table does not describe cannot be judged. Dropping it
+        # silently would quietly shrink the overlay, so say so instead.
+        missing = [c.id for c in overlay.contours if c.id not in properties.index]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} contour(s) are missing from the properties "
+                f"table (first: {missing[:3]}). It must describe the overlay "
+                "being filtered -- extract before filtering, on the unfiltered "
+                "overlay."
+            )
+
+        # iterate the overlay, not the table, so contour order is preserved
+        kept = [cont for cont in overlay.contours if cont.id in kept_ids]
 
     # preserve the overlay's time model (private attrs, since Overlay exposes
     # only the resolved `timepoints` property, not `frame_interval`)
