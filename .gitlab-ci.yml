@@ -91,8 +91,9 @@ test:
       paths:
         - test_resources/
   script:
-    # test dependencies
-    - pip install pytest pytest-sugar pytest-cov python-dotenv unittest-xml-reporting
+    # test dependencies. ipykernel provides the "python3" kernelspec that
+    # tests/analysis/test_scale.py needs to run notebooks through papermill.
+    - pip install pytest pytest-sugar pytest-cov python-dotenv unittest-xml-reporting ipykernel
     - pip install git+https://github.com/JojoDevel/trackastra.git
     - pip install laptrack
     # install the pre-built wheel from build job

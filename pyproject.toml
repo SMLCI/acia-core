@@ -64,6 +64,9 @@ dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
     "pytest-sugar>=1.0.0",
+    # provides the "python3" kernelspec that the papermill-based scale() tests
+    # need; without it tests/analysis/test_scale.py fails with NoSuchKernel
+    "ipykernel>=6.0",
     "coverage>=7.0.0",
     "tox>=4.0.0",
     "build",

@@ -58,7 +58,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: pip install -e .
-      - run: pip install pytest pytest-cov pytest-sugar
+      # ipykernel provides the "python3" kernelspec. tests/analysis/test_scale.py
+      # runs notebooks through papermill with kernel_name="python3" and fails
+      # with jupyter_client.kernelspec.NoSuchKernel without it. It is not a core
+      # dependency, so a bare CI environment does not get it -- unlike a
+      # developer machine, where Jupyter is invariably already installed.
+      - run: pip install pytest pytest-cov pytest-sugar ipykernel
       - run: pytest --cov=acia --cov-report=xml
       # Optional: enable once a Codecov token/badge is set up
       # - uses: codecov/codecov-action@v4
