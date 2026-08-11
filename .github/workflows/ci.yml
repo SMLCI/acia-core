@@ -24,8 +24,11 @@ jobs:
           cache: pip
       # pinned for deterministic lint/format (must match pre-commit + dev extra)
       - run: pip install ruff==0.15.15
-      - run: ruff check acia tests
-      - run: ruff format --check acia tests
+      # docs/ is included because ruff lints .ipynb by default -- the tutorial
+      # notebooks under docs/tutorials/ are real source and regress like any
+      # other code. Matches .gitlab-ci.yml and .pre-commit-config.yaml.
+      - run: ruff check acia tests docs
+      - run: ruff format --check acia tests docs
 
   # mypy is clean; pinned for deterministic results (must match pre-commit)
   typecheck:

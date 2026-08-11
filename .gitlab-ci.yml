@@ -22,7 +22,12 @@ stages:
 lint:
   stage: lint
   script:
-    - pip install ruff
+    # PINNED, and it must stay pinned: an unpinned ruff silently upgrades under
+    # you and changes what "formatted" means. ruff 0.16 began formatting Python
+    # code blocks inside Markdown, which reformats the illustrative snippets in
+    # docs/*.md and fails this job on a green working tree. Keep in lockstep with
+    # .github/workflows/ci.yml and .pre-commit-config.yaml.
+    - pip install ruff==0.15.15
     # docs/ is included because ruff lints .ipynb by default -- the tutorial
     # notebooks are real source and regress like any other code.
     - ruff check acia tests docs
@@ -35,7 +40,11 @@ lint:
 typecheck:
   stage: lint
   script:
-    - pip install mypy
+    # PINNED to match .github/workflows/ci.yml and .pre-commit-config.yaml.
+    # Unpinned, this job installs whatever mypy is current -- mypy 2.x reports 5
+    # errors in acia/notebook.py that 1.19.1 does not, so the job goes orange for
+    # reasons unrelated to the commit that triggered it.
+    - pip install mypy==1.19.1
     - mypy acia --ignore-missing-imports
   allow_failure: true  # Start permissive, remove once types are added
   rules:
