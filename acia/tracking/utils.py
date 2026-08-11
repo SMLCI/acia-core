@@ -1,5 +1,4 @@
-"""Utilities for tracking
-"""
+"""Utilities for tracking"""
 
 import logging
 from itertools import product
@@ -26,7 +25,7 @@ def life_cycle_lineage(tr_graph: nx.DiGraph) -> nx.DiGraph:
     # compute the life-cycles of individual cells
     life_cycles = CTCTrackingHelper.compute_life_cycles(tr_graph)
     # create lookup (cont id --> life cycle index)
-    life_cycle_lookup = CTCTrackingHelper.create_life_cycle_lookup(life_cycles)
+    life_cycle_lookup = CTCTrackingHelper.create_life_cycle_lookup(life_cycles)  # type: ignore[arg-type]
     # contour_lookup = {cont.id: cont for cont in overlay}
 
     lc_graph = nx.DiGraph()
@@ -128,7 +127,7 @@ def tracklet_to_tracking(ov: Overlay, tracklet_graph: nx.DiGraph) -> nx.DiGraph:
     """
     tracking_graph = nx.DiGraph()
 
-    label_lookup = {}
+    label_lookup: dict = {}
 
     for cont in ov:
         if cont.label in tracklet_graph.nodes:
@@ -137,12 +136,11 @@ def tracklet_to_tracking(ov: Overlay, tracklet_graph: nx.DiGraph) -> nx.DiGraph:
             label_lookup[cont.label] = label_lookup.get(cont.label, []) + [cont]
 
     for label in tracklet_graph.nodes:
-
         # get all the contours with this label
         contours = sorted(label_lookup[label], key=lambda c: c.frame)
 
         # add them sequentially
-        for a, b in zip(contours, contours[1:]):
+        for a, b in zip(contours, contours[1:], strict=False):
             tracking_graph.add_edge(a.id, b.id)
 
     for label in tracklet_graph.nodes:
@@ -187,17 +185,13 @@ def merge_incosistent_segmentation(
             graph.nodes[children[0]]["end_frame"]
             - graph.nodes[children[0]]["start_frame"]
         )
-        if dur > num_nodes:
-            return False
-
-        return True
+        return not dur > num_nodes
 
     # collect all the siblsings that should be joined
     to_join = []
     for n in tracklet_graph.nodes:
         # check the join condition
         if cond(n, tracklet_graph):
-
             children = sorted(
                 tracklet_graph.successors(n), key=tracklet_graph.out_degree
             )
@@ -272,12 +266,10 @@ def merge_incosistent_segmentation(
     relabel_actions = {n: n for n in tracklet_graph.nodes}
 
     for a, b in tracklets_to_join:
-
         relabel_actions[b] = relabel_actions[a]
 
     # actually join the tracklets
     for b, a in relabel_actions.items():
-
         # join the two
         b_children = tracklet_graph.successors(b)
 
@@ -313,15 +305,16 @@ def compute_trace(lineage: nx.DiGraph) -> dict:
         dict: Dictionary that contains the trace (str) for every node (type of lineage node)
     """
 
-    traces = {}
+    traces: dict = {}
 
     for n in nx.dfs_preorder_nodes(lineage):
         # traverse nodes in dfs
-        parent = list(lineage.predecessors(n))
-        if len(parent) == 0:
+        parent_list = list(lineage.predecessors(n))
+        parent = None
+        if len(parent_list) == 0:
             parent = None
-        elif len(parent) == 1:
-            parent = parent[0]
+        elif len(parent_list) == 1:
+            parent = parent_list[0]
         else:
             raise ValueError("More than one parent! I cannot handle that!")
 
@@ -329,8 +322,8 @@ def compute_trace(lineage: nx.DiGraph) -> dict:
         if parent is not None:
             parent_trace = traces.get(parent)
 
-            if len(parent_trace) > 0:
-                parent_trace += "."
+            if len(parent_trace) > 0:  # type: ignore[arg-type]
+                parent_trace += "."  # type: ignore[operator]
         else:
             parent_trace = ""
 

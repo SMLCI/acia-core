@@ -1,14 +1,14 @@
-"""Module for general visualization functionality
-"""
+"""Module for general visualization functionality"""
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import numbers
-from collections import deque
+from collections.abc import Callable, Iterable, Sequence
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Union
+from typing import Any
 
 import cv2
 import imageio.v2 as iio
@@ -28,9 +28,12 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 from acia import ureg
-from acia.base import BaseImage, ImageSequenceSource, Overlay
+from acia.base import BaseImage, ImageSequenceSource, Instance, Overlay
 from acia.segm.local import InMemorySequenceSource, LocalImage, THWCSequenceSource
 
+from .compose import ComposedSequenceSource as ComposedSequenceSource
+from .compose import compose_sequences as compose_sequences
+from .compose import label_sequence as label_sequence
 from .utils import strfdelta
 
 # loda the deja vu sans default font
@@ -87,7 +90,6 @@ def draw_scale_bar(
     xstart, ystart = xy_position
 
     for image in image_iterator:
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -187,7 +189,6 @@ def draw_time(
     font = ImageFont.truetype(font_path, font_size)
 
     for frame, image in enumerate(image_iterator):
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -309,7 +310,7 @@ class VideoExporter2:
 
         self.ffmpeg_params = ffmpeg_params
 
-        self.images = []
+        self.images: list = []
 
     @staticmethod
     def default_vp9(
@@ -350,7 +351,7 @@ class VideoExporter2:
 
     @staticmethod
     def default_mjpg(filename: Path, framerate: int):
-        ffmpeg_params = []
+        ffmpeg_params: list[str] = []
         return VideoExporter2(
             filename, framerate, codec="mjpeg", ffmpeg_params=ffmpeg_params
         )
@@ -414,7 +415,8 @@ def render_segmentation(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(imageSource, overlay.timeIterator()), desc="Render cell segmentation..."
+        zip(imageSource, overlay.timeIterator(), strict=False),
+        desc="Render cell segmentation...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -479,7 +481,8 @@ def render_cell_centers(
     images = []
 
     for image, frame_overlay in tqdm(
-        zip(image_source, overlay.timeIterator()), desc="Render cell centers..."
+        zip(image_source, overlay.timeIterator(), strict=False),
+        desc="Render cell centers...",
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -494,7 +497,6 @@ def render_cell_centers(
 
         # Draw overlay
         if frame_overlay:
-
             # compute all centers
             centers = [cont.center for cont in frame_overlay]
 
@@ -507,12 +509,8 @@ def render_cell_centers(
 
     image_stack = np.stack(images)
 
-    if isinstance(ImageSequenceSource, np.ndarray):
-        # return as raw numpy stack
-        return image_stack
-    else:
-        # return as sequence source again
-        return InMemorySequenceSource(image_stack)
+    # return as a sequence source
+    return InMemorySequenceSource(image_stack)
 
 
 def render_tracking(
@@ -533,62 +531,75 @@ def render_tracking(
 
     images = []
 
-    contour_lookup = {cont.id: cont for cont in overlay}
+    # Centers are constant, but deriving one is expensive (a shapely centroid
+    # for Contour, a full-frame mask pass for Instance) and the draw loop below
+    # needs each of them once per incident edge. Resolve them all up front.
+    center_lookup = {
+        cont.id: np.asarray(cont.center, dtype=np.float64).astype(np.int32)
+        for cont in overlay
+    }
+
+    # marker colors
+    line_color = (255, 0, 0)  # rgb: red
+    division_color = (0, 0, 255)  # bgr: blue
+    marker_color = (203, 192, 255)
 
     for image, frame_overlay in zip(
-        tqdm(image_source, desc="Render cell tracking paths..."), overlay.timeIterator()
+        tqdm(image_source, desc="Render cell tracking paths..."),
+        overlay.timeIterator(),
+        strict=False,
     ):
+        raw = image.raw
 
-        np_image = np.copy(image.raw)
-
-        if len(np_image.shape) == 2:
-            # convert to grayscale if needed
-            np_image = np.stack((np_image,) * 3, axis=-1)
-
-        if len(np_image.shape) != 3 or np_image.shape[2] != 3:
+        if raw.ndim != 2 and (raw.ndim != 3 or raw.shape[2] not in (1, 3)):
             logging.warning(
                 "Your images are in the wrong shape! The shape of an image is %s but we need (height, width, 3)! This is likely to cause an error!",
-                image.shape,
+                raw.shape,
             )
 
+        np_image = _to_uint8_rgb(raw)
+
+        # Draw order is kept cell-by-cell (rather than batched per color) so
+        # that overlapping tracks stack exactly as they did before.
         for cont in frame_overlay:
-            if cont.id in tracking_graph.nodes:
-                edges = tracking_graph.out_edges(cont.id)
+            if cont.id not in tracking_graph.nodes:
+                continue
 
-                born = tracking_graph.in_degree(cont.id) == 0
+            edges = tracking_graph.out_edges(cont.id)
 
-                for edge in edges:
-                    source = contour_lookup[edge[0]].center
-                    target = contour_lookup[edge[1]].center
+            if len(edges) == 0:
+                center = center_lookup[cont.id]
+                cv2.rectangle(
+                    np_image,
+                    tuple(map(int, center - 2)),
+                    tuple(map(int, center + 2)),
+                    marker_color,
+                )
+                continue
 
-                    line_color = (255, 0, 0)  # rgb: red
+            # more than one successor -> the cell divides in this frame
+            color = division_color if len(edges) > 1 else line_color
+            born = tracking_graph.in_degree(cont.id) == 0
 
-                    if len(edges) > 1:
-                        line_color = (0, 0, 255)  # bgr: blue
+            for edge in edges:
+                source = center_lookup[edge[0]]
+                target = center_lookup[edge[1]]
 
-                    cv2.line(
+                cv2.line(
+                    np_image,
+                    tuple(map(int, source)),
+                    tuple(map(int, target)),
+                    color,
+                    thickness=3,
+                )
+
+                if born:
+                    cv2.circle(
                         np_image,
                         tuple(map(int, source)),
-                        tuple(map(int, target)),
-                        line_color,
-                        thickness=3,
-                    )
-
-                    if born:
-                        cv2.circle(
-                            np_image,
-                            tuple(map(int, source)),
-                            3,
-                            (203, 192, 255),
-                            thickness=1,
-                        )
-
-                if len(edges) == 0:
-                    cv2.rectangle(
-                        np_image,
-                        np.array(cont.center).astype(np.int32) - 2,
-                        np.array(cont.center).astype(np.int32) + 2,
-                        (203, 192, 255),
+                        3,
+                        marker_color,
+                        thickness=1,
                     )
 
         images.append(np_image)
@@ -601,7 +612,9 @@ def render_video(
     filename: str,
     framerate: int = 10,
     codec: str = "libx264",
-    ffmpeg_params: list[str] = None,
+    pixelformat: str = "yuv420p",
+    macro_block_size: int = 2,
+    ffmpeg_params: list[str] | None = None,
 ) -> None:
     """Render video
 
@@ -610,13 +623,28 @@ def render_video(
         filename (str): video filename
         framerate (int): framerate of the video
         codec (str): the codec for video encoding
+        pixelformat (str): output pixel format. "yuv420p" is required by most
+            browsers/players (e.g. Firefox rejects other chroma subsampling).
+        macro_block_size (int): frame dimensions are padded up to a multiple of
+            this value. imageio's own default of 16 stretches typical
+            (already-even) frame sizes noticeably; 2 is the minimum yuv420p
+            allows and avoids that visible distortion.
+        ffmpeg_params (list[str] | None): extra output ffmpeg arguments, applied
+            in addition to "-movflags +faststart" (which moves the moov atom to
+            the front of the file so it plays back in browsers instead of
+            failing to load).
     """
 
     with iio.get_writer(
-        filename, fps=framerate, codec=codec, ffmpeg_params=ffmpeg_params
+        filename,
+        fps=framerate,
+        codec=codec,
+        pixelformat=pixelformat,
+        macro_block_size=macro_block_size,
+        output_params=["-movflags", "+faststart"],
+        ffmpeg_params=ffmpeg_params,
     ) as writer:
         for im in tqdm(image_source, desc="Encoding video..."):
-
             image = im.raw
 
             if len(image.shape) == 2:
@@ -629,11 +657,11 @@ def render_video(
                     image.shape,
                 )
 
-            writer.append_data(image)
+            writer.append_data(image)  # type: ignore[attr-defined]
 
 
 def render_scalebar(
-    image_source: Overlay,
+    image_source: ImageSequenceSource,
     xy_position: tuple[int | float, int | float],
     size_of_pixel: pint.Quantity,
     bar_width: pint.Quantity,
@@ -641,7 +669,7 @@ def render_scalebar(
     color=(255, 255, 255),
     font_size=25,
     font_path=default_font,
-    background_color: tuple[int, int, int] = None,
+    background_color: tuple[int, int, int] | None = None,
     background_margin_pixel=3,
     show_text=True,
 ) -> ImageSequenceSource:
@@ -703,7 +731,6 @@ def render_scalebar(
     images = []
 
     for image in tqdm(image_source, desc="Render scale bar..."):
-
         # do we have a wrapped image?
         is_wrapped = isinstance(image, BaseImage)
 
@@ -772,12 +799,8 @@ def render_scalebar(
     # combine all images
     image_stack = np.stack(images)
 
-    if isinstance(ImageSequenceSource, np.ndarray):
-        # return as raw numpy stack
-        return image_stack
-    else:
-        # return as sequence source again
-        return InMemorySequenceSource(image_stack)
+    # return as a sequence source
+    return InMemorySequenceSource(image_stack)
 
 
 def render_time(
@@ -788,7 +811,7 @@ def render_time(
     color=(255, 255, 255),
     font_size=25,
     font_path=default_font,
-    background_color: tuple[int, int, int] = None,
+    background_color: tuple[int, int, int] | None = None,
     background_margin_pixel=3,
 ) -> ImageSequenceSource:
     """Draw time onto images
@@ -833,8 +856,9 @@ def render_time(
             )
         ystart = int(np.round(image_height * ystart))
 
-    for image, timepoint in zip(tqdm(image_source, desc="Render time..."), timepoints):
-
+    for image, timepoint in zip(
+        tqdm(image_source, desc="Render time..."), timepoints, strict=False
+    ):
         if isinstance(timepoint, pint.Quantity):
             timepoint = timedelta(seconds=float(timepoint.to(ureg.seconds).magnitude))
 
@@ -888,12 +912,8 @@ def render_time(
     # combine all images
     image_stack = np.stack(images)
 
-    if isinstance(ImageSequenceSource, np.ndarray):
-        # return as raw numpy stack
-        return image_stack
-    else:
-        # return as sequence source again
-        return InMemorySequenceSource(image_stack)
+    # return as a sequence source
+    return InMemorySequenceSource(image_stack)
 
 
 def colorize_instance_mask(
@@ -930,10 +950,170 @@ def colorize_instance_mask(
     # Map colors to mask using LUT
     colored_mask = color_lut[instance_mask]
 
-    return colored_mask
+    return np.asarray(colored_mask)
 
 
-def get_mask(self, height, width, binary_mask=True) -> list[np.array]:
+def _to_uint8_rgb(image: np.ndarray) -> np.ndarray:
+    """Normalize an arbitrary frame into a HxWx3 uint8 RGB array.
+
+    Overlay colors live in the 0-255 range, so blending them onto a uint16 or
+    float frame requires bringing the frame into the same range first.
+
+    The result is always a fresh, contiguous buffer -- renderers draw onto it
+    with cv2, which mutates in place, so it must never alias the source data.
+
+    Args:
+        image (np.ndarray): frame in HxW, HxWx1 or HxWx3 layout (uint8/uint16/float).
+
+    Returns:
+        np.ndarray: HxWx3 uint8 copy of the frame.
+    """
+    im = image
+
+    # Convert image to uint8 if necessary
+    if im.dtype == np.uint16:
+        im = (im / 256).astype(np.uint8)
+    elif im.dtype in (np.float32, np.float64):
+        im = np.clip(im * 255, 0, 255).astype(np.uint8)
+    elif im.dtype != np.uint8:
+        im = im.astype(np.uint8)
+
+    # Convert grayscale images to RGB by duplicating channels
+    if im.ndim == 2:
+        im = np.stack([im] * 3, axis=-1)
+    elif im.ndim == 3 and im.shape[2] == 1:
+        im = np.stack([im[:, :, 0]] * 3, axis=-1)
+
+    # copy=True is load-bearing: np.ascontiguousarray alone would return the
+    # caller's array untouched for an already-contiguous uint8 RGB frame, and
+    # the subsequent in-place cv2 drawing would then corrupt the source data.
+    return np.array(im, dtype=np.uint8, order="C", copy=True)
+
+
+def _contour_labels(contours: Sequence[Any], enumerate_fallback: bool) -> list[int]:
+    """Resolve the integer label to rasterize for each contour.
+
+    Args:
+        contours (Sequence): contours/instances of a single frame.
+        enumerate_fallback (bool): if True, contours whose ``label`` is None or
+            not convertible to int fall back to their 1-based position. If
+            False, such contours are skipped (label 0).
+
+    Returns:
+        list[int]: one label per contour.
+    """
+    labels = []
+    for i, cont in enumerate(contours):
+        label = i + 1 if enumerate_fallback else 0
+        if cont.label is not None:
+            # could not convert label to integer -> keep the fallback label
+            with contextlib.suppress(ValueError, TypeError):
+                label = int(cont.label)
+        labels.append(label)
+    return labels
+
+
+def _frame_label_mask(
+    contours: Sequence[Any],
+    height: int,
+    width: int,
+    enumerate_fallback: bool = False,
+) -> np.ndarray:
+    """Rasterize one frame's contours into a single instance label mask.
+
+    This is the hot path of every mask-based renderer. The naive formulation
+    (one full-image ``mask == label`` plus ``np.maximum`` per cell) costs
+    O(n_cells * height * width); every branch below is O(height * width).
+
+    On overlapping pixels the higher label wins, matching the ``np.maximum``
+    semantics of the original implementation.
+
+    Args:
+        contours (Sequence): contours/instances of a single frame.
+        height (int): frame height.
+        width (int): frame width.
+        enumerate_fallback (bool): see :func:`_contour_labels`.
+
+    Returns:
+        np.ndarray: HxW uint32 label mask (0 = background).
+    """
+    contours = list(contours)
+    if not contours:
+        return np.zeros((height, width), dtype=np.uint32)
+
+    labels = _contour_labels(contours, enumerate_fallback)
+
+    first = contours[0]
+    if isinstance(first, Instance) and all(
+        isinstance(c, Instance) and c.mask is first.mask for c in contours
+    ):
+        # Fast path: acia.segm.formats.overlay_from_masks hands every instance
+        # of a frame a reference to the same full-frame label mask, so the mask
+        # we want already exists -- one LUT remap keeps the requested labels and
+        # drops everything else, instead of one pass per cell.
+        src = first.mask
+        src_labels = np.asarray([c.label for c in contours])
+        lut_size = int(max(int(src.max()), int(src_labels.max()), max(labels))) + 1
+        lut = np.zeros(lut_size, dtype=np.uint32)
+        lut[src_labels] = np.asarray(labels, dtype=np.uint32)
+        return np.asarray(lut[src])
+
+    # Slow path: write each contour into the shared buffer. Ascending label
+    # order reproduces "higher label wins" without a per-cell np.maximum.
+    # int32 rather than uint32 because cv2.fillPoly has no uint32 overload.
+    local_mask = np.zeros((height, width), dtype=np.int32)
+
+    for i in np.argsort(np.asarray(labels, dtype=np.int64), kind="stable"):
+        cont = contours[i]
+
+        if isinstance(cont, Instance):
+            np.putmask(local_mask, cont.binary_mask, np.int32(labels[i]))
+            continue
+
+        # Instance must be handled above: its `coordinates` property derives a
+        # shapely polygon from the mask and raises when the mask is empty.
+        coordinates = getattr(cont, "coordinates", None)
+
+        if coordinates is None:
+            # anything exposing only the toMask() protocol
+            np.putmask(
+                local_mask, cont.toMask(height=height, width=width), np.int32(labels[i])
+            )
+        else:
+            # cv2.fillPoly only touches the polygon bounding box, whereas
+            # Contour.toMask rasterizes over the whole frame per contour.
+            points = np.asarray(coordinates, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.fillPoly(local_mask, [points], int(labels[i]))
+
+    return local_mask.astype(np.uint32)
+
+
+def _blend_overlay(
+    image: np.ndarray, colored_mask: np.ndarray, label_mask: np.ndarray, alpha: float
+) -> np.ndarray:
+    """Alpha-blend a colorized instance mask onto a frame, foreground only.
+
+    Args:
+        image (np.ndarray): HxWx3 uint8 frame (see :func:`_to_uint8_rgb`).
+        colored_mask (np.ndarray): HxWx3 uint8 colorized instance mask.
+        label_mask (np.ndarray): HxW label mask deciding what counts as foreground.
+        alpha (float): weight of the original image (1.0 = original only).
+
+    Returns:
+        np.ndarray: HxWx3 uint8 blended frame.
+    """
+    # uint8 saturating arithmetic -- avoids six full-frame float32 temporaries
+    blended = cv2.addWeighted(image, alpha, colored_mask, 1 - alpha, 0)
+
+    # keep the original image where no overlay is available. Testing the label
+    # mask rather than the colors means a cell that happens to be colored
+    # (0, 0, 0) still counts as foreground.
+    result = image.copy()
+    np.copyto(result, blended, where=(label_mask != 0)[..., None])
+    return result
+
+
+def get_mask(self, height, width, binary_mask=True) -> np.ndarray:
     """
     Turn the individual overlays into masks. For every time point we create a mask of all contours.
 
@@ -942,72 +1122,192 @@ def get_mask(self, height, width, binary_mask=True) -> list[np.array]:
     height: height of the image
     width: width of the image
     """
+    label_mask = _frame_label_mask(list(self), height, width, enumerate_fallback=True)
+
     if binary_mask:
-        local_mask = np.zeros((height, width), dtype=bool)
-    else:
-        # non-binary
-        local_mask = np.zeros((height, width), dtype=np.uint16)
+        return np.asarray(label_mask != 0)
 
-    # combine all contours in one mask
-    for i, cont in enumerate(self):
-        mask = cont.toMask(height=height, width=width)
-        if not binary_mask:
-            label = i + 1
-            if cont.label is not None:
-                try:
-                    label = int(cont.label)
-                except ValueError:
-                    # could not convert label to integer
-                    pass
+    return label_mask
 
-            mask = mask.astype(np.uint16) * (label)  # convert into a non-binary mask
 
-        # combine into a single mask
-        local_mask = np.maximum(mask, local_mask)
+def render_overlay_frame(
+    image: np.ndarray, overlay: Overlay, frame_idx: int, alpha: float = 0.8
+) -> np.ndarray:
+    """Render segmentation overlay on a single frame image with alpha blending.
 
-    return local_mask
+    This helper function applies a segmentation overlay to a single frame image,
+    blending the colorized instance mask with the original image using alpha transparency.
+    Used by Jupyter widget callbacks for interactive overlay rendering.
+
+    Args:
+        image (np.ndarray): Single frame image in HxW or HxWxC format (uint8 or uint16).
+        overlay (Overlay): Overlay object containing contours for the current frame
+            (typically from overlay.time_iterator()).
+        frame_idx (int): Frame index for reference (not directly used, for compatibility).
+        alpha (float, optional): Alpha blending weight for the original image.
+            Default 0.8 means 80% original image, 20% overlay. Valid range: 0.0-1.0.
+
+    Returns:
+        np.ndarray: Blended image with overlay applied, dtype uint8, shape HxWx3 (RGB).
+            Where the overlay has no data (background), returns the original image unchanged.
+    """
+    # Get image dimensions
+    height, width = image.shape[:2]
+
+    # Normalize to a HxWx3 uint8 copy (never touches the caller's array)
+    im = _to_uint8_rgb(image)
+
+    # Convert overlay to instance label mask (each instance has a unique ID)
+    label_mask = _frame_label_mask(
+        list(overlay), height, width, enumerate_fallback=True
+    )
+
+    # Colorize the instance mask (assigns random colors per instance)
+    colored_mask = colorize_instance_mask(label_mask)
+
+    # Alpha blend the colored mask onto the image, foreground pixels only.
+    # alpha controls the mix: higher alpha = more original image, lower = more overlay
+    return _blend_overlay(im, colored_mask, label_mask, alpha)
 
 
 def render_segmentation_mask(
-    source: ImageSequenceSource, overlay: Overlay, alpha=0.8
+    source: ImageSequenceSource,
+    overlay: Overlay,
+    alpha=0.8,
+    *,
+    colors=None,
+    palette: dict | None = None,
+    cmap: str = "viridis",
+    default_color: tuple[int, int, int] = (120, 120, 120),
 ) -> THWCSequenceSource:
-    """Render cell segmentation based on masks with random colors
+    """Render cell segmentation masks, colored randomly (default) or from a table.
 
     Args:
-        source (ImageSequenceSource): the time-lapse sequence source
-        overlay (Overlay): the corresponding overlay. WARNING: all instances need to be based on masks!
-        alpha (float, optional): The opacity of the masked image. Defaults to 0.8.
+        source (ImageSequenceSource): the time-lapse sequence source.
+        overlay (Overlay): the corresponding overlay. WARNING: all instances need
+            to be based on masks!
+        alpha (float, optional): weight of the *original* image in the blend --
+            ``1.0`` keeps the frame unchanged, ``0.0`` shows solid mask color.
+            Defaults to 0.8.
+        colors: optional per-cell coloring, matched to contours by **id** -- a
+            ``pandas.Series`` indexed by contour id (i.e. one column of a property
+            table), a ``dict`` ``{id: value}``, or a single-column ``DataFrame``.
+            Each value becomes a color: an ``(r, g, b)`` triple is used directly, a
+            number is mapped through ``cmap`` (continuous), anything else is
+            categorical (one distinct color per category, from ``palette`` or a
+            qualitative colormap). ``None`` (default) keeps the original random
+            per-instance colors.
+        palette: optional ``{category: (r, g, b)}`` mapping for categorical
+            ``colors`` (its keys double as the color legend).
+        cmap: matplotlib colormap name used for numeric ``colors``.
+        default_color: color for cells absent from ``colors`` (or with ``NaN``).
 
     Returns:
         THWCSequenceSource: TxHxWx3 sequence
     """
+    id_to_rgb = None
+    if colors is not None:
+        id_to_rgb, _ = _resolve_cell_colors(
+            _as_id_value_dict(colors), palette, cmap, default_color
+        )
+
     return_images = []
 
     for im, ov in zip(
-        tqdm(source, desc="Render segmentation masks..."), overlay.time_iterator()
+        tqdm(source, desc="Render segmentation masks..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
-        im = np.copy(im.raw)
+        raw = im.raw
+        height, width = raw.shape[:2]
+        image = _to_uint8_rgb(raw)
 
-        height, width = im.shape[:2]
+        conts = list(ov)
+        label_mask = _frame_label_mask(conts, height, width, enumerate_fallback=True)
 
-        label_mask = get_mask(ov, height, width, False)
+        if id_to_rgb is None:
+            # random per-instance colors (original behaviour)
+            colored_mask = colorize_instance_mask(label_mask)
+        else:
+            # drive the color LUT from the table: each contour's rasterized label
+            # -> the color looked up for that contour's id
+            labels = _contour_labels(conts, enumerate_fallback=True)
+            lut = np.zeros((int(label_mask.max()) + 1, 3), dtype=np.uint8)
+            for cont, lbl in zip(conts, labels, strict=False):
+                lut[lbl] = id_to_rgb.get(cont.id, default_color)
+            colored_mask = colorize_instance_mask(label_mask, color_lut=lut)
 
-        # render the masks based on the first contour mask in the frame
-        colored_mask = colorize_instance_mask(label_mask)
-
-        # Alpha blend with original image
-        overlay = cv2.addWeighted(
-            im.astype(np.float32), alpha, colored_mask.astype(np.float32), 1 - alpha, 0
-        ).astype(np.uint8)
-
-        # use the original image where no overlay is availabel
-        binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-        overlay = np.where(binary_mask, overlay, im)
-
-        return_images.append(overlay)
+        return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
+
+
+def _as_id_value_dict(values) -> dict:
+    """Normalize a Series / single-column DataFrame / dict into ``{id: value}``."""
+    if hasattr(values, "columns"):  # DataFrame
+        if values.shape[1] != 1:
+            raise ValueError(
+                "values DataFrame must have exactly one column (pass e.g. df['col'])"
+            )
+        values = values.iloc[:, 0]
+    if hasattr(values, "to_dict"):  # pandas Series
+        return dict(values.to_dict())
+    return dict(values)
+
+
+def _is_rgb(v) -> bool:
+    return (
+        isinstance(v, (tuple, list, np.ndarray))
+        and len(v) == 3
+        and all(isinstance(x, numbers.Number) and not isinstance(x, bool) for x in v)
+    )
+
+
+def _resolve_cell_colors(id_value, palette, cmap, default_color):
+    """Map ``{id: value}`` -> ``({id: (r,g,b)}, {category: (r,g,b)} legend)``.
+
+    ``(r,g,b)`` values pass through; numeric values map through ``cmap``
+    (continuous, no discrete legend); everything else is treated as categorical.
+    """
+    present = {
+        i: v
+        for i, v in id_value.items()
+        if v is not None and not (isinstance(v, float) and np.isnan(v))
+    }
+    vals = list(present.values())
+    id_to_rgb: dict = {}
+    legend: dict = {}
+
+    if vals and all(_is_rgb(v) for v in vals):
+        for i, v in present.items():
+            id_to_rgb[i] = tuple(int(x) for x in v)
+        return id_to_rgb, legend
+
+    if vals and all(
+        isinstance(v, numbers.Number) and not isinstance(v, bool) for v in vals
+    ):
+        arr = np.array([float(v) for v in vals], dtype=float)
+        lo = float(arr.min())
+        span = float(arr.max()) - lo or 1.0
+        cm = mpl.colormaps[cmap] if cmap in mpl.colormaps else mpl.colormaps["viridis"]
+        for i, v in present.items():
+            r, g, b, _ = cm((float(v) - lo) / span)
+            id_to_rgb[i] = (int(r * 255), int(g * 255), int(b * 255))
+        return id_to_rgb, legend
+
+    # categorical: one distinct color per category
+    categories = sorted({str(v) for v in vals})
+    resolved = {str(k): tuple(int(x) for x in c) for k, c in (palette or {}).items()}
+    qualitative = mpl.colormaps["tab10"]
+    for k, cat in enumerate(categories):
+        if cat not in resolved:
+            r, g, b, _ = qualitative(k % qualitative.N)
+            resolved[cat] = (int(r * 255), int(g * 255), int(b * 255))
+    for i, v in present.items():
+        id_to_rgb[i] = resolved.get(str(v), default_color)
+    legend = {cat: resolved[cat] for cat in categories}
+    return id_to_rgb, legend
 
 
 def render_tracking_mask(
@@ -1029,34 +1329,34 @@ def render_tracking_mask(
     """
     return_images = []
 
-    # generate color LUT (persistent for labels)
+    # generate color LUT (persistent for labels). Only the label range matters
+    # here, so take the max directly instead of sorting every label.
     rng = np.random.default_rng(seed)
-    unique_labels = np.unique([0] + [cont.label for cont in overlay])
-    color_lut = rng.integers(
-        0, 256, size=(np.max(unique_labels) + 1, 3), dtype=np.uint8
-    )
+    max_label = max((int(cont.label) for cont in overlay), default=0)
+    color_lut = rng.integers(0, 256, size=(max_label + 1, 3), dtype=np.uint8)
     color_lut[0] = (0, 0, 0)
 
     for im, ov in zip(
-        tqdm(source, desc="Render tracking mask..."), overlay.time_iterator()
+        tqdm(source, desc="Render tracking mask..."),
+        overlay.time_iterator(),
+        strict=False,
     ):
-        im = np.copy(im.raw)
+        raw = im.raw
+        h, w = raw.shape[:2]
+        image = _to_uint8_rgb(raw)
 
-        h, w = im.shape[:2]
+        contours = list(ov)
 
-        label_mask = np.zeros((h, w), dtype=np.uint32)
+        # single-pass rasterization of the whole frame (see _frame_label_mask)
+        label_mask = _frame_label_mask(contours, h, w)
 
-        for cont in ov:
-            # print(f"Label: {cont.label}")
-            cell_mask = (cont.binary_mask * cont.label).astype(np.uint16)
-            label_mask = np.maximum(label_mask, cell_mask)
-
-            # render label numbers if necessary
-            if show_label_numbers:
+        # render label numbers if necessary
+        if show_label_numbers:
+            for cont in contours:
                 cv2.putText(
-                    im,
+                    image,
                     f"{cont.label}",
-                    np.array(cont.center).astype(int),
+                    tuple(map(int, np.array(cont.center).astype(int))),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (255, 0, 0),
@@ -1067,16 +1367,7 @@ def render_tracking_mask(
         # render the masks based on the labels
         colored_mask = colorize_instance_mask(label_mask, color_lut=color_lut)
 
-        # Alpha blend with original image
-        overlay = cv2.addWeighted(
-            im.astype(np.float32), alpha, colored_mask.astype(np.float32), 1 - alpha, 0
-        ).astype(np.uint8)
-
-        # use the original image where no overlay is availabel
-        binary_mask = np.stack((np.max(colored_mask, axis=-1),) * 3, axis=-1)
-        overlay = np.where(binary_mask, overlay, im)
-
-        return_images.append(overlay)
+        return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
@@ -1175,7 +1466,10 @@ def extract_lineage_plotdata(
         features = G.nodes[n]
         if features:
             maxk = max((len(str(k)) for k in features), default=1)
-            fmt = lambda k, v, maxk: f"{str(k).ljust(maxk)} : {v}<br>"
+
+            def fmt(k, v, maxk):
+                return f"{str(k).ljust(maxk)} : {v}<br>"
+
             feat_lines = "".join(fmt(k, v, maxk) for k, v in features.items())
             hover_html = f"<b>Node:</b> {n}<br><span style='font-family:monospace'>{feat_lines}</span>"
         else:
@@ -1304,13 +1598,13 @@ def plot_cell_lineage(
         fig = None
 
     # edges
-    for x, y in zip(data["edge_xs"], data["edge_ys"]):
+    for x, y in zip(data["edge_xs"], data["edge_ys"], strict=False):
         ax.plot(x, y, "-", color=line_color, lw=line_lw)
 
     # coloring
     colors = None
     if node_color_by is not None:
-        vals = _value_getter(G, data["node_ids"], node_color_by)
+        vals = _value_getter(G, data["node_ids"], node_color_by) or []
         if _is_numeric_series(vals):
             vmin = min(v for v in vals if v is not None)
             vmax = max(v for v in vals if v is not None)
@@ -1378,7 +1672,9 @@ def plot_cell_lineage(
     )
 
     if show_label:
-        for x, y, label in zip(data["xs"], data["ys"], data["node_labels"]):
+        for x, y, label in zip(
+            data["xs"], data["ys"], data["node_labels"], strict=False
+        ):
             ax.text(x, y + 0.12, label, fontsize=7, ha="center", va="bottom")
 
     # births / ends
@@ -1474,10 +1770,17 @@ def plotly_cell_lineage(
     show_colorbar: bool = True,
     show_legend: bool = True,
     colorbar_title: str | None = None,  # NEW: numeric colorbar title
+    time_axis_label: str | None = None,  # override the time-axis title
 ):
     """
     Plot a cell lineage tree as an interactive Plotly chart.
     Node hover shows all features as a readable (monospace) "pseudo-table".
+
+    ``time_axis_label`` overrides the title on whichever axis encodes
+    ``time_feature`` (x when horizontal, y when vertical). When it is ``None``
+    (the default), the title is auto-derived: ``f"Time [{unit}]"`` when the
+    graph carries a ``graph["time_unit"]`` (as stamped by the tracker when the
+    source was time-calibrated), else plain ``"Time"``.
     """
     assigned_y = compute_lineage_y(G, time_feature)
     data = extract_lineage_plotdata(
@@ -1486,7 +1789,7 @@ def plotly_cell_lineage(
     fig = go.Figure()
 
     # edges
-    for x, y in zip(data["edge_xs"], data["edge_ys"]):
+    for x, y in zip(data["edge_xs"], data["edge_ys"], strict=False):
         fig.add_trace(
             go.Scatter(
                 x=x,
@@ -1542,7 +1845,7 @@ def plotly_cell_lineage(
         add_nodes_subset(list(range(len(data["xs"]))), name="Cells", color=line_color)
     else:
         if _is_numeric_series(vals):
-            color = [v if v is not None else None for v in vals]
+            color = list(vals)
             idx_valid = [i for i, v in enumerate(color) if v is not None]
             idx_na = [i for i, v in enumerate(color) if v is None]
             add_nodes_subset(
@@ -1639,14 +1942,122 @@ def plotly_cell_lineage(
             )
         )
 
-    # axes & layout
+    # axes & layout. Auto-label the time axis with the graph's own unit (set by
+    # the tracker when it stamped real time on the nodes, e.g. "min"), unless the
+    # caller gave an explicit override.
+    if time_axis_label is not None:
+        time_title = time_axis_label
+    elif G.graph.get("time_unit"):
+        time_title = f"Time [{G.graph['time_unit']}]"
+    else:
+        time_title = "Time"
     if orientation == "horizontal":
-        fig.update_xaxes(title="Time")
+        fig.update_xaxes(title=time_title)
         fig.update_yaxes(title="Lineage")
     else:
         fig.update_xaxes(title="Lineage")
-        fig.update_yaxes(title="Time", autorange="reversed")
+        fig.update_yaxes(title=time_title, autorange="reversed")
     fig.update_layout(
         title=figure_title, height=fig_height, width=fig_width, plot_bgcolor="white"
     )
     return fig
+
+
+# ========== TRACKLET (CELL-CYCLE) LINEAGE ==========
+def tracklet_graph_to_segments(tracklet_graph: nx.DiGraph) -> nx.DiGraph:
+    """Reshape a tracklet graph into a "one line per cell cycle" segment graph.
+
+    :func:`plotly_cell_lineage`/:func:`plot_cell_lineage` (and their shared
+    layout helpers :func:`compute_lineage_y`/:func:`extract_lineage_plotdata`)
+    only require a graph where every node carries a unique id and a scalar
+    ``time_feature`` attribute -- they know nothing about tracklets. This
+    function bridges that gap by turning each tracklet node ``n`` (with
+    ``start_frame``/``end_frame`` int attributes, as produced by e.g.
+    :func:`acia.tracking.formats.read_ctc_tracklet_graph`) into **two** point
+    nodes, so a tracklet becomes a single line segment from its start to its
+    end and a division becomes a branch from a parent segment's end-point to
+    each child segment's start-point.
+
+    Args:
+        tracklet_graph: one node per tracklet, keyed by an arbitrary hashable
+            label (e.g. the CTC integer label), with ``start_frame``/
+            ``end_frame`` int attributes; edges ``parent -> child`` encode a
+            division.
+
+    When the tracklet graph carries real time on its nodes -- ``start_time``/
+    ``end_time`` float attributes plus a ``graph["time_unit"]``, as stamped by
+    :func:`acia.tracking.annotate_tracklet_times` at tracking time -- those are
+    forwarded to the point nodes' ``"time"`` attribute (and the unit copied to
+    ``segments.graph["time_unit"]``), so the lineage lays out on a real-time
+    axis with no extra input. Otherwise only ``"frame"`` is carried.
+
+    Returns:
+        A new :class:`networkx.DiGraph` where each input node ``n`` becomes
+        ``(n, "start")`` and ``(n, "end")``, each carrying a ``"frame"`` int
+        attribute (``start_frame``/``end_frame`` respectively) and, when the
+        input carried real time, a ``"time"`` float attribute. One
+        intra-tracklet edge ``(n, "start") -> (n, "end")`` per tracklet, and
+        one inter-tracklet edge ``(n, "end") -> (child, "start")`` for every
+        division edge ``n -> child`` in the input. Suitable for
+        ``plotly_cell_lineage(segments, time_feature="frame")`` (or
+        ``time_feature="time"`` when the input carried real time).
+    """
+    segments = nx.DiGraph()
+
+    # Real time is present iff every tracklet node carries start_time/end_time.
+    has_time = tracklet_graph.number_of_nodes() > 0 and all(
+        "start_time" in a and "end_time" in a
+        for _, a in tracklet_graph.nodes(data=True)
+    )
+
+    for n, attrs in tracklet_graph.nodes(data=True):
+        start_attrs = {"frame": attrs["start_frame"]}
+        end_attrs = {"frame": attrs["end_frame"]}
+        if has_time:
+            start_attrs["time"] = attrs["start_time"]
+            end_attrs["time"] = attrs["end_time"]
+        segments.add_node((n, "start"), **start_attrs)
+        segments.add_node((n, "end"), **end_attrs)
+        segments.add_edge((n, "start"), (n, "end"))
+
+    for parent, child in tracklet_graph.edges:
+        segments.add_edge((parent, "end"), (child, "start"))
+
+    if has_time and "time_unit" in tracklet_graph.graph:
+        segments.graph["time_unit"] = tracklet_graph.graph["time_unit"]
+
+    return segments
+
+
+def plot_tracklet_lineage(tracklet_graph: nx.DiGraph, **kwargs):
+    """Render a tracklet graph as a lineage tree with one line per cell cycle.
+
+    One-line convenience wrapper hiding :func:`tracklet_graph_to_segments`
+    behind a single call to :func:`plotly_cell_lineage`. ``time_feature`` is
+    selected automatically -- ``"time"`` when the tracklet graph carries real
+    time (``start_time``/``end_time``, as stamped by
+    :func:`acia.tracking.annotate_tracklet_times`), else ``"frame"`` -- and is
+    not caller-overridable; a caller who also passes ``time_feature=`` gets
+    Python's own "got multiple values for keyword argument" ``TypeError``,
+    which is the correct, sufficient failure mode here. When real time is
+    present, the axis is auto-labelled from the graph's ``time_unit``.
+
+    Args:
+        tracklet_graph: see :func:`tracklet_graph_to_segments`.
+        **kwargs: forwarded to :func:`plotly_cell_lineage` unchanged (e.g.
+            ``orientation``, ``show_label``, ``node_color_by``,
+            ``mark_births``, ``time_axis_label``).
+
+    Returns:
+        The :class:`plotly.graph_objects.Figure` produced by
+        :func:`plotly_cell_lineage`.
+    """
+    segments = tracklet_graph_to_segments(tracklet_graph)
+    time_feature = (
+        "time" if any("time" in a for _, a in segments.nodes(data=True)) else "frame"
+    )
+    return plotly_cell_lineage(
+        segments,
+        time_feature=time_feature,
+        **kwargs,
+    )

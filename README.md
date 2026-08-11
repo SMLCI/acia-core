@@ -1,7 +1,10 @@
 # **Acia**: Automated single-cell image analysis
 
-![pipeline](https://jugit.fz-juelich.de/IBG-1/ModSim/imageanalysis/acia/badges/master/pipeline.svg)
-![coverage](https://jugit.fz-juelich.de/IBG-1/ModSim/imageanalysis/acia/badges/master/coverage.svg)
+[![CI](https://github.com/SMLCI/acia-core/actions/workflows/ci.yml/badge.svg)](https://github.com/SMLCI/acia-core/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/acia.svg)](https://pypi.org/project/acia/)
+[![Python versions](https://img.shields.io/pypi/pyversions/acia.svg)](https://pypi.org/project/acia/)
+[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://smlci.github.io/acia-core)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Accio** 🪄 - and your single-cell insights appear - Not quite but - `acia` - and your single-cell insights appear to become much easier 😉
 

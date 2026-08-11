@@ -1,4 +1,4 @@
-""" PyUAT based tracking """
+"""PyUAT based tracking"""
 
 import gzip
 import tempfile
@@ -59,11 +59,11 @@ class PyUATTracker(TrackingProcessor):
 
         if mip_method != "GRB":
             warnings.warn(
-                "You are not using Gurobi! Please install gurobi and specify 'GRB' as optimizer for a tremendous speedup!"
+                "You are not using Gurobi! Please install gurobi and specify 'GRB' as optimizer for a tremendous speedup!",
+                stacklevel=2,
             )
 
     def __call__(self, images: ImageSequenceSource, segmentation: Overlay):
-
         print("Extract single-cell information...")
         df, all_detections = extract_single_cell_information(segmentation)
 
@@ -96,7 +96,7 @@ class PyUATTracker(TrackingProcessor):
             # read the tracking result
             with gzip.open(output_file) as input_file:
                 tracking_overlay, tracking_graph = parse_simple_tracking(
-                    input_file.read()
+                    input_file.read().decode("utf-8")
                 )
 
         # Convert from contour based overlay to a mask based overlay

@@ -1,7 +1,5 @@
 """Utilities for working with OMERO shape objects"""
 
-from typing import List, Tuple
-
 import omero
 from omero.rtypes import rdouble, rint, rstring
 
@@ -58,12 +56,12 @@ def make_polystr(points):
     return rstring(" ".join(f"{str(x)},{str(y)}" for x, y in points))
 
 
-def make_coordinates(polystr: str) -> List[Tuple[float]]:
-    return [tuple(map(float, textCoord.split(","))) for textCoord in polystr.split(" ")]
+def make_coordinates(polystr: str) -> list[tuple[float]]:
+    return [tuple(map(float, textCoord.split(","))) for textCoord in polystr.split(" ")]  # type: ignore[misc]
 
 
 def create_polygon(
-    points: List,
+    points: list,
     z: int,
     t: int,
     fillColor=(255, 0, 255, 50),

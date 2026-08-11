@@ -13,7 +13,6 @@ class CPNSegmenter:
     """Contour Proposal Networks segmenter: https://github.com/FZJ-INM1-BDA/celldetection"""
 
     def __init__(self, nms_thresh=0.4):
-
         # Load pretrained model
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = cd.fetch_model(
@@ -23,7 +22,6 @@ class CPNSegmenter:
         self.model.eval()
 
     def __call__(self, image_sequence):
-
         contours = []
         max_frame = 0
         for frame_id, img in enumerate(

@@ -1,3 +1,9 @@
+CLAUDE.md
+lineage.html
+test_resources/
+tracking_output/
+.auto-claude-security.json
+
 coco/
 images/
 mlruns/
@@ -122,3 +128,13 @@ ENV/
 
 # IDE settings
 .vscode/
+
+# Auto Claude data directory
+.auto-claude/
+
+.claude_settings.json
+.worktrees/
+.auto-claudo-status
+
+# macOS
+.DS_Store

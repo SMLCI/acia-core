@@ -13,7 +13,6 @@ class YOLOSegmenter:
     """YOLOSegmenter using Yolo: https://github.com/ultralytics/ultralytics"""
 
     def __init__(self, model):
-
         # create CellPose model
         self.model = YOLO(model)
 
@@ -46,14 +45,12 @@ class YOLOSegmenter:
 
         # loop over all frames
         for frame, frame_data in enumerate(results):
-
             if frame_data.masks is None:
                 # Nothing found within the image
                 continue
 
             # loop over all masks
-            for mask, box in zip(frame_data.masks, frame_data.boxes):
-
+            for mask, box in zip(frame_data.masks, frame_data.boxes, strict=False):
                 # add one because they start couting at 0 (but zero is background in the mask)
                 cls = int(box.cls.item()) + 1
 

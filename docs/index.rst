@@ -11,7 +11,7 @@ Welcome to AutomatedCellularImageAnalysis's documentation!
    modules
    contributing
    authors
-   history
+   changelog
 
 Indices and tables
 ==================

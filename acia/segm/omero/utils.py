@@ -1,6 +1,4 @@
-""" Utils for OMERO segmenation data"""
-
-from typing import List
+"""Utils for OMERO segmenation data"""
 
 import cv2
 import numpy as np
@@ -54,7 +52,7 @@ def getProject(conn: BlitzGateway, projectId: int) -> ProjectWrapper:
     return conn.getObject("Project", projectId)
 
 
-def list_projects(conn: BlitzGateway) -> List[ProjectWrapper]:
+def list_projects(conn: BlitzGateway) -> list[ProjectWrapper]:
     """List projects in the current user group
         Note: only projects in your current group are accessible
 
@@ -64,10 +62,10 @@ def list_projects(conn: BlitzGateway) -> List[ProjectWrapper]:
     Returns:
         List[ProjectWrapper]: List of project wrappers
     """
-    return conn.getObjects("Project")
+    return conn.getObjects("Project")  # type: ignore[no-any-return]
 
 
-def list_image_ids_in_dataset(conn: BlitzGateway, datasetId: int) -> List[int]:
+def list_image_ids_in_dataset(conn: BlitzGateway, datasetId: int) -> list[int]:
     """[summary]
 
     Args:
@@ -82,7 +80,7 @@ def list_image_ids_in_dataset(conn: BlitzGateway, datasetId: int) -> List[int]:
     ]
 
 
-def list_images_in_dataset(conn: BlitzGateway, datasetId: int) -> List[ImageWrapper]:
+def list_images_in_dataset(conn: BlitzGateway, datasetId: int) -> list[ImageWrapper]:
     """List all images in the omero dataset
 
     Args:
@@ -92,16 +90,16 @@ def list_images_in_dataset(conn: BlitzGateway, datasetId: int) -> List[ImageWrap
     Returns:
         List[ImageWrapper]: List of omero images
     """
-    return conn.getObjects("Image", opts={"dataset": datasetId})
+    return conn.getObjects("Image", opts={"dataset": datasetId})  # type: ignore[no-any-return]
 
 
 def list_datasets_in_project(
     conn: BlitzGateway, projectId: int
-) -> List[DatasetWrapper]:
-    return conn.getObjects("Dataset", opts={"project": projectId})
+) -> list[DatasetWrapper]:
+    return conn.getObjects("Dataset", opts={"project": projectId})  # type: ignore[no-any-return]
 
 
-def list_images_in_project(conn: BlitzGateway, projectId: int) -> List[ImageWrapper]:
+def list_images_in_project(conn: BlitzGateway, projectId: int) -> list[ImageWrapper]:
     return [
         image
         for dataset in list_datasets_in_project(conn, projectId=projectId)
@@ -109,7 +107,7 @@ def list_images_in_project(conn: BlitzGateway, projectId: int) -> List[ImageWrap
     ]
 
 
-def list_image_ids_in(omero_id: int, omero_type: str, conn: BlitzGateway) -> List[int]:
+def list_image_ids_in(omero_id: int, omero_type: str, conn: BlitzGateway) -> list[int]:
     """List all image sequences in an omero source (dataset, project or image)
 
     Args:
@@ -128,9 +126,9 @@ def list_image_ids_in(omero_id: int, omero_type: str, conn: BlitzGateway) -> Lis
     func = None
 
     if omero_type == "project":
-        func = list_images_in_project
+        func = list_images_in_project  # type: ignore[assignment]
     elif omero_type == "dataset":
-        func = list_images_in_dataset
+        func = list_images_in_dataset  # type: ignore[assignment]
     elif omero_type == "image":
         return [omero_id]
     else:
@@ -138,15 +136,15 @@ def list_image_ids_in(omero_id: int, omero_type: str, conn: BlitzGateway) -> Lis
             f"Wrong omero_type: '{omero_type}'! Please choose one of 'project', 'dataset' or 'image'!"
         )
 
-    return list(map(lambda image: image.getId(), func(conn, omero_id)))
+    return list(map(lambda image: image.getId(), func(conn, omero_id)))  # type: ignore[misc]
 
 
 def get_image_name(conn: BlitzGateway, imageId: int) -> str:
-    return conn.getObject("Image", imageId).getName()
+    return conn.getObject("Image", imageId).getName()  # type: ignore[no-any-return]
 
 
 def get_project_name(conn: BlitzGateway, projectId: int) -> str:
-    return conn.getObject("Project", projectId).getName()
+    return conn.getObject("Project", projectId).getName()  # type: ignore[no-any-return]
 
 
 def image_iterator(conn: BlitzGateway, object) -> ImageWrapper:
@@ -253,15 +251,17 @@ class OmeroScaleBar(ScaleBar):
         return image
 
 
-def has_all_tags(object, tag_list: List[str] = None):
+def has_all_tags(object, tag_list: list[str] | None = None):
     if tag_list is None:
         tag_list = []
 
     tag_list = tag_list.copy()
     for ann in object.listAnnotations():
-        if ann.OMERO_TYPE == omero.model.TagAnnotationI:
-            if ann.getTextValue() in tag_list:
-                del tag_list[tag_list.index(ann.getTextValue())]
+        if (
+            omero.model.TagAnnotationI == ann.OMERO_TYPE
+            and ann.getTextValue() in tag_list
+        ):
+            del tag_list[tag_list.index(ann.getTextValue())]
 
         if len(tag_list) == 0:
             break

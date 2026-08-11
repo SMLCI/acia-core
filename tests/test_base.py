@@ -1,10 +1,22 @@
-""" Test acia base functionality"""
+"""Test acia base functionality"""
 
 import unittest
+import warnings
 
+import cv2
 import numpy as np
+import pytest
 
-from acia.base import Contour, Instance
+from acia import ureg
+from acia.base import (
+    ArrayImage,
+    BaseImage,
+    Contour,
+    ImageSequenceSource,
+    Instance,
+    RegisteredSequenceSource,
+)
+from acia.registration import FrameTransform
 
 
 class TestContour(unittest.TestCase):
@@ -65,6 +77,251 @@ class TestInstance(unittest.TestCase):
 
         poly = instance.polygon
         self.assertEqual(poly.area, 2)
+
+
+def _textured_frame(seed: int = 0, size: int = 200) -> np.ndarray:
+    """A blurred-noise frame with real texture -- mirrors
+    ``tests/test_registration.py::_textured_frame``."""
+    rng = np.random.default_rng(seed)
+    frame = rng.integers(0, 255, (size, size), dtype=np.uint8).astype(np.float32)
+    return cv2.GaussianBlur(frame, (3, 3), 0)
+
+
+def _warp(frame: np.ndarray, dx: float, dy: float, theta: float) -> np.ndarray:
+    """Warp ``frame`` by a rigid ``(dx, dy, theta)`` about its own center.
+
+    Mirrors ``tests/test_registration.py::_warp`` (and
+    ``RotatedCropSequenceSource``'s own warp-matrix convention): rotation
+    about the frame center via ``cv2.getRotationMatrix2D`` plus an explicit
+    translation added to the matrix's translation column.
+    """
+    h, w = frame.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, theta, 1.0)
+    matrix[0, 2] += dx
+    matrix[1, 2] += dy
+    return cv2.warpAffine(frame, matrix, (w, h), flags=cv2.INTER_LINEAR)
+
+
+class _GraySource(ImageSequenceSource):
+    """Minimal source yielding 2D grayscale (H, W) frames (mirrors
+    ``tests/segm/test_crop_rotated.py::_GraySource``)."""
+
+    def __init__(self, stack: np.ndarray):
+        self.stack = stack  # (T, H, W)
+
+    def get_frame(self, frame: int) -> BaseImage:
+        return ArrayImage(self.stack[frame], frame=frame)
+
+    @property
+    def size_t(self) -> int:
+        return self.stack.shape[0]
+
+    @property
+    def size_h(self) -> int:
+        return self.stack.shape[1]
+
+    @property
+    def size_w(self) -> int:
+        return self.stack.shape[2]
+
+    @property
+    def size_c(self) -> int:
+        return 1
+
+    @property
+    def num_channels(self) -> int:
+        return 1
+
+
+class TestRegisteredSequenceSource:
+    """`ImageSequenceSource.register()` / `RegisteredSequenceSource`."""
+
+    def test_stored_transform_undoes_known_drift(self):
+        reference = _textured_frame(seed=0)
+        dx_true, dy_true, theta_true = 6.0, -4.0, 3.0
+        drifted = _warp(reference, dx_true, dy_true, theta_true)
+
+        # `apply_correction` inverts the same (dx, dy, theta) that produced
+        # the forward warp above (see `_warp`'s and `apply_correction`'s
+        # shared matrix convention), so the ground-truth undo transform is
+        # exactly the one used to create `drifted`.
+        transform = FrameTransform(dx=dx_true, dy=dy_true, theta=theta_true)
+
+        stack = np.stack([reference, drifted])
+        parent = _GraySource(stack)
+        registered = parent.register({1: transform})
+
+        corrected = registered.get_frame(1).raw
+        uncorrected_diff = np.abs(
+            drifted.astype(float) - reference.astype(float)
+        ).mean()
+        corrected_diff = np.abs(
+            corrected.astype(float) - reference.astype(float)
+        ).mean()
+        assert corrected_diff < uncorrected_diff * 0.5
+
+    def test_missing_transform_returns_uncorrected_and_warns(self):
+        reference = _textured_frame(seed=1)
+        stack = np.stack([reference, reference])
+        parent = _GraySource(stack)
+        registered = parent.register({})  # no stored transform for frame 0
+
+        with pytest.warns(UserWarning, match="no stored correction"):
+            frame = registered.get_frame(0).raw
+
+        np.testing.assert_array_equal(frame, reference)
+
+    def test_register_returns_registered_source_wrapping_parent(self):
+        reference = _textured_frame(seed=2)
+        stack = np.stack([reference])
+        parent = _GraySource(stack)
+        registered = parent.register({})
+
+        assert isinstance(registered, RegisteredSequenceSource)
+        assert registered.parent is parent
+        assert registered.size_t == parent.size_t
+        assert registered.size_h == parent.size_h
+        assert registered.size_w == parent.size_w
+        assert registered.size_c == parent.size_c
+        assert registered.num_channels == parent.num_channels
+
+    def test_pixel_size_and_timepoints_delegate_to_parent(self):
+        reference = _textured_frame(seed=3)
+        stack = np.stack([reference, reference])
+        parent = _GraySource(stack).with_pixel_size(0.5 * ureg.micrometer)
+        registered = parent.register({})
+
+        assert registered.pixel_size == parent.pixel_size
+
+
+class TestRegisteredSequenceSourceOnMissing:
+    """`on_missing` policy for frames with no stored transform."""
+
+    def test_rejects_an_unknown_policy(self):
+        parent = _GraySource(np.stack([_textured_frame(seed=0)]))
+        with pytest.raises(ValueError, match="on_missing"):
+            parent.register({}, on_missing="improvise")
+
+    def test_error_policy_raises_instead_of_degrading(self):
+        parent = _GraySource(np.stack([_textured_frame(seed=1)]))
+        registered = parent.register({}, on_missing="error")
+        with pytest.raises(KeyError, match="no stored correction"):
+            registered.get_frame(0)
+
+    def test_nearest_policy_corrects_with_a_neighbours_transform(self):
+        """A missing frame left uncorrected is off by the *full* accumulated
+        drift; a neighbour's transform is far closer to right."""
+        reference = _textured_frame(seed=2)
+        dx, dy, theta = 6.0, -4.0, 3.0
+        drifted = _warp(reference, dx, dy, theta)
+
+        # Frame 1 has a transform; frame 2 (same drift) has none.
+        stack = np.stack([reference, drifted, drifted])
+        parent = _GraySource(stack)
+        registered = parent.register(
+            {1: FrameTransform(dx=dx, dy=dy, theta=theta)}, on_missing="nearest"
+        )
+
+        with pytest.warns(UserWarning, match="nearest available"):
+            corrected = registered.get_frame(2).raw
+
+        uncorrected_diff = np.abs(
+            drifted.astype(float) - reference.astype(float)
+        ).mean()
+        corrected_diff = np.abs(
+            corrected.astype(float) - reference.astype(float)
+        ).mean()
+        assert corrected_diff < uncorrected_diff * 0.5
+
+    def test_nearest_policy_falls_back_to_uncorrected_when_nothing_is_stored(self):
+        reference = _textured_frame(seed=3)
+        parent = _GraySource(np.stack([reference]))
+        registered = parent.register({}, on_missing="nearest")
+        with pytest.warns(UserWarning, match="no stored correction"):
+            frame = registered.get_frame(0).raw
+        np.testing.assert_array_equal(frame, reference)
+
+    def test_warns_once_per_index_not_once_per_read(self):
+        """A lazy crop -> write pipeline reads each frame on every pass; one
+        warning per pass would bury the signal it is meant to carry."""
+        reference = _textured_frame(seed=4)
+        parent = _GraySource(np.stack([reference, reference]))
+        registered = parent.register({})
+
+        with pytest.warns(UserWarning, match="no stored correction"):
+            registered.get_frame(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            registered.get_frame(0)  # same index again: already reported
+
+    def test_missing_frames_collects_every_gap_for_one_summary(self):
+        reference = _textured_frame(seed=5)
+        parent = _GraySource(np.stack([reference, reference, reference]))
+        registered = parent.register({1: FrameTransform(dx=1.0, dy=0.0, theta=0.0)})
+
+        assert registered.missing_frames == set()
+        with pytest.warns(UserWarning):
+            registered.get_frame(0)
+            registered.get_frame(2)
+        assert registered.missing_frames == {0, 2}
+
+
+class TestFragmentedInstance:
+    """An Instance whose mask has disconnected components.
+
+    `mask_to_polygons` returns a MultiPolygon for such a mask, which has no
+    `exterior` -- previously an AttributeError from `coordinates` (and so from
+    `save_segmentation`) rather than a usable contour.
+    """
+
+    @staticmethod
+    def _fragmented(label=1):
+        mask = np.zeros((20, 20), dtype=np.int32)
+        mask[3:8, 3:8] = label  # 25 px
+        mask[12:15, 12:15] = label  # 9 px, detached
+        return Instance(mask, frame=0, label=label, id=1)
+
+    @staticmethod
+    def _solid(label=1):
+        mask = np.zeros((20, 20), dtype=np.int32)
+        mask[3:8, 3:8] = label
+        return Instance(mask, frame=0, label=label, id=2)
+
+    def test_coordinates_returns_the_largest_part(self):
+        inst = self._fragmented()
+        coords = inst.coordinates
+        assert coords.shape[1] == 2
+        # the 5x5 blob's outline, not the 3x3 one
+        xs, ys = coords[:, 0], coords[:, 1]
+        assert xs.max() - xs.min() == 5
+        assert ys.max() - ys.min() == 5
+
+    def test_is_fragmented_flags_only_multi_part_masks(self):
+        assert self._fragmented().is_fragmented is True
+        assert self._solid().is_fragmented is False
+
+    def test_area_still_counts_every_component(self):
+        """`area` comes from the mask, so it is unaffected by the polygon
+        having to pick one part -- 25 + 9 px."""
+        assert self._fragmented().area == 34.0
+
+    def test_draw_agrees_with_coordinates(self):
+        """Both pick the same part, so a rendered outline matches what a
+        serialized contour would hold."""
+        from PIL import Image
+
+        inst = self._fragmented()
+        image = Image.new("RGB", (20, 20))
+        inst.draw(image)  # must not raise
+        drawn = np.array(image).sum(axis=-1)
+        # nothing drawn around the small, discarded blob
+        assert drawn[12:15, 12:15].sum() == 0
+
+    def test_empty_mask_still_raises_a_clear_error(self):
+        empty = Instance(np.zeros((20, 20), dtype=np.int32), frame=0, label=1, id=3)
+        with pytest.raises(ValueError, match="empty mask"):
+            _ = empty.coordinates
 
 
 if __name__ == "__main__":

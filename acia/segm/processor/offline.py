@@ -81,7 +81,6 @@ class OfflineModel(Processor):
         overlay = Overlay([])
 
         for frame_id, image in tqdm.tqdm(enumerate(source)):
-
             pred_result = prediction(image, self.model, tiling=self.tiling)
 
             if len(pred_result) == 0:
@@ -92,7 +91,10 @@ class OfflineModel(Processor):
             all_contours = [contour_from_mask(mask, 0.5) for mask in all_masks]
             # drop non-sense contours
             all_contours = list(
-                filter(lambda comb: len(comb[1]) >= 5, zip(pred_result, all_contours))
+                filter(
+                    lambda comb: len(comb[1]) >= 5,
+                    zip(pred_result, all_contours, strict=False),
+                )
             )
 
             contours = [
@@ -136,6 +138,7 @@ class PoseModel(Processor):
         Load model from definitions
         """
         from cellpose import models
+
         logging.info("Loading model %s", self.model_name)
         self.model = models.Cellpose(
             gpu=self.use_gpu, model_type=self.model_name, omni=self.omni

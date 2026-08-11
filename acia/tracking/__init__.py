@@ -1,5 +1,4 @@
-"""Tracking module contains all tools to work with tracking formats
-"""
+"""Tracking module contains all tools to work with tracking formats"""
 
 from pathlib import Path
 
@@ -9,6 +8,56 @@ import numpy as np
 from acia.base import Overlay
 
 from .formats import gen_simple_tracking, parse_simple_tracking
+
+
+def _node_time_attrs(cont) -> dict:
+    """Real-time node attributes for a contour, or empty if it carries no time.
+
+    When the contour's overlay was time-calibrated (see
+    :meth:`acia.base.Overlay.with_timepoints`), each contour carries a pint
+    ``time`` timestamp. This returns ``{"time": <float magnitude>}`` in the
+    timestamp's own unit (so a lineage can be laid out on a real-time axis),
+    or ``{}`` when the contour is uncalibrated.
+    """
+    t = getattr(cont, "time", None)
+    if t is None:
+        return {}
+    return {"time": float(t.magnitude)}
+
+
+def _time_unit_str(cont) -> str | None:
+    """Pretty (``~P``) unit string of a contour's ``time``, or ``None``."""
+    t = getattr(cont, "time", None)
+    return None if t is None else f"{t.units:~P}"
+
+
+def annotate_tracklet_times(tracklet_graph: nx.DiGraph, timepoints) -> nx.DiGraph:
+    """Stamp real ``start_time``/``end_time`` onto every tracklet node in place.
+
+    A tracklet node carries integer ``start_frame``/``end_frame`` (see
+    :func:`acia.tracking.formats.read_ctc_tracklet_graph`); this maps those
+    frame indices through per-frame ``timepoints`` to real timestamps, storing
+    the float magnitudes (in ``timepoints``' own unit) as ``start_time``/
+    ``end_time`` and recording that unit in ``tracklet_graph.graph["time_unit"]``.
+    Downstream (:func:`acia.viz.plot_tracklet_lineage`) then lays the lineage
+    out on a real-time axis without the caller re-supplying any time.
+
+    Args:
+        tracklet_graph: one node per tracklet with ``start_frame``/``end_frame``.
+        timepoints: per-frame pint ``Quantity`` (e.g. ``source.timepoints``);
+            ``None`` is a no-op (the graph keeps frame-only nodes).
+
+    Returns:
+        The same ``tracklet_graph``, mutated in place.
+    """
+    if timepoints is None:
+        return tracklet_graph
+    mags = timepoints.magnitude
+    for _, attrs in tracklet_graph.nodes(data=True):
+        attrs["start_time"] = float(mags[attrs["start_frame"]])
+        attrs["end_time"] = float(mags[attrs["end_frame"]])
+    tracklet_graph.graph["time_unit"] = f"{timepoints.units:~P}"
+    return tracklet_graph
 
 
 class TrackingSource:
@@ -112,13 +161,13 @@ def subsample_tracking(
 
     # subsample frames
     subsampled_frames = set(
-        np.arange(overlay.numFrames(), step=subsampling_factor, dtype=np.int32)
+        np.arange(overlay.numFrames(), step=subsampling_factor, dtype=np.int32)  # type: ignore[call-overload]
     )
 
     frame_lookup = {
         old_frame: new_frame
         for new_frame, old_frame in zip(
-            range(len(subsampled_frames)), sorted(subsampled_frames)
+            range(len(subsampled_frames)), sorted(subsampled_frames), strict=False
         )
     }
 
@@ -136,7 +185,9 @@ def subsample_tracking(
 
     # compute the set of segment ids we have to remove
     subsampled_overlay_ids = {cont.id for cont in subsampled_overlay}
-    nodes_to_remove = set(tracking_graph.nodes).difference(
+    nodes_to_remove = set(
+        tracking_graph.nodes
+    ).difference(
         subsampled_overlay_ids
     )  # [node for node in nx.topological_sort(tracking_graph) if node not in subsampled_overlay_ids]
 
@@ -176,11 +227,21 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
 
     track_graph = nx.DiGraph()
 
-    # add all the nodes
+    # add all the nodes -- carrying real time (not just frame index) when the
+    # overlay is time-calibrated, so the lineage can plot against real time.
+    time_unit: str | None = None
+    all_timed = True
     for cont in ov:
-        track_graph.add_node(cont.id, frame=cont.frame)
+        time_attrs = _node_time_attrs(cont)
+        track_graph.add_node(cont.id, frame=cont.frame, **time_attrs)
+        if time_attrs:
+            time_unit = time_unit or _time_unit_str(cont)
+        else:
+            all_timed = False
+    if all_timed and time_unit is not None:
+        track_graph.graph["time_unit"] = time_unit
 
-    tracklets = {}
+    tracklets: dict = {}
     for cont in ov:
         tracklets[cont.label] = tracklets.get(cont.label, []) + [cont]
 
@@ -190,9 +251,8 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
         )
 
     for tracklet_label, tracklet_nodes in tracklets.items():
-
         # add tracklet edges
-        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:]):
+        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:], strict=False):
             track_graph.add_edge(contA.id, contB.id)
 
         for pred_label in tracklet_graph.predecessors(tracklet_label):

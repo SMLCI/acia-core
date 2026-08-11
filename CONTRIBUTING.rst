@@ -15,7 +15,7 @@ Types of Contributions
 Report Bugs
 ~~~~~~~~~~~
 
-Report bugs at https://github.com/JojoDevel/acia/issues.
+Report bugs at https://github.com/SMLCI/acia-core/issues.
 
 If you are reporting a bug, please include:
 
@@ -45,7 +45,7 @@ articles, and such.
 Submit Feedback
 ~~~~~~~~~~~~~~~
 
-The best way to send feedback is to file an issue at https://github.com/JojoDevel/acia/issues.
+The best way to send feedback is to file an issue at https://github.com/SMLCI/acia-core/issues.
 
 If you are proposing a feature:
 
@@ -59,16 +59,15 @@ Get Started!
 
 Ready to contribute? Here's how to set up `acia` for local development.
 
-1. Fork the `acia` repo on GitHub.
+1. Fork the `acia` repo on GitHub (``SMLCI/acia-core``).
 2. Clone your fork locally::
 
-    $ git clone git@github.com:your_name_here/acia.git
+    $ git clone git@github.com:your_name_here/acia-core.git
 
-3. Install your local copy into a virtualenv. Assuming you have virtualenvwrapper installed, this is how you set up your fork for local development::
+3. Install your local copy in editable mode with the dev extras::
 
-    $ mkvirtualenv acia
-    $ cd acia/
-    $ python setup.py develop
+    $ cd acia-core/
+    $ pip install -e ".[dev]"
 
 4. Create a branch for local development::
 
@@ -76,22 +75,28 @@ Ready to contribute? Here's how to set up `acia` for local development.
 
    Now you can make your changes locally.
 
-5. When you're done making changes, check that your changes pass flake8 and the
-   tests, including testing other Python versions with tox::
+5. When you're done, check that your changes pass linting, formatting and the
+   tests (the same checks CI runs)::
 
-    $ flake8 acia tests
-    $ python setup.py test or pytest
-    $ tox
+    $ ruff check acia tests
+    $ ruff format --check acia tests
+    $ pytest                      # fast suite; integration tests are deselected
 
-   To get flake8 and tox, just pip install them into your virtualenv.
+   Heavy integration tests (external data, trackastra/laptrack, ffmpeg) are
+   marked ``@pytest.mark.integration`` and run separately::
 
-6. Commit your changes and push your branch to GitHub::
+    $ pytest -m integration
+
+6. Add a short entry under ``## [Unreleased]`` in ``CHANGELOG.md`` describing
+   your change.
+
+7. Commit your changes and push your branch to GitHub::
 
     $ git add .
     $ git commit -m "Your detailed description of your changes."
     $ git push origin name-of-your-bugfix-or-feature
 
-7. Submit a pull request through the GitHub website.
+8. Submit a pull request through the GitHub website.
 
 Pull Request Guidelines
 -----------------------
@@ -101,10 +106,11 @@ Before you submit a pull request, check that it meets these guidelines:
 1. The pull request should include tests.
 2. If the pull request adds functionality, the docs should be updated. Put
    your new functionality into a function with a docstring, and add the
-   feature to the list in README.rst.
-3. The pull request should work for Python 3.5, 3.6, 3.7 and 3.8, and for PyPy. Check
-   https://travis-ci.com/JojoDevel/acia/pull_requests
-   and make sure that the tests pass for all supported Python versions.
+   feature to the list in README.md and an entry under ``[Unreleased]`` in
+   ``CHANGELOG.md``.
+3. The pull request should work for Python 3.10, 3.11, 3.12 and 3.13. The CI
+   workflow (``.github/workflows/ci.yml``) runs lint, type-checks and the test
+   matrix on every push and pull request.
 
 Tips
 ----
@@ -114,15 +120,26 @@ To run a subset of tests::
 $ pytest tests.test_acia
 
 
-Deploying
+Releasing
 ---------
 
-A reminder for the maintainers on how to deploy.
-Make sure all your changes are committed (including an entry in HISTORY.rst).
-Then run::
+Releases are automated. A maintainer triggers them from GitHub:
 
-$ bump2version patch # possible: major / minor / patch
-$ git push
-$ git push --tags
+1. Make sure ``CHANGELOG.md`` has the changes for this release under
+   ``## [Unreleased]``.
+2. Go to **Actions → Release → Run workflow** and choose the bump level
+   (``patch`` / ``minor`` / ``major``). Use ``dry_run`` first to preview.
+
+The ``release.yml`` workflow then, in one run:
+
+* runs ``bump-my-version`` to update ``pyproject.toml`` and ``acia/__init__.py``,
+  promote the ``[Unreleased]`` changelog section to a dated version, and create
+  the ``vX.Y.Z`` commit and tag,
+* builds the sdist + wheel and publishes them to PyPI via **OIDC trusted
+  publishing** (no stored token), and
+* creates a GitHub Release using the new changelog section as the notes.
+
+Documentation is published to GitHub Pages automatically on every push to the
+default branch via ``docs.yml``.
 
 Travis will then deploy to PyPI if tests pass.

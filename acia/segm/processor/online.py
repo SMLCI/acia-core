@@ -5,14 +5,13 @@ import logging
 import os
 from io import BytesIO
 from itertools import chain, islice
-from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
-import requests
+import requests  # type: ignore[import-untyped]
 import tqdm.auto as tqdm
 from PIL import Image
-from retry import retry
+from retry import retry  # type: ignore[import-untyped]
 
 from acia.base import Contour, ImageSequenceSource, Overlay, Processor
 
@@ -56,7 +55,6 @@ class OnlineModel(Processor):
 
         # iterate over images from image source
         for frame, image in enumerate(tqdm.tqdm(source)):
-
             # convert image into a binary png stream
             byte_io = BytesIO()
             Image.fromarray(image).save(byte_io, "png")
@@ -85,16 +83,18 @@ class OnlineModel(Processor):
             for detection in content:
                 # label = detection['label']
                 contour_lists = detection["contours"][0]
-                contour = list(zip(contour_lists["x"], contour_lists["y"]))
+                contour = list(
+                    zip(contour_lists["x"], contour_lists["y"], strict=False)
+                )
                 score = detection["score"]
 
-                contours.append(Contour(contour, score, frame, -1))
+                contours.append(Contour(np.array(contour), score, frame, -1))
 
         return Overlay(contours)
 
     @staticmethod
-    def parseContours(response_body) -> List[Contour]:
-        pass
+    def parseContours(response_body) -> list[Contour]:
+        raise NotImplementedError()
 
 
 class ModelDescriptor:
@@ -257,7 +257,7 @@ class FlexibleOnlineModel(Processor):
         return contours
 
     @retry(requests.exceptions.ReadTimeout, tries=3)
-    def predict_batch(self, frame_ids: List[int], images: List, params) -> Overlay:
+    def predict_batch(self, frame_ids: list[int], images: list, params) -> Overlay:
         """Predict segmentation for a batch of frames
 
         Args:
@@ -317,8 +317,8 @@ class FlexibleOnlineModel(Processor):
 
         logging.debug("Finished batch prediction")
 
-        return contours
+        return Overlay(contours)
 
     @staticmethod
-    def parseContours(response_body) -> List[Contour]:
-        pass
+    def parseContours(response_body) -> list[Contour]:
+        raise NotImplementedError()

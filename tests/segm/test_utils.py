@@ -1,4 +1,4 @@
-""" Utils for segmentation testing """
+"""Utils for segmentation testing"""
 
 import unittest
 
@@ -13,7 +13,6 @@ class TestIndexing(unittest.TestCase):
     """Test the linearization of z and t stacks"""
 
     def test_both(self):
-
         setup = dict(size_t=4, size_z=4)
 
         self.assertEqual(compute_indices(0, **setup), (0, 0))
@@ -149,6 +148,40 @@ class TestMaskPolygon(unittest.TestCase):
         np.testing.assert_array_almost_equal(
             [re_polygon.centroid.x, re_polygon.centroid.y], [5, 5]
         )
+
+    def test_empty_mask_returns_none(self):
+        """Test that an empty mask returns None"""
+        mask = np.zeros((100, 100), dtype=bool)
+
+        result = mask_to_polygons(mask)
+
+        self.assertIsNone(result)
+
+    def test_single_pixel_mask(self):
+        """Test mask with a single pixel"""
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[50, 50] = True
+
+        result = mask_to_polygons(mask)
+
+        self.assertIsNotNone(result)
+        # Single pixel should produce a polygon with area ~1
+        self.assertGreater(result.area, 0)
+
+    def test_multiple_disconnected_regions(self):
+        """Test mask with multiple disconnected regions produces MultiPolygon"""
+        from shapely.geometry import MultiPolygon
+
+        mask = np.zeros((100, 100), dtype=bool)
+        # Two separate regions
+        mask[10:20, 10:20] = True
+        mask[60:70, 60:70] = True
+
+        result = mask_to_polygons(mask)
+
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, MultiPolygon)
+        self.assertEqual(len(result.geoms), 2)
 
 
 if __name__ == "__main__":
