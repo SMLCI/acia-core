@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 import numpy as np
 import pandas as pd
 import papermill as pm
+import shapely
 from numpy import ma
 from pint._typing import UnitLike
 from tqdm.auto import tqdm
@@ -41,7 +42,6 @@ from acia.analysis.units import read_units_csv as read_units_csv
 from acia.analysis.units import strip_units as strip_units
 from acia.analysis.units import write_units_csv as write_units_csv
 from acia.base import BaseImage, ImageSequenceSource, Overlay
-from acia.utils import pairwise_distances
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,42 @@ class PropertyExtractor:
             # 2. convert to output unit
             return float((input * self.input_unit).to(self.output_unit).magnitude)
 
+    def _affine(self) -> tuple[float, float] | None:
+        """``(scale, offset)`` with ``convert(x) == scale * x + offset``.
+
+        A unit conversion is affine, so the whole of :meth:`convert` -- a pint
+        ``Quantity`` construction and two unit lookups, per value -- collapses to
+        one multiply once the two coefficients are known.
+
+        Returns ``None`` if the identity does not hold *exactly* on a spread of
+        probe values, so an unusual unit falls back to the per-value path rather
+        than silently returning near-enough numbers.
+        """
+        offset = self.convert(0.0)
+        scale = self.convert(1.0) - offset
+
+        for probe in (0.5, 3.0, 1234.5, 1e-6, 1e6, 188.0):
+            if scale * probe + offset != self.convert(probe):
+                return None
+        return scale, offset
+
+    def convert_array(self, values) -> np.ndarray:
+        """Vectorised :meth:`convert` over an array of magnitudes.
+
+        Produces bit-identical results to calling :meth:`convert` per value
+        (verified in ``tests/test_property_equivalence.py``), because the
+        conversion really is a single multiply and this performs the same one.
+        """
+        values = np.asarray(values, dtype=float)
+        affine = self._affine()
+        if affine is None:
+            return np.array([self.convert(float(v)) for v in values], dtype=float)
+
+        scale, offset = affine
+        if offset == 0.0:
+            return np.asarray(values * scale, dtype=float)
+        return np.asarray(values * scale + offset, dtype=float)
+
 
 class ExtractorExecutor:
     """Executor to extract a list of single-cell properties from segmentation and images"""
@@ -183,8 +219,12 @@ class ExtractorExecutor:
         df["id"] = [c.id for c in overlay]
         df = df.set_index("id")
 
-        for extractor in tqdm(extractors):
-            print(f"Extracting: {extractor.name}...")
+        # the bar names the property currently being extracted; it used to also
+        # print one line per extractor to stdout, which a notebook re-running
+        # this over many sources drowns in
+        progress = tqdm(extractors, unit="property", desc="extracting")
+        for extractor in progress:
+            progress.set_postfix_str(extractor.name)
             result_df, extractor_units = extractor.extract(overlay, images, df)
 
             # join on the shared `id` index -- order-independent and, unlike
@@ -204,6 +244,45 @@ class ExtractorExecutor:
         # "none"/"magnitude" -> leave as plain floats
 
         return df
+
+
+def _polygons(overlay: Overlay) -> list:
+    """Every contour's polygon, in overlay order."""
+    return [cont.polygon for cont in overlay]
+
+
+def _rect_edge_lengths(polygons: list) -> np.ndarray:
+    """``(n, 4)`` edge lengths of each polygon's minimum rotated rectangle.
+
+    Computes the rectangles for the whole overlay in one shapely call rather
+    than one per contour per extractor, which had ``LengthEx`` and ``WidthEx``
+    each deriving the same rectangle independently.
+
+    A degenerate outline (collinear or zero-extent) has a rectangle that
+    collapses to a ``LineString``/``Point``. The per-contour code raised
+    ``AttributeError`` reaching for its missing ``exterior``; that is reproduced
+    here rather than quietly turning into a different error or a 0, so making
+    the extractors degenerate-tolerant stays a separate, deliberate change.
+    """
+    if not polygons:
+        return np.empty((0, 4), dtype=float)
+
+    rectangles = shapely.oriented_envelope(np.array(polygons, dtype=object))
+
+    # a rectangle ring is 5 coordinates (closed); anything else is degenerate
+    if not np.all(shapely.get_num_coordinates(rectangles) == 5):
+        for rectangle in rectangles:
+            rectangle.exterior.coords  # noqa: B018 - raises as the old path did
+
+    coords = shapely.get_coordinates(rectangles).reshape(-1, 5, 2)
+    return np.asarray(np.linalg.norm(np.diff(coords, axis=1), axis=2), dtype=float)
+
+
+def _value_frame(overlay: Overlay, name: str, values: np.ndarray) -> pd.DataFrame:
+    """``id``-indexed single-column frame, float-typed even when empty."""
+    return pd.DataFrame(
+        {"id": [cont.id for cont in overlay], name: np.asarray(values, dtype=float)}
+    ).set_index("id")
 
 
 def _id_indexed(records: list[dict], columns: list[str]) -> pd.DataFrame:
@@ -236,11 +315,10 @@ class AreaEx(PropertyExtractor):
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         self._calibrate(images)
-        data = []
-        for cont in overlay:
-            data.append({"id": cont.id, self.name: self.convert(cont.area)})
-
-        df = _id_indexed(data, [self.name])
+        # `cont.area` stays per-contour: Instance counts mask pixels while
+        # Contour measures its polygon, and only the unit conversion is common
+        areas = [cont.area for cont in overlay]
+        df = _value_frame(overlay, self.name, self.convert_array(areas))
 
         return df, {self.name: self.output_unit}
 
@@ -265,14 +343,10 @@ class PerimeterEx(PropertyExtractor):
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         self._calibrate(images)
-        data = []
-        for cont in overlay:
-            # extract the length of the polygon
-            perimeter = cont.polygon.length
-
-            data.append({"id": cont.id, self.name: self.convert(perimeter)})
-
-        df = _id_indexed(data, [self.name])
+        # scalar `.length` access: a bulk shapely call would save ~1% here and
+        # would return nan for an empty polygon where this raises, as it always has
+        perimeters = [cont.polygon.length for cont in overlay]
+        df = _value_frame(overlay, self.name, self.convert_array(perimeters))
 
         return df, {self.name: self.output_unit}
 
@@ -333,19 +407,18 @@ class BoundaryClosenessEx(PropertyExtractor):
         self._calibrate(images)
         size_w, size_h = images.size_w, images.size_h
 
-        data = []
+        raw = []
         for cont in overlay:
             polygon = cont.polygon
             if polygon is None or polygon.is_empty:
                 # degenerate contour -> distance 0 (treated as at-border)
-                raw = 0.0
+                raw.append(0.0)
             else:
                 minx, miny, maxx, maxy = polygon.bounds
                 # the bounding box is the closest part of the contour to a border
-                raw = float(min(minx, miny, size_w - maxx, size_h - maxy))
-            data.append({"id": cont.id, self.name: self.convert(raw)})
+                raw.append(float(min(minx, miny, size_w - maxx, size_h - maxy)))
 
-        df = _id_indexed(data, [self.name])
+        df = _value_frame(overlay, self.name, self.convert_array(raw))
 
         return df, {self.name: self.output_unit}
 
@@ -370,24 +443,10 @@ class LengthEx(PropertyExtractor):
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         self._calibrate(images)
-        lengths = []
-        for cont in overlay:
-            lengths.append(
-                self.convert(
-                    # longer edge of minimum roated bbox
-                    np.max(
-                        pairwise_distances(
-                            np.array(
-                                cont.polygon.minimum_rotated_rectangle.exterior.coords
-                            )
-                        )
-                    )
-                )
-            )
-
-        df = pd.DataFrame(
-            {self.name: lengths, "id": [c.id for c in overlay]}
-        ).set_index("id")
+        edges = _rect_edge_lengths(_polygons(overlay))
+        # longer edge of minimum rotated bbox
+        lengths = edges.max(axis=1) if len(edges) else np.empty(0)
+        df = _value_frame(overlay, self.name, self.convert_array(lengths))
 
         return df, {self.name: self.output_unit}
 
@@ -413,26 +472,10 @@ class WidthEx(PropertyExtractor):
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         """Extract width information for all contours"""
         self._calibrate(images)
-        widths = []
-        for cont in overlay:
-            widths.append(
-                self.convert(
-                    # shorter edge of bbox approximation
-                    np.min(
-                        # measure edge lengths of bbox approximation
-                        pairwise_distances(
-                            np.array(
-                                # bbox approaximation
-                                cont.polygon.minimum_rotated_rectangle.exterior.coords
-                            )
-                        )
-                    )
-                )
-            )
-
-        df = pd.DataFrame({self.name: widths, "id": [c.id for c in overlay]}).set_index(
-            "id"
-        )
+        edges = _rect_edge_lengths(_polygons(overlay))
+        # shorter edge of bbox approximation
+        widths = edges.min(axis=1) if len(edges) else np.empty(0)
+        df = _value_frame(overlay, self.name, self.convert_array(widths))
 
         return df, {self.name: self.output_unit}
 
@@ -461,32 +504,12 @@ class LengthWidthEx(PropertyExtractor):
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         """Extract length and width information for all contours"""
         self._calibrate(images)
-        widths = []
-        lengths = []
-        for cont in overlay:
-            pd_box = pairwise_distances(
-                np.array(
-                    # bbox approaximation
-                    cont.polygon.minimum_rotated_rectangle.exterior.coords
-                )
-            )
-
-            widths.append(
-                self.convert(
-                    # shorter edge of bbox approximation
-                    np.min(
-                        # measure edge lengths of bbox approximation
-                        pd_box
-                    )
-                )
-            )
-
-            lengths.append(
-                self.convert(
-                    # longer edge of minimum roated bbox
-                    np.max(pd_box)
-                )
-            )
+        edges = _rect_edge_lengths(_polygons(overlay))
+        if len(edges):
+            widths = self.convert_array(edges.min(axis=1))
+            lengths = self.convert_array(edges.max(axis=1))
+        else:
+            widths = lengths = np.empty(0)
 
         df = pd.DataFrame(
             {
@@ -672,6 +695,12 @@ class PositionEx(PropertyExtractor):
 
     def extract(self, overlay: Overlay, images: ImageSequenceSource, df: pd.DataFrame):
         self._calibrate(images)
+        # Deliberately NOT using convert_array here. Contour.center is float32
+        # (it is derived from the float32 `coordinates`), and pint carries that
+        # magnitude through the conversion, so these two columns have always
+        # been computed in single precision. Converting them as a float64 array
+        # is more accurate but changes every value by ~1e-7 relative, which is a
+        # quality change rather than a speed one -- it belongs in its own commit.
         positions_x = []
         positions_y = []
         ids = []

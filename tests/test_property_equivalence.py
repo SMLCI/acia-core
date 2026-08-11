@@ -346,6 +346,55 @@ class TestGeometryInvariants(unittest.TestCase):
         contour.coordinates = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
         self.assertEqual(contour.area, 4.0)
 
+    def test_convert_array_is_bit_identical_to_convert(self):
+        """The vectorised unit conversion must not merely be close.
+
+        ``convert_array`` replaces a per-value pint conversion with one multiply
+        by a precomputed factor. That is only legitimate while it reproduces
+        ``convert`` exactly -- otherwise every extracted property shifts in its
+        last digits, and area-derived filters could select different cells.
+        """
+        from acia.analysis import AreaEx, LengthEx, PerimeterEx, TimeEx
+
+        rng = np.random.default_rng(11)
+        probes = np.concatenate(
+            [
+                rng.uniform(1e-3, 1e4, 5000),
+                [0.0, 1.0, 1e-12, 1e12, 77.0, 188.0, 0.5],
+            ]
+        )
+
+        images = source()
+        for extractor in (AreaEx(), PerimeterEx(), LengthEx(), TimeEx()):
+            with self.subTest(extractor=type(extractor).__name__):
+                extractor._calibrate(images)
+                expected = np.array([extractor.convert(float(v)) for v in probes])
+                np.testing.assert_array_equal(
+                    extractor.convert_array(probes),
+                    expected,
+                    err_msg="convert_array drifted from convert",
+                )
+
+    def test_convert_array_falls_back_when_not_affine(self):
+        """A conversion the fast path cannot model exactly must not use it."""
+        from acia.analysis import AreaEx
+
+        extractor = AreaEx()
+        extractor._calibrate(source())
+        self.assertIsNotNone(extractor._affine())
+
+        # a non-affine conversion cannot be reproduced by scale/offset, so
+        # _affine must report that rather than returning wrong coefficients
+        class Quadratic(AreaEx):
+            def convert(self, input):
+                return float(input) ** 2
+
+        self.assertIsNone(Quadratic()._affine())
+        np.testing.assert_array_equal(
+            Quadratic().convert_array([1.0, 2.0, 3.0]),
+            np.array([1.0, 4.0, 9.0]),
+        )
+
     def test_raster_polygon_area_equals_pixel_count(self):
         """``polygon.area`` equals the mask pixel count, exactly.
 
