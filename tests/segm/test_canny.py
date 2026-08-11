@@ -175,7 +175,7 @@ class TestCannyFrameProcessing(unittest.TestCase):
         overlay = processor(source)
 
         # Collect all frame indices from contours
-        frame_indices = set([c.frame for c in overlay.contours])
+        frame_indices = {c.frame for c in overlay.contours}
 
         # Should have contours from all frames
         self.assertEqual(frame_indices, {0, 1, 2, 3, 4})
@@ -567,7 +567,7 @@ class TestCannyContourFormat(unittest.TestCase):
         overlay = processor(source)
 
         # Should still process all frames
-        frame_indices = set([c.frame for c in overlay.contours])
+        frame_indices = {c.frame for c in overlay.contours}
 
         # Frame 1 has no contours, but frames 0 and 2 should
         self.assertIn(0, frame_indices)
@@ -656,7 +656,7 @@ class TestCannyIntegration(unittest.TestCase):
         overlay = processor(source)
 
         # Should have contours from all frames
-        frames = set([c.frame for c in overlay.contours])
+        frames = {c.frame for c in overlay.contours}
         self.assertEqual(len(frames), 5)
 
     def test_processor_reusability(self):
@@ -696,7 +696,7 @@ class TestCannyIntegration(unittest.TestCase):
         overlay = processor(source)
 
         # Should process all frames
-        frames = set([c.frame for c in overlay.contours])
+        frames = {c.frame for c in overlay.contours}
         self.assertEqual(len(frames), 10)
         self.assertGreater(len(overlay), 10)  # Multiple shapes per frame
 
