@@ -1,5 +1,7 @@
 CLAUDE.md
 lineage.html
+lineage.png
+report.xml
 test_resources/
 tracking_output/
 .auto-claude-security.json
@@ -89,6 +91,13 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+# autosummary writes the API reference stubs here on every build
+docs/api/generated/
+# sample data the tutorials download at run time (~46 MB); myst-nb executes each
+# notebook with its own directory as the cwd, so it lands here
+docs/tutorials/data/
+# notebook byproducts (videos are already covered by *.mp4 above)
+docs/tutorials/*.csv
 
 # PyBuilder
 target/

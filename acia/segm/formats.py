@@ -326,7 +326,7 @@ def read_ctc_segmentation_native(segmentation_path: Path) -> Overlay:
     """Fast loading of CTC segmentation masks into an Overlay
 
     Args:
-        segmentation_path (Path): Path to the folder containing all the *.tif masks
+        segmentation_path (Path): Path to the folder containing all the ``*.tif`` masks
 
     Returns:
         Overlay: Overlay containing all masks

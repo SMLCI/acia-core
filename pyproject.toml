@@ -72,8 +72,15 @@ dev = [
 ]
 docs = [
     "sphinx>=7.0.0",
-    "sphinx-rtd-theme>=2.0.0",
-    "myst-parser>=2.0.0",
+    "pydata-sphinx-theme>=0.15",
+    # myst-nb is a superset of myst-parser: MyST markdown *plus* executable
+    # notebooks. The tutorials under docs/tutorials/ are committed without
+    # outputs (nbstripout) and executed at build time, so the published pages
+    # are proof the tutorials still run.
+    "myst-nb>=1.1",
+    "sphinx-copybutton>=0.5",
+    "sphinx-design>=0.6",
+    "ipykernel>=6.0",
 ]
 omero = ["omero-py>=5.9.3"]
 notebook = ["ipywidgets>=8.0.0"]

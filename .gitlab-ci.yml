@@ -16,7 +16,6 @@ stages:
   - lint
   - build
   - test
-  - deploy
 
 # Lint and format check with Ruff
 lint:
@@ -103,15 +102,10 @@ test:
         path: coverage.xml
       junit: report.xml
 
-# Deploy documentation to GitLab Pages
-pages:
-  stage: deploy
-  script:
-    - pip install sphinx sphinx-rtd-theme pint
-    - cd docs && make html
-    - mv _build/html/ ../public/
-  artifacts:
-    paths:
-      - public
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+# NOTE: documentation is built and published by GitHub Actions
+# (.github/workflows/docs.yml) to https://smlci.github.io/acia-core, which is the
+# URL declared in pyproject.toml's [project.urls]. The GitLab Pages job that used
+# to live here was removed: it installed neither `acia` (which docs/conf.py
+# imports for __version__) nor the MyST/notebook dependencies, so it could not
+# have produced a working site, and a second publish target for the same content
+# is a maintenance trap.
