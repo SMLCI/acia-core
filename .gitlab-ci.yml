@@ -124,33 +124,33 @@ test:
 # imports for __version__, nor myst-parser, so it cannot have worked).
 #
 # Only ONE segmentation backend can be installed: cellpose<4, cellpose>=4 and
-# omnipose pin conflicting versions. The getting-started path uses Cellpose-SAM.
-#
-# On the biggpu runner the notebooks detect CUDA and process every 4th frame; on
-# a CPU runner they fall back to every 20th automatically, so this job is correct
-# either way -- it just produces a finer-grained tutorial when a GPU is present.
+# omnipose pin conflicting versions. The getting-started path uses Omnipose,
+# which runs the tutorial in about a minute on a CPU, so this job does not
+# actually need the GPU runner -- it just benefits from it.
 #
 # Note this publishes a SECOND copy of the site; GitHub Pages
 # (https://smlci.github.io/acia-core) remains the URL declared in
 # pyproject.toml's [project.urls]. Keep them from drifting.
 pages:
   stage: deploy
-  image: python:3.12
+  # Omnipose pins numpy<2 / scipy==1.11.4 and does not support 3.12.
+  image: python:3.10
   tags:
     - biggpu
   variables:
-    # GitLab can only cache paths inside CI_PROJECT_DIR, so move Cellpose's
-    # model store (~300 MB, default ~/.cellpose/models) into the project.
+    # GitLab can only cache paths inside CI_PROJECT_DIR, so move the model
+    # store (default ~/.cellpose/models) into the project. Omnipose shares that
+    # directory and honours the same environment variable.
     CELLPOSE_LOCAL_MODELS_PATH: "$CI_PROJECT_DIR/.cellpose-models"
   cache:
     - key: pip-${CI_JOB_IMAGE}
       paths:
         - .cache/pip/
-    # ~42 MB Cell Tracking Challenge sample the notebooks download themselves
-    - key: docs-tutorial-data-v1
+    # ~20 MB of individual frames the notebooks fetch over WebDAV
+    - key: docs-tutorial-data-colony-v1
       paths:
         - docs/tutorials/data/
-    - key: docs-cellpose-weights-v1
+    - key: docs-omnipose-weights-v1
       paths:
         - .cellpose-models/
     # myst-nb re-executes only notebooks whose source changed
@@ -158,7 +158,7 @@ pages:
       paths:
         - docs/_build/.jupyter_cache/
   script:
-    - pip install -e ".[docs,cellpose-sam]"
+    - pip install -e ".[docs,omnipose]" --use-pep517
     # -W: the build must stay warning-free, exactly as it does on GitHub
     - sphinx-build -b html -W --keep-going docs public
   artifacts:

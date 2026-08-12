@@ -33,32 +33,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Omnipose pins numpy<2 / scipy==1.11.4 and does not support 3.12.
+          python-version: "3.10"
           cache: pip
 
       # The tutorials under docs/tutorials/ are committed WITHOUT outputs and
       # executed here by myst-nb, so this job needs everything they import.
       # Only ONE segmentation backend can be installed (cellpose<4, cellpose>=4
       # and omnipose pin conflicting versions) -- the getting-started path uses
-      # Cellpose-SAM.
-      - name: Install CPU torch
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      # Omnipose, whose bact_phase_omni model is both the right one for phase
+      # contrast bacteria and cheap enough to run on a CPU runner (~3 s/frame,
+      # vs Cellpose-SAM which does not finish 5 frames in 10 minutes).
+      - run: pip install -e ".[docs,omnipose]" --use-pep517
 
-      - run: pip install -e ".[docs,cellpose-sam]"
-
-      # ~42 MB Cell Tracking Challenge sample, downloaded by the notebooks.
+      # ~20 MB of individual frames, fetched over WebDAV by the notebooks.
       - name: Cache tutorial sample data
         uses: actions/cache@v4
         with:
           path: docs/tutorials/data
-          key: tutorial-data-DIC-C2DH-HeLa-v1
+          key: tutorial-data-colony-v1
 
-      # Cellpose-SAM weights (~300 MB) are fetched on first model load.
+      # bact_phase_omni weights (~25 MB) are fetched on first model load.
       - name: Cache segmentation model weights
         uses: actions/cache@v4
         with:
           path: ~/.cellpose
-          key: cellpose-sam-weights-v1
+          key: omnipose-weights-v1
 
       # myst-nb only re-executes notebooks whose source changed. The cache path
       # is pinned in docs/conf.py (nb_execution_cache_path) so it does not move

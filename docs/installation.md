@@ -97,5 +97,8 @@ sphinx-build -b html docs docs/_build/html
 ```
 
 The tutorials are executed as part of the build (see
-{doc}`tutorials/01_open_your_first_file`), so the first run downloads a sample
-dataset and takes a few minutes; subsequent builds reuse the execution cache.
+{doc}`tutorials/01_open_your_first_file`), so the first run downloads a ~20 MB
+sample dataset and takes a few minutes; subsequent builds reuse the execution
+cache. The tutorials use the `omnipose` backend, so build the docs with
+`pip install -e ".[docs,omnipose]" --use-pep517` on **Python 3.10** if you want
+them to execute.

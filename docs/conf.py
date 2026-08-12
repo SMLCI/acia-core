@@ -82,6 +82,9 @@ nb_execution_mode = "cache"
 nb_execution_cache_path = str(Path(__file__).parent / "_build" / ".jupyter_cache")
 nb_execution_timeout = 900
 nb_execution_raise_on_error = True
+# Without this a failing notebook reports only "CellExecutionError" and the file
+# name -- useless in CI, where you cannot open the notebook and re-run the cell.
+nb_execution_show_tb = True
 # Escape hatch: add a glob here if a notebook ever becomes too heavy for CI.
 # Anything listed here ships whatever outputs it was committed with, which for a
 # stripped notebook means *no* outputs -- so prefer subsampling over excluding.

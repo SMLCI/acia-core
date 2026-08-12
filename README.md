@@ -21,14 +21,14 @@ works for any objects you can detect in images.
 ```python
 from acia import ureg
 from acia.segm.open import open_sequence
-from acia.segm.processor.cellpose_sam import CellposeSAMSegmenter
+from acia.segm.processor.omnipose import OmniposeSegmenter
 from acia.analysis import extract_growth
 
 src = open_sequence("experiment.nd2").position(0)      # ND2, CZI, TIFF, folders
 src = src[::10, 256:768, 256:768]                      # lazy: subsample + crop
-src = src.with_pixel_size(0.065 * ureg.micrometer)     # calibration travels along
+src = src.with_pixel_size(0.072 * ureg.micrometer)     # calibration travels along
 
-overlay = CellposeSAMSegmenter()(src)                  # -> detections
+overlay = OmniposeSegmenter()(src)                     # -> detections
 table, growth, figure = extract_growth(overlay, src)   # -> µm², hours, 1/hour
 ```
 
@@ -98,11 +98,11 @@ pytest
 ruff check acia tests
 ```
 
-To build the documentation locally (the first build downloads a ~42 MB sample
+To build the documentation locally (the first build downloads a ~20 MB sample
 dataset and executes the tutorials):
 
 ```bash
-pip install -e ".[docs,cellpose-sam]"
+pip install -e ".[docs,omnipose]" --use-pep517
 make docs
 ```
 
