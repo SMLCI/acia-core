@@ -41,3 +41,35 @@ verbatim into the notebook parameters) together with an explicit
 
 Use `max_workers` to run executions in parallel, and `exist_skip=True` to resume
 a partially completed sweep without redoing finished sequences.
+
+## Progress output
+
+There are always two levels: one bar counting **sources**, and per-notebook bars
+counting **cells**. Sequentially, the source bar is labelled with what is running
+right now, and each stage notebook gets its own bar underneath:
+
+```text
+01_Segment.ipynb | pos001_roi001.tiff:  33%|███| 1/3 [04:41<09:23, 281.63s/source]
+  ↳ 01_Segment.ipynb | pos001_roi001.tiff: 100%|███| 21/21 [01:21<00:00, 3.88s/cell]
+  ↳ 02_Track.ipynb | pos001_roi001.tiff:   100%|███| 15/15 [02:57<00:00, 10.11s/cell]
+```
+
+With `max_workers > 1` there is no single "current" source, so the source bar
+reports the one that just finished (`done …` / `FAILED …`) and each worker gets a
+bar of its own:
+
+```text
+Sources:  33%|███| 1/3 [04:41<09:23, 281.63s/source]
+  [w1] pos001_roi001.tiff | 02_Track.ipynb:   57%|███| 12/21 [00:32<00:35, 3.91s/cell]
+  [w2] pos002_roi001.tiff | 01_Segment.ipynb: 19%|█  |  4/21 [00:00<00:03, 4.88cell/s]
+```
+
+Those worker bars are drawn by the calling process from progress the workers
+report over a queue. Workers deliberately never draw bars themselves: they share
+one stderr with no shared cursor, so their output would overwrite itself into
+unreadable fragments (particularly in a notebook, whose output area does not
+emulate a terminal cursor).
+
+`stage_progress` controls the per-notebook bars: `"keep"` (default) leaves the
+finished ones on screen as a per-stage timing log, `"collapse"` removes each bar
+once its stage is done, and `"off"` shows only the source bar.

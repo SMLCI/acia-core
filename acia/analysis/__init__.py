@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing
 import os
 import shutil
 import warnings
 from collections.abc import Iterable
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from functools import reduce
 from itertools import starmap
 from multiprocessing import Pool
@@ -27,6 +28,8 @@ from pint._typing import UnitLike
 from tqdm.auto import tqdm
 
 from acia import Q_, U_
+from acia.analysis._scale_progress import _WorkerBars
+from acia.analysis._scale_progress import register_engine as register_progress_engine
 from acia.analysis.growth_rate import AggMode as AggMode
 from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
 from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
@@ -912,6 +915,8 @@ def _scale_execute_one(
     kernel_name,
     storage_parameter_name,
     on_stage=None,
+    stage_progress="keep",
+    progress_queue=None,
 ):
     """Run every analysis script for one image entry.
 
@@ -924,9 +929,28 @@ def _scale_execute_one(
     before it is executed, so the caller can report what is running. Only used on
     the sequential path -- the parallel one runs this in a child process, from
     which the parent's progress bar is not reachable.
+
+    How the per-stage cell progress is displayed depends on where we run:
+
+    * no ``progress_queue`` (sequential) -- papermill draws its own bar in this
+      process, labelled with the stage notebook and the source it runs on.
+    * with a ``progress_queue`` (parallel) -- nothing is drawn here at all; cell
+      progress is reported to the parent, which renders one bar per pool worker.
+      Children must not draw: they share one stderr with no shared cursor, so
+      their bars would overwrite each other (see :mod:`acia.analysis._scale_progress`).
+
+    ``stage_progress`` is :func:`scale`'s parameter of the same name.
     """
     output_parent = Path(job["output_parent"])
     os.makedirs(output_parent, exist_ok=exist_ok)
+
+    engine_name = None
+    progress_key = None
+    if progress_queue is not None and stage_progress != "off":
+        engine_name = register_progress_engine()
+        progress_key = os.getpid()
+    else:
+        progress_queue = None
 
     executions = []
     for src, dst in job["scripts"]:
@@ -937,6 +961,13 @@ def _scale_execute_one(
 
         if on_stage is not None:
             on_stage(dst.name)
+
+        if progress_queue is not None:
+            # report before the copy + kernel start, so the worker's bar shows what
+            # it is about to run instead of staying blank for the kernel boot
+            progress_queue.put(
+                ("stage_start", progress_key, job["label"], dst.name),
+            )
 
         shutil.copy(src, dst)
 
@@ -952,13 +983,41 @@ def _scale_execute_one(
 
         # execute the notebook (its own kernel subprocess; cwd is this process's,
         # which is safe because each worker is a separate process)
-        pm.execute_notebook(
-            dst,
-            dst,
-            parameters=parameters,
-            cwd=dst.parent,
-            kernel_name=kernel_name,
-        )
+        extra: dict[str, Any] = {}
+        if progress_queue is not None:
+            extra = {
+                "progress_bar": False,
+                "engine_name": engine_name,
+                "progress_queue": progress_queue,
+                "progress_key": progress_key,
+            }
+        elif stage_progress == "off":
+            extra = {"progress_bar": False}
+        else:
+            # papermill takes a dict of tqdm kwargs; indent the label so the bar
+            # reads as "cells of this stage" under scale()'s own source bar
+            extra = {
+                "progress_bar": {
+                    "desc": f"  ↳ {dst.name} | {job['label']}",
+                    "leave": stage_progress == "keep",
+                }
+            }
+
+        try:
+            pm.execute_notebook(
+                dst,
+                dst,
+                parameters=parameters,
+                cwd=dst.parent,
+                kernel_name=kernel_name,
+                **extra,
+            )
+        finally:
+            if progress_queue is not None:
+                # papermill closes the reporter itself, but not when it fails
+                # before the notebook manager exists -- make sure the parent's
+                # worker bar is always released
+                progress_queue.put(("stage_end", progress_key))
 
         executions.append(dict(parameters=parameters, storage_folder=dst.parent))
     return executions
@@ -976,6 +1035,7 @@ def scale(
     parameter_name: str = "image_id",
     max_workers: int = 1,
     storage_parameter_name: str | None = "storage_folder",
+    stage_progress: str = "keep",
 ):
     """Scale an analysis notebook to several image sources.
 
@@ -1026,6 +1086,30 @@ def scale(
             dies only fails its own image. On a **single GPU** keep this small
             (2-3): every concurrent run loads its own model, so throughput is
             bounded by GPU memory, not CPU cores.
+        stage_progress (str): how the per-notebook cell progress is shown --
+            ``"keep"`` (default) leaves the finished bars on screen as a per-stage
+            timing log, ``"collapse"`` removes each bar once its stage is done, and
+            ``"off"`` shows only the source bar. See below for what the two levels
+            look like.
+
+    **Progress output.** There are always two levels: one bar counting *sources*,
+    and per-notebook bars counting *cells*. Running sequentially, the source bar is
+    labelled with what is running right now and papermill's own bars sit underneath
+    it::
+
+        01_Segment.ipynb | pos001_roi001.tiff:  33%|███| 1/3 [04:41<09:23, 281.63s/source]
+          ↳ 01_Segment.ipynb | pos001_roi001.tiff: 100%|███| 21/21 [01:21<00:00, 3.88s/cell]
+
+    With ``max_workers > 1`` there is no single "current" source, so the source bar
+    reports the one that just finished and each worker gets its own bar instead::
+
+        Sources:  33%|███| 1/3 [04:41<09:23, 281.63s/source]
+          [w1] pos001_roi001.tiff | 02_Track.ipynb:   57%|███| 12/21 [00:32<00:35, 3.91s/cell]
+          [w2] pos002_roi001.tiff | 01_Segment.ipynb: 19%|█  |  4/21 [00:00<00:03, 4.88cell/s]
+
+    Those worker bars are drawn by *this* process from progress the workers report
+    over a queue -- children never write bars themselves, because they share one
+    stderr with no shared cursor and would overwrite each other.
     """
 
     if execution_naming is None:
@@ -1070,6 +1154,12 @@ def scale(
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
+    if stage_progress not in ("keep", "collapse", "off"):
+        raise ValueError(
+            "stage_progress must be one of 'keep', 'collapse', 'off'; "
+            f"got {stage_progress!r}"
+        )
+
     # Resolve naming + per-entry parameters up front (in this process, so a lambda
     # `execution_naming` still works). Each job is fully picklable for the pool.
     jobs: list[dict[str, Any]] = []
@@ -1113,6 +1203,7 @@ def scale(
                             on_stage=lambda stage, label=job["label"]: (
                                 pbar.set_description(f"{stage} | {label}")
                             ),
+                            stage_progress=stage_progress,
                         )
                     )
                 except pm.PapermillExecutionError:
@@ -1124,7 +1215,29 @@ def scale(
         # outputs). spawn also avoids duplicating a CUDA-initialised parent kernel.
         # Failures are collected here in the parent as each future completes.
         ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+        with contextlib.ExitStack() as stack:
+            # The workers report their progress here instead of drawing bars of
+            # their own (see the "Progress output" note above). A Manager queue is
+            # used because a plain mp.Queue cannot be passed as a submit() argument.
+            progress_queue = None
+            if stage_progress != "off":
+                try:
+                    manager = stack.enter_context(ctx.Manager())
+                    progress_queue = manager.Queue()
+                except Exception:  # pragma: no cover - environment dependent
+                    logger.warning(
+                        "Could not start the progress manager; falling back to the "
+                        "source bar only.",
+                        exc_info=True,
+                    )
+
+            # several sources run at once, so "currently running" is not a single
+            # thing on the source bar: it reports the one that just finished (and
+            # whether it failed). What each worker does right now is on its own bar.
+            bars = _WorkerBars(total_sources=len(jobs), mode=stage_progress)
+            pool = stack.enter_context(
+                ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx)
+            )
             futures = {
                 pool.submit(
                     _scale_execute_one,
@@ -1134,23 +1247,34 @@ def scale(
                     exist_skip,
                     kernel_name,
                     storage_parameter_name,
+                    None,
+                    stage_progress,
+                    progress_queue,
                 ): job
                 for job in jobs
             }
-            # several sources run at once, so "currently running" is not a single
-            # thing: report the one that just finished (and whether it failed)
-            # rather than pretending there is one active source.
-            with tqdm(total=len(futures), unit="source") as pbar:
-                for future in as_completed(futures):
-                    job = futures[future]
-                    status = "done"
-                    try:
-                        experiment_executions.extend(future.result())
-                    except pm.PapermillExecutionError:
-                        failed_ids.append(job["image_id"])
-                        status = "FAILED"
-                    pbar.set_description(f"{status} {job['label']}")
-                    pbar.update(1)
+            try:
+                pending = set(futures)
+                while pending:
+                    # a short timeout instead of as_completed() so the worker bars
+                    # are drained and redrawn while nothing completes
+                    done, pending = wait(
+                        pending, timeout=0.2, return_when=FIRST_COMPLETED
+                    )
+                    if progress_queue is not None:
+                        bars.drain(progress_queue)
+                    for future in done:
+                        job = futures[future]
+                        status = "done"
+                        try:
+                            experiment_executions.extend(future.result())
+                        except pm.PapermillExecutionError:
+                            failed_ids.append(job["image_id"])
+                            status = "FAILED"
+                        bars.advance_total(f"{status} {job['label']}")
+                    bars.tick()
+            finally:
+                bars.close()
 
     if len(failed_ids) > 0:
         error_ratio = len(failed_ids) / len(image_ids) * 100
