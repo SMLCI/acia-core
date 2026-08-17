@@ -108,6 +108,9 @@ def test_record_appends_stages_and_keeps_population(tmp_path):
         "position": 1,
         "roi": 2,
         "image_id": str((tmp_path / "pos001_roi002.tiff").resolve()),
+        # relative to the output folder, so a run survives being moved between
+        # machines -- the absolute path above does not
+        "image_id_relative": "../pos001_roi002.tiff",
     }
 
 

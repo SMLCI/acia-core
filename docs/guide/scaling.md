@@ -42,6 +42,10 @@ verbatim into the notebook parameters) together with an explicit
 Use `max_workers` to run executions in parallel, and `exist_skip=True` to resume
 a partially completed sweep without redoing finished sequences.
 
+`analysis_script` also takes a **list** of notebooks, run in order per source — that is
+how a chain of {doc}`stages <stages>` is scaled over a dataset. Each run then records what
+it read and produced, so `stage_table()` summarises the whole batch afterwards.
+
 ## Progress output
 
 There are always two levels: one bar counting **sources**, and per-notebook bars

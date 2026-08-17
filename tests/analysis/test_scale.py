@@ -236,6 +236,30 @@ def test_scale_rejects_bad_max_workers(tmp_path):
         scale(tmp_path / "out", script, image_ids=[1], max_workers=0)
 
 
+def test_scale_points_the_kernel_at_the_source_notebook(tmp_path):
+    """The template, not the executed copy.
+
+    papermill writes outputs back into the copy as it runs, so every execution
+    folder's copy has different bytes. Hashing those would make the recorded code
+    digest differ per image and destroy the one question it answers -- did this whole
+    batch run the same code?
+    """
+    import os
+
+    from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV
+
+    script = _make_script(tmp_path)
+    seen = []
+
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        exec_nb.side_effect = lambda *a, **k: seen.append(
+            os.environ[STAGE_NOTEBOOK_ENV]
+        )
+        scale(tmp_path / "out", script, image_ids=[1, 2])
+
+    assert seen == [str(script), str(script)]  # the template, for both images
+
+
 def test_scale_rejects_bad_stage_progress(tmp_path):
     script = _make_script(tmp_path)
     with pytest.raises(ValueError):

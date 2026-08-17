@@ -10,6 +10,7 @@ these pages are meant to be entered from the middle — read the one you need.
 remote-sources
 slicing-and-calibration
 units
+stages
 scaling
 /glossary
 ```

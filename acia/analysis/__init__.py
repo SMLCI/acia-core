@@ -30,14 +30,19 @@ from tqdm.auto import tqdm
 from acia import Q_, U_
 from acia.analysis._scale_progress import _WorkerBars
 from acia.analysis._scale_progress import register_engine as register_progress_engine
+from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV
 from acia.analysis.growth_rate import AggMode as AggMode
 from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
 from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
 from acia.analysis.stage import DEFAULT_KEY_PATTERN as DEFAULT_KEY_PATTERN
+from acia.analysis.stage import IO_SCHEMA as IO_SCHEMA
 from acia.analysis.stage import MANIFEST_NAME as MANIFEST_NAME
 from acia.analysis.stage import StageContext as StageContext
+from acia.analysis.stage import check_stale as check_stale
 from acia.analysis.stage import population_id_of as population_id_of
 from acia.analysis.stage import read_manifest as read_manifest
+from acia.analysis.stage import stage_graph as stage_graph
+from acia.analysis.stage import stage_table as stage_table
 from acia.analysis.stage import stages_run as stages_run
 from acia.analysis.units import UNIT_ATTR, units_in_header
 from acia.analysis.units import attach_units as attach_units
@@ -1002,6 +1007,18 @@ def _scale_execute_one(
                     "leave": stage_progress == "keep",
                 }
             }
+
+        # Tell the kernel which notebook it is running, so StageContext can record
+        # the code that produced a result (a kernel cannot know this otherwise).
+        # An env var rather than a papermill parameter: it needs no `parameters`
+        # cell in the notebook and raises no "unknown parameter" warning.
+        #
+        # The *source* notebook, not the copy being executed: papermill writes
+        # outputs back into `dst` as it runs, so every execution folder's copy has
+        # different bytes. Hashing those would make the digest differ per image and
+        # destroy the one question it exists to answer -- did this batch all run the
+        # same code?
+        os.environ[STAGE_NOTEBOOK_ENV] = str(src)
 
         try:
             pm.execute_notebook(
