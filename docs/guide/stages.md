@@ -63,16 +63,17 @@ took and which version of the notebook produced it:
   "started_at": "2026-08-17T09:10:41+00:00",
   "finished_at": "2026-08-17T09:12:03+00:00",
   "duration_s": 82.4,
-  "code": {"notebook": "02_Track.ipynb", "mtime": "…", "sha256": "9f2c…"},
+  "code": {"notebook": "02_Track.ipynb", "mtime": "2026-08-16T17:02:55+00:00",
+           "sha256": "9f2c…"},
   "env": {"python": "3.10.14", "platform": "Linux-5.15…", "host": "gpu-node-3"},
   "io": {
     "schema": "acia.stage_io/v1",
     "inputs": [
-      {"path": "../pos001_roi001.tiff", "size": 4120233, "mtime": 1755…},
-      {"path": "segmentation.npz", "size": 88401, "mtime": 1755…,
+      {"path": "../pos001_roi001.tiff", "size": 4120233, "mtime": 1786951087},
+      {"path": "segmentation.npz", "size": 88401, "mtime": 1786956912,
        "produced_by": "Segment"}
     ],
-    "outputs": [{"path": "tracking/", "size": 1044, "mtime": 1755…}]
+    "outputs": [{"path": "tracking/", "size": 1044, "mtime": 1786957923}]
   }
 }
 ```
