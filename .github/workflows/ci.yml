@@ -24,8 +24,11 @@ jobs:
           cache: pip
       # pinned for deterministic lint/format (must match pre-commit + dev extra)
       - run: pip install ruff==0.15.15
-      - run: ruff check acia tests
-      - run: ruff format --check acia tests
+      # docs/ is included because ruff lints .ipynb by default -- the tutorial
+      # notebooks under docs/tutorials/ are real source and regress like any
+      # other code. Matches .gitlab-ci.yml and .pre-commit-config.yaml.
+      - run: ruff check acia tests docs
+      - run: ruff format --check acia tests docs
 
   # mypy is clean; pinned for deterministic results (must match pre-commit)
   typecheck:
@@ -55,7 +58,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: pip install -e .
-      - run: pip install pytest pytest-cov pytest-sugar
+      # ipykernel provides the "python3" kernelspec. tests/analysis/test_scale.py
+      # runs notebooks through papermill with kernel_name="python3" and fails
+      # with jupyter_client.kernelspec.NoSuchKernel without it. It is not a core
+      # dependency, so a bare CI environment does not get it -- unlike a
+      # developer machine, where Jupyter is invariably already installed.
+      - run: pip install pytest pytest-cov pytest-sugar ipykernel
       - run: pytest --cov=acia --cov-report=xml
       # Optional: enable once a Codecov token/badge is set up
       # - uses: codecov/codecov-action@v4

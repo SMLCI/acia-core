@@ -11,14 +11,16 @@ def strfdelta(tdelta, fmt="{D:02}d {H:02}h {M:02}m {S:02}s", inputtype="timedelt
     The fmt argument allows custom formatting to be specified.  Fields can
     include seconds, minutes, hours, days, and weeks.  Each field is optional.
 
-    Some examples:
+    Some examples::
+
         '{D:02}d {H:02}h {M:02}m {S:02}s' --> '05d 08h 04m 02s' (default)
         '{W}w {D}d {H}:{M:02}:{S:02}'     --> '4w 5d 8:04:02'
         '{D:2}d {H:2}:{M:02}:{S:02}'      --> ' 5d  8:04:02'
         '{H}h {S}s'                       --> '72h 800s'
 
     The inputtype argument allows tdelta to be a regular number instead of the
-    default, which is a datetime.timedelta object.  Valid inputtype strings:
+    default, which is a datetime.timedelta object.  Valid inputtype strings::
+
         's', 'seconds',
         'm', 'minutes',
         'h', 'hours',

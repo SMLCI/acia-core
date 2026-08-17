@@ -22,9 +22,16 @@ stages:
 lint:
   stage: lint
   script:
-    - pip install ruff
-    - ruff check acia tests
-    - ruff format --check acia tests
+    # PINNED, and it must stay pinned: an unpinned ruff silently upgrades under
+    # you and changes what "formatted" means. ruff 0.16 began formatting Python
+    # code blocks inside Markdown, which reformats the illustrative snippets in
+    # docs/*.md and fails this job on a green working tree. Keep in lockstep with
+    # .github/workflows/ci.yml and .pre-commit-config.yaml.
+    - pip install ruff==0.15.15
+    # docs/ is included because ruff lints .ipynb by default -- the tutorial
+    # notebooks are real source and regress like any other code.
+    - ruff check acia tests docs
+    - ruff format --check acia tests docs
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
@@ -33,7 +40,11 @@ lint:
 typecheck:
   stage: lint
   script:
-    - pip install mypy
+    # PINNED to match .github/workflows/ci.yml and .pre-commit-config.yaml.
+    # Unpinned, this job installs whatever mypy is current -- mypy 2.x reports 5
+    # errors in acia/notebook.py that 1.19.1 does not, so the job goes orange for
+    # reasons unrelated to the commit that triggered it.
+    - pip install mypy==1.19.1
     - mypy acia --ignore-missing-imports
   allow_failure: true  # Start permissive, remove once types are added
   rules:
@@ -80,8 +91,9 @@ test:
       paths:
         - test_resources/
   script:
-    # test dependencies
-    - pip install pytest pytest-sugar pytest-cov python-dotenv unittest-xml-reporting
+    # test dependencies. ipykernel provides the "python3" kernelspec that
+    # tests/analysis/test_scale.py needs to run notebooks through papermill.
+    - pip install pytest pytest-sugar pytest-cov python-dotenv unittest-xml-reporting ipykernel
     - pip install git+https://github.com/JojoDevel/trackastra.git
     - pip install laptrack
     # install the pre-built wheel from build job
@@ -103,13 +115,52 @@ test:
         path: coverage.xml
       junit: report.xml
 
-# Deploy documentation to GitLab Pages
+# Build the documentation and publish it to GitLab Pages.
+#
+# The tutorials under docs/tutorials/ are committed WITHOUT outputs and executed
+# by myst-nb during the build, so this job needs everything they import -- which
+# is why it installs the package itself plus a segmentation backend, unlike the
+# job that used to live here (it installed neither `acia`, which docs/conf.py
+# imports for __version__, nor myst-parser, so it cannot have worked).
+#
+# Only ONE segmentation backend can be installed: cellpose<4, cellpose>=4 and
+# omnipose pin conflicting versions. The getting-started path uses Omnipose,
+# which runs the tutorial in about a minute on a CPU, so this job does not
+# actually need the GPU runner -- it just benefits from it.
+#
+# Note this publishes a SECOND copy of the site; GitHub Pages
+# (https://smlci.github.io/acia-core) remains the URL declared in
+# pyproject.toml's [project.urls]. Keep them from drifting.
 pages:
   stage: deploy
+  # Omnipose pins numpy<2 / scipy==1.11.4 and does not support 3.12.
+  image: python:3.10
+  tags:
+    - biggpu
+  variables:
+    # GitLab can only cache paths inside CI_PROJECT_DIR, so move the model
+    # store (default ~/.cellpose/models) into the project. Omnipose shares that
+    # directory and honours the same environment variable.
+    CELLPOSE_LOCAL_MODELS_PATH: "$CI_PROJECT_DIR/.cellpose-models"
+  cache:
+    - key: pip-${CI_JOB_IMAGE}
+      paths:
+        - .cache/pip/
+    # ~20 MB of individual frames the notebooks fetch over WebDAV
+    - key: docs-tutorial-data-colony-v1
+      paths:
+        - docs/tutorials/data/
+    - key: docs-omnipose-weights-v1
+      paths:
+        - .cellpose-models/
+    # myst-nb re-executes only notebooks whose source changed
+    - key: docs-jupyter-cache-v1
+      paths:
+        - docs/_build/.jupyter_cache/
   script:
-    - pip install sphinx sphinx-rtd-theme pint
-    - cd docs && make html
-    - mv _build/html/ ../public/
+    - pip install -e ".[docs,omnipose]" --use-pep517
+    # -W: the build must stay warning-free, exactly as it does on GitHub
+    - sphinx-build -b html -W --keep-going docs public
   artifacts:
     paths:
       - public

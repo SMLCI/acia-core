@@ -236,6 +236,70 @@ def test_scale_rejects_bad_max_workers(tmp_path):
         scale(tmp_path / "out", script, image_ids=[1], max_workers=0)
 
 
+def test_scale_points_the_kernel_at_the_source_notebook(tmp_path):
+    """The template, not the executed copy.
+
+    papermill writes outputs back into the copy as it runs, so every execution
+    folder's copy has different bytes. Hashing those would make the recorded code
+    digest differ per image and destroy the one question it answers -- did this whole
+    batch run the same code?
+    """
+    import os
+
+    from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV
+
+    script = _make_script(tmp_path)
+    seen = []
+
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        exec_nb.side_effect = lambda *a, **k: seen.append(
+            os.environ[STAGE_NOTEBOOK_ENV]
+        )
+        scale(tmp_path / "out", script, image_ids=[1, 2])
+
+    assert seen == [str(script), str(script)]  # the template, for both images
+
+
+def test_scale_rejects_bad_stage_progress(tmp_path):
+    script = _make_script(tmp_path)
+    with pytest.raises(ValueError):
+        scale(tmp_path / "out", script, image_ids=[1], stage_progress="louder")
+
+
+def test_scale_labels_the_papermill_cell_bar(tmp_path):
+    """The per-notebook bar says which stage runs on which source, not "Executing"."""
+    stages = []
+    for name in ("01_Segment.ipynb", "02_Track.ipynb"):
+        stage = tmp_path / name
+        stage.write_text("{}")
+        stages.append(stage)
+
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        scale(tmp_path / "out", stages, image_ids=["/data/exp/pos1_roi2.tiff"])
+
+    bars = [call.kwargs["progress_bar"] for call in exec_nb.call_args_list]
+    assert bars == [
+        {"desc": "  ↳ 01_Segment.ipynb | pos1_roi2.tiff", "leave": True},
+        {"desc": "  ↳ 02_Track.ipynb | pos1_roi2.tiff", "leave": True},
+    ]
+
+
+def test_scale_stage_progress_collapse_does_not_leave_bars(tmp_path):
+    script = _make_script(tmp_path)
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        scale(tmp_path / "out", script, image_ids=[1], stage_progress="collapse")
+
+    assert exec_nb.call_args_list[0].kwargs["progress_bar"]["leave"] is False
+
+
+def test_scale_stage_progress_off_disables_the_cell_bar(tmp_path):
+    script = _make_script(tmp_path)
+    with patch("acia.analysis.pm.execute_notebook") as exec_nb:
+        scale(tmp_path / "out", script, image_ids=[1], stage_progress="off")
+
+    assert exec_nb.call_args_list[0].kwargs["progress_bar"] is False
+
+
 def test_scale_storage_parameter_name_none_omits_it(tmp_path):
     script = _make_script(tmp_path)
     out = tmp_path / "out"

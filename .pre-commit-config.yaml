@@ -1,4 +1,8 @@
-exclude: ^(docs)/
+# Only the generated/derived parts of docs/ are exempt. The hand-written pages
+# and the tutorial notebooks under docs/ are checked like any other source --
+# in particular check-added-large-files, which is what stops a notebook full of
+# embedded video from ever being committed.
+exclude: ^docs/(_build|api/generated|tutorials/data)/
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
@@ -9,6 +13,14 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-added-large-files
+
+  # Tutorial notebooks are committed as SOURCE ONLY. Outputs are produced by the
+  # docs build (myst-nb executes every notebook), so nothing binary -- rendered
+  # videos, base64 PNGs, embedded figures -- ever enters git history.
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
 
   - repo: https://github.com/asottile/pyupgrade
     rev: v3.17.0

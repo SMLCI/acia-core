@@ -3,6 +3,12 @@ name: Docs
 on:
   push:
     branches: [master, main]
+  pull_request:
+    paths:
+      - "docs/**"
+      - "acia/**"
+      - "pyproject.toml"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
@@ -10,28 +16,95 @@ permissions:
   pages: write
   id-token: write
 
-# allow only one concurrent Pages deployment
+# Per-ref, so a pull-request docs build never queues behind (or blocks) a
+# deployment. The deploy job below takes the single global "pages" lock instead.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-deploy:
+  # Building is separate from deploying so that a pull request can produce a
+  # reviewable site without touching GitHub Pages -- and without being gated by
+  # the github-pages environment, whose deployment-branch rules would otherwise
+  # apply to the build too.
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Omnipose pins numpy<2 / scipy==1.11.4 and does not support 3.12.
+          python-version: "3.10"
           cache: pip
-      - run: pip install -e .[docs]
-      - run: make -C docs html
+
+      # The tutorials under docs/tutorials/ are committed WITHOUT outputs and
+      # executed here by myst-nb, so this job needs everything they import.
+      # Only ONE segmentation backend can be installed (cellpose<4, cellpose>=4
+      # and omnipose pin conflicting versions) -- the getting-started path uses
+      # Omnipose, whose bact_phase_omni model is both the right one for phase
+      # contrast bacteria and cheap enough to run on a CPU runner (~3 s/frame,
+      # vs Cellpose-SAM which does not finish 5 frames in 10 minutes).
+      - run: pip install -e ".[docs,omnipose]" --use-pep517
+
+      # ~20 MB of individual frames, fetched over WebDAV by the notebooks.
+      - name: Cache tutorial sample data
+        uses: actions/cache@v4
+        with:
+          path: docs/tutorials/data
+          key: tutorial-data-colony-v1
+
+      # bact_phase_omni weights (~25 MB) are fetched on first model load.
+      - name: Cache segmentation model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cellpose
+          key: omnipose-weights-v1
+
+      # myst-nb only re-executes notebooks whose source changed. The cache path
+      # is pinned in docs/conf.py (nb_execution_cache_path) so it does not move
+      # with the output directory.
+      - name: Cache notebook execution
+        uses: actions/cache@v4
+        with:
+          path: docs/_build/.jupyter_cache
+          key: jupyter-cache-${{ hashFiles('docs/tutorials/*.ipynb', 'pyproject.toml') }}
+          restore-keys: jupyter-cache-
+
+      - name: Build docs
+        run: sphinx-build -b html -W --keep-going docs docs/_build/html
+
+      # A plain zip anyone can download and open locally -- this is how you
+      # review the rendered site for a pull request, since PRs do not deploy.
+      - name: Upload browsable HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-html
+          path: docs/_build/html
+          retention-days: 14
+
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+        with:
+          # Create the Pages site on first run rather than requiring someone to
+          # flip Settings -> Pages -> Source to "GitHub Actions" by hand.
+          enablement: true
+
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: docs/_build/html
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The one global lock: only a single Pages deployment at a time.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
         uses: actions/deploy-pages@v4

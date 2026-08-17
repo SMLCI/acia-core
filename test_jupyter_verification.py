@@ -2,7 +2,9 @@
 """Test script to verify Jupyter notebook visualization functionality."""
 
 import numpy as np
+
 from acia.segm.local import THWCSequenceSource
+
 
 def test_basic_functionality():
     """Test basic visualization functionality."""
@@ -13,7 +15,7 @@ def test_basic_functionality():
     print("Creating THWCSequenceSource...")
     src = THWCSequenceSource(test_data)
 
-    print(f"Source properties:")
+    print("Source properties:")
     print(f"  - Number of frames (size_t): {src.size_t}")
     print(f"  - Number of channels: {src.num_channels}")
     print(f"  - Has _repr_html_: {hasattr(src, '_repr_html_')}")
@@ -29,6 +31,7 @@ def test_basic_functionality():
 
     print("\n✅ All basic checks passed!")
     return True
+
 
 if __name__ == "__main__":
     success = test_basic_functionality()
