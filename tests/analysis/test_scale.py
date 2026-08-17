@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import papermill as pm
 import pytest
 
 from acia.analysis import _source_label, default_execution_naming, scale
@@ -317,3 +318,107 @@ def test_scale_storage_parameter_name_custom(tmp_path):
     params = exec_nb.call_args_list[0].kwargs["parameters"]
     assert "storage_folder" not in params
     assert params["output_folder"].endswith("execution_1")
+
+
+# --- failure isolation and kernel-start retry ---------------------------------
+#
+# scale() used to catch only PapermillExecutionError ("a cell raised"). A kernel
+# that never starts raises a bare RuntimeError, which escaped and aborted the
+# whole batch -- the sources after the failing one were never attempted.
+
+
+def _kernel_died():
+    return RuntimeError("Kernel died before replying to kernel_info")
+
+
+def test_scale_isolates_kernel_start_failure(tmp_path):
+    """A kernel that never starts fails its own source, not the batch."""
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+
+    def flaky(*args, **kwargs):
+        if kwargs["parameters"]["image_id"] == 2:
+            raise _kernel_died()
+
+    with patch("acia.analysis.pm.execute_notebook", side_effect=flaky) as exec_nb:
+        scale(out, script, image_ids=[1, 2, 3])
+
+    # every source was attempted (the retry gives the failing one two calls)
+    attempted = [c.kwargs["parameters"]["image_id"] for c in exec_nb.call_args_list]
+    assert sorted(set(attempted)) == [1, 2, 3]
+    assert (out / "execution_1").is_dir()
+    assert (out / "execution_3").is_dir()
+
+
+def test_scale_isolates_arbitrary_failure(tmp_path):
+    """Any exception is isolated, not just papermill's own."""
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+
+    def flaky(*args, **kwargs):
+        if kwargs["parameters"]["image_id"] == 1:
+            raise OSError("no space left on device")
+
+    with patch("acia.analysis.pm.execute_notebook", side_effect=flaky) as exec_nb:
+        scale(out, script, image_ids=[1, 2])
+
+    attempted = [c.kwargs["parameters"]["image_id"] for c in exec_nb.call_args_list]
+    assert attempted == [1, 2]
+
+
+def test_scale_retries_a_kernel_that_failed_to_start(tmp_path):
+    """One transient kernel-start failure is retried, and the source succeeds."""
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _kernel_died()
+
+    with patch("acia.analysis.pm.execute_notebook", side_effect=flaky):
+        result = scale(out, script, image_ids=[1])
+
+    assert calls["n"] == 2  # failed once, retried once, succeeded
+    assert len(result) == 1  # counted as a success, not a failure
+
+
+def test_scale_does_not_retry_a_cell_error(tmp_path):
+    """A notebook whose cell raised is a real failure -- re-running it is waste."""
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+    calls = {"n": 0}
+
+    def always_fails(*args, **kwargs):
+        calls["n"] += 1
+        raise pm.PapermillExecutionError(
+            exec_count=1,
+            source="1/0",
+            ename="ZeroDivisionError",
+            evalue="division by zero",
+            traceback=[],
+        )
+
+    with patch("acia.analysis.pm.execute_notebook", side_effect=always_fails):
+        result = scale(out, script, image_ids=[1])
+
+    assert calls["n"] == 1
+    assert result == []
+
+
+def test_scale_gives_up_after_the_kernel_retry(tmp_path):
+    """A kernel that never starts at all is isolated once the retry is spent."""
+    script = _make_script(tmp_path)
+    out = tmp_path / "out"
+    calls = {"n": 0}
+
+    def always_dies(*args, **kwargs):
+        calls["n"] += 1
+        raise _kernel_died()
+
+    with patch("acia.analysis.pm.execute_notebook", side_effect=always_dies):
+        result = scale(out, script, image_ids=[1, 2])
+
+    assert calls["n"] == 4  # two sources x (initial attempt + one retry)
+    assert result == []
