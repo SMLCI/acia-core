@@ -278,6 +278,19 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- `scale()` aborted the whole batch when a notebook's kernel failed to start.
+  Both the sequential and the parallel path caught only
+  `papermill.PapermillExecutionError` — which means "a cell raised" — while a
+  kernel that never becomes ready raises a bare `RuntimeError`
+  (`Kernel died before replying to kernel_info`). That escaped, so the sources
+  after the failing one were never attempted, losing a whole overnight batch to
+  one transient hiccup. Every exception is now isolated to its own source, and
+  the exception is logged: `failed_ids` only carries the id, so the closing
+  summary could report how many sources failed but never why. A kernel that
+  fails to start is additionally retried once — the handshake fails before any
+  cell runs, so re-executing repeats no work and duplicates no side effect,
+  which turns a lost stage into a slow one. A kernel that dies *mid*-notebook
+  raises `DeadKernelError` and is not retried, since cells have already run.
 - `merge_cells_to_colonies()` gave every blob in a frame the same id (`-1`), and
   `ExtractorExecutor.execute()` joins extractor results on that id index — a join
   on a non-unique index is a cartesian product, so *k* blobs became *k*⁶ rows and

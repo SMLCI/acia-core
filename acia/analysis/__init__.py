@@ -912,6 +912,74 @@ def _source_label(image_id, name: str) -> str:
     return name
 
 
+# jupyter_client raises a bare RuntimeError with one of these messages when a
+# kernel never becomes ready (KernelClient.wait_for_ready). All three mean the
+# handshake failed *before* any cell ran, so re-executing the notebook repeats no
+# work and has no side effect to duplicate -- which is what makes retrying safe.
+# A kernel that dies mid-notebook raises DeadKernelError instead and is NOT
+# retried here, because cells have already run.
+_KERNEL_START_FAILURES = (
+    "Kernel died before replying to kernel_info",
+    "Kernel didn't respond in",
+    "Kernel didn't respond to heartbeats in",
+)
+
+
+def _is_kernel_start_failure(exc: BaseException) -> bool:
+    """Did this exception come from a kernel that never started?
+
+    Matched on the message because jupyter_client raises a plain ``RuntimeError``
+    for all three cases rather than a dedicated exception class.
+    """
+    if not isinstance(exc, RuntimeError):
+        return False
+    return any(msg in str(exc) for msg in _KERNEL_START_FAILURES)
+
+
+def _execute_notebook(*args, kernel_start_retries: int = 1, **kwargs) -> None:
+    """``papermill.execute_notebook`` that retries a kernel which never started.
+
+    Starting a kernel is occasionally flaky under load -- observed in CI as
+    ``RuntimeError: Kernel died before replying to kernel_info`` on one image of a
+    batch. Nothing has executed at that point, so one more attempt is cheap and
+    turns a lost stage into a slow one.
+    """
+    for attempt in range(kernel_start_retries + 1):
+        try:
+            pm.execute_notebook(*args, **kwargs)
+            return
+        except Exception as exc:
+            if attempt >= kernel_start_retries or not _is_kernel_start_failure(exc):
+                raise
+            logger.warning(
+                "The kernel for %s failed to start (%s); retrying (attempt %d/%d).",
+                args[0] if args else kwargs.get("input_path"),
+                exc,
+                attempt + 2,
+                kernel_start_retries + 1,
+            )
+
+
+def _record_failure(failed_ids: list, job: dict) -> None:
+    """Isolate one source's failure from the rest of the batch.
+
+    Every exception is isolated, not only ``PapermillExecutionError``. That one
+    means "a cell raised"; a kernel that fails to start raises a bare
+    ``RuntimeError``, and letting it escape aborted the whole batch -- the
+    remaining sources were never attempted, which is exactly what running each
+    source independently is supposed to prevent.
+
+    The exception is logged here because ``failed_ids`` only carries the id: the
+    summary at the end of :func:`scale` can say how many sources failed, never why.
+    """
+    logger.warning(
+        "Scaling failed for %s; continuing with the remaining sources.",
+        job["label"],
+        exc_info=True,
+    )
+    failed_ids.append(job["image_id"])
+
+
 def _scale_execute_one(
     job,
     additional_parameters,
@@ -1021,7 +1089,7 @@ def _scale_execute_one(
         os.environ[STAGE_NOTEBOOK_ENV] = str(src)
 
         try:
-            pm.execute_notebook(
+            _execute_notebook(
                 dst,
                 dst,
                 parameters=parameters,
@@ -1223,8 +1291,8 @@ def scale(
                             stage_progress=stage_progress,
                         )
                     )
-                except pm.PapermillExecutionError:
-                    failed_ids.append(job["image_id"])
+                except Exception:
+                    _record_failure(failed_ids, job)
     else:
         # Run several notebooks in parallel. A *process* pool (spawn) is required,
         # not threads: papermill sets the working directory with a process-global
@@ -1285,8 +1353,8 @@ def scale(
                         status = "done"
                         try:
                             experiment_executions.extend(future.result())
-                        except pm.PapermillExecutionError:
-                            failed_ids.append(job["image_id"])
+                        except Exception:
+                            _record_failure(failed_ids, job)
                             status = "FAILED"
                         bars.advance_total(f"{status} {job['label']}")
                     bars.tick()
