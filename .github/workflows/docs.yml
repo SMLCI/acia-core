@@ -9,6 +9,9 @@ on:
       - "acia/**"
       - "pyproject.toml"
       - ".github/workflows/docs.yml"
+      # docs/changelog.md includes this file, so a changelog edit can break the
+      # -W build. Without it here, that only surfaced on a push to main.
+      - "CHANGELOG.md"
   workflow_dispatch:
 
 permissions:
