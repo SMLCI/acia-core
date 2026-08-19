@@ -195,6 +195,20 @@ whole module stays importable without `anywidget` installed):
   triple used directly, a number mapped through `cmap`, anything else categorical.
 
 **Segmentation**:
+- Three new backends, each a `SegmentationProcessor` subclass behind its own
+  optional-dependency extra: `StarDistSegmenter` (`acia.segm.processor.stardist`,
+  `stardist` extra) wraps StarDist's star-convex instance segmentation — no
+  bacteria-specific pretrained model exists upstream, so it's a contrast baseline
+  for round/oval targets rather than a primary bacterial segmenter;
+  `MicroSAMSegmenter` (`acia.segm.processor.microsam`, `microsam` extra) wraps
+  micro-sam's (μSAM) AIS automatic-instance-segmentation path via the
+  light-microscopy-finetuned `vit_b_lm` checkpoint by default; `DeltaSegmenter`
+  (`acia.segm.processor.delta`, `delta` extra) wraps DeLTA 3.x's segmentation
+  U-Net only (no tracking model touched), selectable by imaging `regime`
+  (`"2D"` agar-pad vs `"mothermachine"`), targeting the torch backend so it
+  shares a torch stack with Cellpose/Omnipose instead of pulling in
+  TensorFlow. See
+  `_bmad-output/implementation-artifacts/spec-additional-segmentation-backends.md`.
 - `FlowposeRTSegmenter` (`acia.segm.processor.flowpose_rt`): omnipose-compatible
   segmentation backed by the lightweight `flowpose-rt` package (no
   cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.

@@ -121,6 +121,23 @@ omnipose = [
 # at runtime). Not on PyPI yet -- install the flowpose-rt package from source
 # (e.g. `pip install ../flowpose-rt`) until it's published.
 flowpose-rt = ["flowpose-rt", "torch"]
+# stardist: TensorFlow/Keras-based, no torch. Has no HARD pin conflict with the
+# torch-based backends above, but still install it into its own environment --
+# running TensorFlow and torch's respective CUDA/cuDNN stacks side by side in
+# one env is a common source of GPU init failures even without a pip conflict.
+# No bacteria-specific pretrained model exists; its star-convex shape prior
+# fits round cells/nuclei much better than elongated rod-shaped bacteria.
+stardist = ["stardist", "tensorflow"]
+# micro-sam (μSAM): SAM-based light-microscopy foundation model. pip works but
+# the project recommends conda/mamba (native vigra/nifty deps); see
+# acia-workflows-lab/notebooks/segmentation_comparison/README.md for the
+# conda-forge install this extra doesn't cover.
+microsam = ["micro_sam"]
+# DeLTA 3.x (package `delta-microscopy`, import name `delta`): targets the
+# torch backend deliberately, so it shares a torch stack with the backends
+# above instead of pulling in TensorFlow (v3 rewrote DeLTA on Keras 3 as a
+# multi-backend model -- tf/torch/jax are now interchangeable extras upstream).
+delta = ["delta-microscopy[torch-cpu]"]
 
 [project.scripts]
 acia = "acia.cli:main"
