@@ -343,6 +343,19 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- Tracking input was **silently misaligned** for any overlay whose first
+  detection was not on frame 0. `overlay_to_masks` built its stack from
+  `Overlay.timeIterator()`, which starts at the first *populated* frame, so an
+  overlay beginning on frame 3 handed the tracker frame 3's cells as frame 0 —
+  associating every cell against the wrong image. Frames are now indexed
+  absolutely. Overlays from `load_segmentation(path, source)` carry an explicit
+  frame extent and were never affected. `write_ctc_tracking` had the same bug in
+  its `man_track{i:04d}.tif` numbering, and is fixed the same way.
+- `overlay_to_masks` on an empty overlay raised
+  `ValueError: zero-size array to reduction operation minimum`; it now returns an
+  empty `(0, height, width)` stack.
+- Label values above 65535 silently wrapped in the `uint16` mask stack. The stack
+  now widens to `uint32` when any label needs it.
 - Cropping a drift-corrected source with an ROI drawn on a frame other than the
   registration reference placed the crop off by the drift accumulated up to
   that frame — silently, and worse the later the frame. The ROI's
@@ -476,6 +489,33 @@ warning-free under `-W`.
 
   `render_tracking` output is byte-identical; `render_tracking_mask` differs by
   at most 1/255 per channel, from blending in uint8 instead of float32.
+
+- Overlay → label-mask rasterisation, the conversion every tracking backend runs
+  before it can start (`overlay_to_masks`, used by `TrackastraTracker`,
+  `LapTrack*`, `PyUATTracker`, `UltrackTracker`), plus `Overlay.toMasks`, the two
+  CTC exporters and fluorescence extraction. Each rasterised **every cell over
+  the whole frame** and combined the results with `np.maximum`, so cost tracked
+  `n_cells × frame area` with 3–5 frame-sized temporaries per cell. The shared
+  fast path from the viz work (`_frame_label_mask`) now lives in
+  `acia.segm.rasterize` and backs all of them.
+
+      overlay_to_masks 1024², 5×150 cells, Contour-backed:  1.70 → 0.031 s  (55×)
+      overlay_to_masks 1024², 5×150 cells, Instance-backed: 0.27 → 0.010 s  (27×)
+
+  The `Contour`-backed figure is the one that matters after `load_segmentation`,
+  which returns polygon-backed detections: those went through a full-frame
+  `rasterio` pass *per cell*. A frame of polygons is now burned in a single
+  `rasterio` call, and mask-backed instances are written through their cached
+  bounding box. Output is byte-identical — polygons keep rasterio's pixel-centre
+  rule via the new `exact_polygons` flag rather than taking the renderers'
+  `cv2.fillPoly` shortcut, which fills inclusively and would have dilated every
+  cell by a pixel (~+11% area on bacterium-sized cells).
+
+  Fluorescence extraction additionally stopped re-decoding the channel inside the
+  per-cell loop (`image.get_channel()` ran once per cell *per channel*) and now
+  gathers each cell's pixels inside its bounding box instead of building a
+  frame-sized `np.ma.masked_array`. Values are unchanged.
+
 
 ## [0.3.2] - 2025-10-27
 

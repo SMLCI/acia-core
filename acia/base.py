@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import logging
 import multiprocessing
@@ -650,29 +649,41 @@ class Overlay:
         height: height of the image
         width: width of the image
         """
+        # deferred: acia.segm.rasterize imports acia.base
+        from acia.segm.rasterize import contour_labels, frame_label_mask
+
         masks = []
         for timeOverlay in self.timeIterator():
+            conts = list(timeOverlay)
+
             if binary_mask:
-                local_mask = np.zeros((height, width), dtype=bool)
+                # every contour counts towards the union regardless of its
+                # label, so number them positionally rather than by label -- a
+                # contour labelled 0 would otherwise vanish from the union
+                local_mask = (
+                    frame_label_mask(
+                        conts,
+                        height=height,
+                        width=width,
+                        labels=range(1, len(conts) + 1),
+                        exact_polygons=True,
+                    )
+                    > 0
+                )
             else:
-                # non-binary
-                local_mask = np.zeros((height, width), dtype=np.uint16)
-
-            # combine all contours in one mask
-            for i, cont in enumerate(timeOverlay):
-                mask = cont.toMask(height=height, width=width)
-                if not binary_mask:
-                    label = i + 1
-                    if cont.label is not None:
-                        with contextlib.suppress(ValueError):
-                            label = int(cont.label)
-
-                    mask = mask.astype(np.uint16) * (
-                        label
-                    )  # convert into a non-binary mask
-
-                # combine into a single mask
-                local_mask = np.maximum(mask, local_mask)
+                labels = contour_labels(conts, enumerate_fallback=True)
+                max_label = max(labels, default=0)
+                dtype = np.uint16 if max_label < np.iinfo(np.uint16).max else np.uint32
+                # exact_polygons: this is the documented rasterisation of an
+                # overlay, so polygons keep the pixel-centre rule they had when
+                # every cell was rasterized over the whole frame
+                local_mask = frame_label_mask(
+                    conts,
+                    height=height,
+                    width=width,
+                    labels=labels,
+                    exact_polygons=True,
+                ).astype(dtype)
 
             # append frame mask to list of masks
             masks.append(local_mask)

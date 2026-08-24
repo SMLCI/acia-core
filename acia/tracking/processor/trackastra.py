@@ -40,8 +40,16 @@ class TrackastraTracker(TrackingProcessor):
             # strip off last because it should not be used
             imgs = imgs[..., 0]
 
-        if segmentation.numFrames() != len(masks):
-            logging.warning("Number of segmented frames and masks is unequal!")
+        # the masks are indexed by absolute frame, so this compares what
+        # actually has to line up: a mismatch here means the tracker would
+        # associate cells against the wrong images
+        if len(masks) != len(imgs):
+            logging.warning(
+                "Segmentation spans %d frames but the image source has %d; "
+                "tracking will run on the overlapping frames only.",
+                len(masks),
+                len(imgs),
+            )
 
         # perform the actual tracking
         track_graph, tracked_masks = self.model.track(imgs, masks, mode=self.mode)

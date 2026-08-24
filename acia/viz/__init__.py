@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import numbers
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -28,8 +27,16 @@ from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 from acia import ureg
-from acia.base import BaseImage, ImageSequenceSource, Instance, Overlay
+from acia.base import BaseImage, ImageSequenceSource, Overlay
 from acia.segm.local import InMemorySequenceSource, LocalImage, THWCSequenceSource
+
+# The fast rasterisation the mask renderers are built on lives in
+# acia.segm.rasterize, shared with the tracking processors, the CTC exporters
+# and the fluorescence extractor -- each of which used to carry its own copy of
+# the slow per-cell loop. Imported under the original private names so the call
+# sites here and tests/viz/test_mask_rasterization.py are unaffected.
+from acia.segm.rasterize import contour_labels as _contour_labels
+from acia.segm.rasterize import frame_label_mask as _frame_label_mask
 
 from .compose import ComposedSequenceSource as ComposedSequenceSource
 from .compose import compose_sequences as compose_sequences
@@ -988,104 +995,6 @@ def _to_uint8_rgb(image: np.ndarray) -> np.ndarray:
     # caller's array untouched for an already-contiguous uint8 RGB frame, and
     # the subsequent in-place cv2 drawing would then corrupt the source data.
     return np.array(im, dtype=np.uint8, order="C", copy=True)
-
-
-def _contour_labels(contours: Sequence[Any], enumerate_fallback: bool) -> list[int]:
-    """Resolve the integer label to rasterize for each contour.
-
-    Args:
-        contours (Sequence): contours/instances of a single frame.
-        enumerate_fallback (bool): if True, contours whose ``label`` is None or
-            not convertible to int fall back to their 1-based position. If
-            False, such contours are skipped (label 0).
-
-    Returns:
-        list[int]: one label per contour.
-    """
-    labels = []
-    for i, cont in enumerate(contours):
-        label = i + 1 if enumerate_fallback else 0
-        if cont.label is not None:
-            # could not convert label to integer -> keep the fallback label
-            with contextlib.suppress(ValueError, TypeError):
-                label = int(cont.label)
-        labels.append(label)
-    return labels
-
-
-def _frame_label_mask(
-    contours: Sequence[Any],
-    height: int,
-    width: int,
-    enumerate_fallback: bool = False,
-) -> np.ndarray:
-    """Rasterize one frame's contours into a single instance label mask.
-
-    This is the hot path of every mask-based renderer. The naive formulation
-    (one full-image ``mask == label`` plus ``np.maximum`` per cell) costs
-    O(n_cells * height * width); every branch below is O(height * width).
-
-    On overlapping pixels the higher label wins, matching the ``np.maximum``
-    semantics of the original implementation.
-
-    Args:
-        contours (Sequence): contours/instances of a single frame.
-        height (int): frame height.
-        width (int): frame width.
-        enumerate_fallback (bool): see :func:`_contour_labels`.
-
-    Returns:
-        np.ndarray: HxW uint32 label mask (0 = background).
-    """
-    contours = list(contours)
-    if not contours:
-        return np.zeros((height, width), dtype=np.uint32)
-
-    labels = _contour_labels(contours, enumerate_fallback)
-
-    first = contours[0]
-    if isinstance(first, Instance) and all(
-        isinstance(c, Instance) and c.mask is first.mask for c in contours
-    ):
-        # Fast path: acia.segm.formats.overlay_from_masks hands every instance
-        # of a frame a reference to the same full-frame label mask, so the mask
-        # we want already exists -- one LUT remap keeps the requested labels and
-        # drops everything else, instead of one pass per cell.
-        src = first.mask
-        src_labels = np.asarray([c.label for c in contours])
-        lut_size = int(max(int(src.max()), int(src_labels.max()), max(labels))) + 1
-        lut = np.zeros(lut_size, dtype=np.uint32)
-        lut[src_labels] = np.asarray(labels, dtype=np.uint32)
-        return np.asarray(lut[src])
-
-    # Slow path: write each contour into the shared buffer. Ascending label
-    # order reproduces "higher label wins" without a per-cell np.maximum.
-    # int32 rather than uint32 because cv2.fillPoly has no uint32 overload.
-    local_mask = np.zeros((height, width), dtype=np.int32)
-
-    for i in np.argsort(np.asarray(labels, dtype=np.int64), kind="stable"):
-        cont = contours[i]
-
-        if isinstance(cont, Instance):
-            np.putmask(local_mask, cont.binary_mask, np.int32(labels[i]))
-            continue
-
-        # Instance must be handled above: its `coordinates` property derives a
-        # shapely polygon from the mask and raises when the mask is empty.
-        coordinates = getattr(cont, "coordinates", None)
-
-        if coordinates is None:
-            # anything exposing only the toMask() protocol
-            np.putmask(
-                local_mask, cont.toMask(height=height, width=width), np.int32(labels[i])
-            )
-        else:
-            # cv2.fillPoly only touches the polygon bounding box, whereas
-            # Contour.toMask rasterizes over the whole frame per contour.
-            points = np.asarray(coordinates, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(local_mask, [points], int(labels[i]))
-
-    return local_mask.astype(np.uint32)
 
 
 def _blend_overlay(

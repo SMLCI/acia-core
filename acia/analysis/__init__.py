@@ -23,7 +23,6 @@ import numpy as np
 import pandas as pd
 import papermill as pm
 import shapely
-from numpy import ma
 from pint._typing import UnitLike
 from tqdm.auto import tqdm
 
@@ -51,6 +50,7 @@ from acia.analysis.units import read_units_csv as read_units_csv
 from acia.analysis.units import strip_units as strip_units
 from acia.analysis.units import write_units_csv as write_units_csv
 from acia.base import BaseImage, ImageSequenceSource, Overlay
+from acia.segm.rasterize import contour_pixels
 
 logger = logging.getLogger(__name__)
 
@@ -806,25 +806,23 @@ class FluorescenceEx(PropertyExtractor):
             pd.DataFrame: pandas data frame containing columns of channel_names and the rows represent the extracted fluorescence
         """
 
+        # hoisted out of the contour loop: get_channel() was being re-run once
+        # per cell per channel, decoding the same frame thousands of times
+        raw_images = [image.get_channel(channel) for channel in channels]
+
         data = []
 
         for cont in overlay:
             local_data = {"id": cont.id}
-            for ch_id, channel in enumerate(channels):
-                raw_image = image.get_channel(channel)
+            for ch_id, raw_image in enumerate(raw_images):
+                # the cell's pixels, gathered inside its bounding box. The
+                # previous ma.masked_array(raw_image, mask=~cont.toMask(...))
+                # .compressed() built three frame-sized temporaries per cell per
+                # channel; contour_pixels returns the same values in the same
+                # order at O(cell) cost.
+                values = contour_pixels(cont, raw_image)
 
-                height, width = raw_image.shape[:2]
-
-                # draw cell mask
-                roi_mask = cont.toMask(height=height, width=width)
-
-                # create masked array
-                masked_roi: ma.MaskedArray = ma.masked_array(raw_image, mask=~roi_mask)
-
-                # compute fluorescence response
-                value = summarize_operator(masked_roi.compressed())
-
-                local_data[channel_names[ch_id]] = value
+                local_data[channel_names[ch_id]] = summarize_operator(values)
             data.append(local_data)
 
         return _id_indexed(data, list(channel_names))
