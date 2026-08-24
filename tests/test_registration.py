@@ -15,6 +15,7 @@ across cases where the spec allows.
 from __future__ import annotations
 
 import unittest
+import warnings
 from itertools import pairwise
 
 import cv2
@@ -26,6 +27,7 @@ from acia.registration import (
     FrameTransform,
     GradientECC,
     HoughLineRigidFit,
+    LowConfidenceWarning,
     MaskedTemplateCorrelation,
     PhaseCorrelationHighpass,
     ReanchoringReference,
@@ -291,9 +293,21 @@ class TestMaskedTemplateCorrelation(unittest.TestCase):
         reference = _textured_frame(seed=3)
         # true shift (50px) far exceeds the tiny search_margin below
         frame = _warp(reference, 50.0, 0.0, 0.0)
-        method = MaskedTemplateCorrelation(_default_mask_rect(), search_margin=8)
+        method = MaskedTemplateCorrelation(
+            _default_mask_rect(), search_margin=8, on_low_confidence="reject"
+        )
         with self.assertRaises(RegistrationError):
             method.estimate(reference, frame)
+
+    def test_shift_beyond_search_margin_is_kept_but_flagged_by_default(self):
+        """The default policy keeps this fit -- it is exactly the case
+        ``confidence`` exists to flag, since the returned shift is wrong."""
+        reference = _textured_frame(seed=3)
+        frame = _warp(reference, 50.0, 0.0, 0.0)
+        method = MaskedTemplateCorrelation(_default_mask_rect(), search_margin=8)
+        with self.assertWarns(LowConfidenceWarning):
+            transform = method.estimate(reference, frame)
+        self.assertLess(transform.confidence, 0.5)
 
     def test_low_score_rejected(self):
         """Genuinely dissimilar content, found within the search window,
@@ -302,10 +316,39 @@ class TestMaskedTemplateCorrelation(unittest.TestCase):
         reference = _textured_frame(seed=3)
         dissimilar_frame = _textured_frame(seed=99)  # unrelated content
         method = MaskedTemplateCorrelation(
-            _default_mask_rect(), search_margin=30, min_score=0.5
+            _default_mask_rect(),
+            search_margin=30,
+            min_score=0.5,
+            on_low_confidence="reject",
         )
         with self.assertRaisesRegex(RegistrationError, "min_score"):
             method.estimate(reference, dissimilar_frame)
+
+    def test_low_score_kept_and_warned_by_default(self):
+        reference = _textured_frame(seed=3)
+        dissimilar_frame = _textured_frame(seed=99)
+        method = MaskedTemplateCorrelation(
+            _default_mask_rect(), search_margin=30, min_score=0.5
+        )
+        with self.assertWarnsRegex(LowConfidenceWarning, "min_score"):
+            transform = method.estimate(reference, dissimilar_frame)
+        self.assertLess(transform.confidence, 0.5)
+
+    def test_kept_estimate_equals_the_ungated_one(self):
+        """Gate-motion regression: the refinement now runs *before* the gate,
+        so what "keep" returns must be byte-identical to what the same method
+        with the gate disabled returns."""
+        reference = _textured_frame(seed=3)
+        dissimilar_frame = _textured_frame(seed=99)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", LowConfidenceWarning)
+            kept = MaskedTemplateCorrelation(
+                _default_mask_rect(), search_margin=30, min_score=0.5
+            ).estimate(reference, dissimilar_frame)
+        ungated = MaskedTemplateCorrelation(
+            _default_mask_rect(), search_margin=30, min_score=0.0
+        ).estimate(reference, dissimilar_frame)
+        self.assertEqual(kept, ungated)
 
     def test_translation_happy_path_with_rotated_mask_rect(self):
         """A non-zero ``mask_rect.angle`` must not corrupt the recovered
@@ -423,6 +466,36 @@ class TestFeatureRANSACEuclidean(unittest.TestCase):
         blank = _blank_frame()
         with self.assertRaises(RegistrationError):
             FeatureRANSACEuclidean().estimate(reference, blank)
+
+    def test_too_few_matches_raises_whatever_the_policy(self):
+        """The pre-RANSAC match count is a hard floor, not a confidence gate:
+        with too few correspondences no model is ever built, so there is no
+        estimate for "keep" to keep."""
+        reference = _structured_frame(seed=1)
+        blank = _blank_frame()
+        with self.assertRaises(RegistrationError):
+            FeatureRANSACEuclidean(on_low_confidence="keep").estimate(reference, blank)
+
+    def test_low_inlier_count_is_kept_and_warned_by_default(self):
+        reference = _structured_frame(seed=1)
+        dx_true, dy_true, theta_true = 5.0, -3.0, 4.0
+        frame = _warp(reference, dx_true, dy_true, theta_true)
+        # 80 sits in the window between this fixture's RANSAC inlier count
+        # (~67) and its ratio-test match count (~101): high enough to miss the
+        # confidence gate, low enough to clear the hard pre-RANSAC floor that
+        # shares the same setting. Nothing about the fit itself changes.
+        method = FeatureRANSACEuclidean(min_inliers=80)
+        with self.assertWarnsRegex(LowConfidenceWarning, "inlier"):
+            transform = method.estimate(reference, frame)
+        self.assertAlmostEqual(transform.dx, dx_true, delta=0.5)
+        self.assertEqual(transform, FeatureRANSACEuclidean().estimate(reference, frame))
+
+    def test_low_inlier_count_rejected_under_the_reject_policy(self):
+        reference = _structured_frame(seed=1)
+        frame = _warp(reference, 5.0, -3.0, 4.0)
+        method = FeatureRANSACEuclidean(min_inliers=80, on_low_confidence="reject")
+        with self.assertRaisesRegex(RegistrationError, "inlier"):
+            method.estimate(reference, frame)
 
     def test_multi_channel_input_matches_grayscale_accuracy(self):
         reference_gray = _structured_frame(seed=1)
@@ -995,10 +1068,32 @@ class TestSceneDriftFalseFailure(unittest.TestCase):
         cls.frames, cls.truth = _growing_colony_series(n_frames=40)
 
     def test_late_frames_are_rejected_against_a_fixed_reference(self):
-        method = GradientECC()  # min_confidence=0.9
+        method = GradientECC(on_low_confidence="reject")  # min_confidence=0.9
         with self.assertRaises(RegistrationError) as ctx:
             method.estimate(self.frames[0], self.frames[-1])
         self.assertIn("correlation coefficient", str(ctx.exception))
+
+    def test_late_frames_are_kept_and_warned_about_by_default(self):
+        """The whole point of ``on_low_confidence="keep"`` in one assertion:
+        the frame the gate distrusts still gets a transform, that transform is
+        in fact correct, and its low ``confidence`` is what says "check me"."""
+        method = GradientECC()  # min_confidence=0.9, on_low_confidence="keep"
+        with self.assertWarnsRegex(LowConfidenceWarning, "min_confidence"):
+            transform = method.estimate(self.frames[0], self.frames[-1])
+        dx, dy = self.truth[-1]
+        self.assertAlmostEqual(transform.dx, dx, delta=0.5)
+        self.assertAlmostEqual(transform.dy, dy, delta=0.5)
+        self.assertLess(transform.confidence, 0.9)
+
+    def test_kept_estimate_equals_the_ungated_one(self):
+        """Gate-motion regression: decomposition now runs before the gate."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", LowConfidenceWarning)
+            kept = GradientECC().estimate(self.frames[0], self.frames[-1])
+        ungated = GradientECC(min_confidence=0.0).estimate(
+            self.frames[0], self.frames[-1]
+        )
+        self.assertEqual(kept, ungated)
 
     def test_the_rejected_fits_were_actually_correct(self):
         """With the gate off, the very frames it rejected land on target."""
@@ -1176,8 +1271,16 @@ class TestReanchoringOnGrowingColony(unittest.TestCase):
     def setUpClass(cls):
         cls.frames, cls.truth = _growing_colony_series(n_frames=40)
 
-    def _run(self, mode):
-        tracker = ReanchoringReference(GradientECC(), self.frames[0], mode=mode)
+    def _run(self, mode, on_low_confidence="reject"):
+        # "reject" on purpose: re-anchoring is driven by RegistrationError, so
+        # the default "keep" policy is precisely what stops it from firing (see
+        # test_keeping_low_confidence_fits_supersedes_reanchoring below). These
+        # cases are about the fallback itself, so they opt back into the gate.
+        tracker = ReanchoringReference(
+            GradientECC(on_low_confidence=on_low_confidence),
+            self.frames[0],
+            mode=mode,
+        )
         results, failures = {}, []
         for t in range(1, len(self.frames)):
             try:
@@ -1202,6 +1305,22 @@ class TestReanchoringOnGrowingColony(unittest.TestCase):
             self.assertAlmostEqual(transform.dx, dx, delta=0.5)
             self.assertAlmostEqual(transform.dy, dy, delta=0.5)
 
+    def test_keeping_low_confidence_fits_supersedes_reanchoring(self):
+        """With the default policy an unconfident fit is a *success*, so the
+        re-anchor fallback never sees it. Every frame still lands on target --
+        by a different route, and flagged by a low confidence instead."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", LowConfidenceWarning)
+            tracker, results, failures = self._run("reanchor", "keep")
+        self.assertEqual(failures, [])
+        self.assertEqual(tracker.reanchor_events, [])
+        self.assertEqual(len(results), len(self.frames) - 1)
+        for t, transform in results.items():
+            dx, dy = self.truth[t]
+            self.assertAlmostEqual(transform.dx, dx, delta=0.5)
+            self.assertAlmostEqual(transform.dy, dy, delta=0.5)
+        self.assertLess(min(t.confidence for t in results.values()), 0.9)
+
     def test_chained_mode_accumulation_stays_bounded(self):
         """Chaining every frame works but accumulates composition error --
         measured at ~0.006 px/frame here, hence the preference for reanchor."""
@@ -1211,6 +1330,45 @@ class TestReanchoringOnGrowingColony(unittest.TestCase):
             abs(transform.dx - self.truth[t][0]) for t, transform in results.items()
         )
         self.assertLess(worst, 1.0)
+
+
+class TestLowConfidencePolicy(unittest.TestCase):
+    """The knob itself, independent of any one method's gate."""
+
+    def test_unknown_policy_is_rejected_at_construction(self):
+        for factory in (
+            lambda p: GradientECC(on_low_confidence=p),
+            lambda p: FeatureRANSACEuclidean(on_low_confidence=p),
+            lambda p: MaskedTemplateCorrelation(
+                _default_mask_rect(), on_low_confidence=p
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "on_low_confidence"):
+                factory("warn")
+
+    def test_keep_is_the_default(self):
+        self.assertEqual(GradientECC().on_low_confidence, "keep")
+        self.assertEqual(FeatureRANSACEuclidean().on_low_confidence, "keep")
+        self.assertEqual(
+            MaskedTemplateCorrelation(_default_mask_rect()).on_low_confidence,
+            "keep",
+        )
+
+    def test_the_warning_reports_the_score_and_the_threshold(self):
+        frames, _truth = _growing_colony_series(n_frames=40)
+        with self.assertWarns(LowConfidenceWarning) as ctx:
+            GradientECC().estimate(frames[0], frames[-1])
+        message = str(ctx.warning)
+        self.assertIn("min_confidence=0.9", message)
+        # The measured coefficient, not just the threshold it missed.
+        self.assertRegex(message, r"coefficient 0\.\d+")
+
+    def test_ungated_methods_take_no_policy(self):
+        """PhaseCorrelationHighpass/HoughLineRigidFit report no confidence, so
+        there is nothing to gate -- they must not silently accept the knob."""
+        for cls in (PhaseCorrelationHighpass, HoughLineRigidFit):
+            with self.assertRaises(TypeError):
+                cls(on_low_confidence="keep")
 
 
 if __name__ == "__main__":

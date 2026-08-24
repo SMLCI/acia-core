@@ -3104,6 +3104,7 @@ if _HAS_ANYWIDGET:
             method_name: str = "GradientECC",
             method_kwargs: dict | None = None,
             reference_mode: str = "reanchor",
+            low_confidence: str = "keep",
             **kwargs,
         ) -> None:
             """Build the dashboard from a source (no pixel reads at construction).
@@ -3127,18 +3128,39 @@ if _HAS_ANYWIDGET:
                     Defaults to ``"reanchor"``, which only changes what happens
                     to a frame that would otherwise be recorded as a failure.
                     Pass ``"fixed"`` to always compare against frame 0.
+                low_confidence: What the registration method does with a fit
+                    scoring below its own confidence threshold; one of
+                    :data:`~acia.registration.LOW_CONFIDENCE_POLICIES`.
+                    Defaults to ``"keep"``, so every frame ends up with a
+                    stored transform and a weak fit is reported through its
+                    ``confidence`` (and a warning) rather than by being
+                    missing. Pass ``"reject"`` to record those frames in
+                    ``failed_frames`` instead, leaving them without a
+                    transform. Forwarded to the method as
+                    ``on_low_confidence``; an explicit ``on_low_confidence``
+                    in ``method_kwargs`` wins. Methods with no confidence
+                    gate ignore it.
                 **kwargs: Forwarded to ``anywidget.AnyWidget``.
 
             Raises:
-                ValueError: If ``reference_mode`` is not a known mode.
+                ValueError: If ``reference_mode`` or ``low_confidence`` is not
+                    a known value.
             """
-            from acia.registration import ReanchoringReference
+            from acia.registration import (
+                LOW_CONFIDENCE_POLICIES,
+                ReanchoringReference,
+            )
             from acia.segm.open import open_sequence
 
             if reference_mode not in ReanchoringReference.MODES:
                 raise ValueError(
                     f"Unknown reference_mode {reference_mode!r}; expected one "
                     f"of {', '.join(ReanchoringReference.MODES)}."
+                )
+            if low_confidence not in LOW_CONFIDENCE_POLICIES:
+                raise ValueError(
+                    f"Unknown low_confidence policy {low_confidence!r}; "
+                    f"expected one of {', '.join(LOW_CONFIDENCE_POLICIES)}."
                 )
 
             if isinstance(source, (str, os.PathLike)):
@@ -3147,6 +3169,7 @@ if _HAS_ANYWIDGET:
             self._records: dict[int, RegistrationRecord] = {}
             self._method_kwargs: dict = dict(method_kwargs or {})
             self._reference_mode = reference_mode
+            self._low_confidence = low_confidence
 
             meta = source.metadata
             positions = [{"index": p.index, "name": p.name} for p in source.positions]
@@ -3269,6 +3292,11 @@ if _HAS_ANYWIDGET:
                 **overrides: Constructor keyword arguments taking precedence
                     over this dashboard's ``method_kwargs``.
 
+            The dashboard's ``low_confidence`` policy is forwarded as
+            ``on_low_confidence`` to whichever methods accept one -- the
+            ungated methods have no such parameter -- and an explicit
+            ``on_low_confidence`` from either settings layer wins.
+
             Raises:
                 ValueError: If ``method_name`` is unknown, or if
                     ``MaskedTemplateCorrelation`` is requested without a mask
@@ -3281,7 +3309,11 @@ if _HAS_ANYWIDGET:
 
             # Pass mask_rect to whichever methods actually accept one, rather
             # than naming a single class here.
-            accepts_mask = "mask_rect" in inspect.signature(cls).parameters
+            params = inspect.signature(cls).parameters
+            if "on_low_confidence" in params and "on_low_confidence" not in kwargs:
+                kwargs["on_low_confidence"] = self._low_confidence
+
+            accepts_mask = "mask_rect" in params
             if accepts_mask and "mask_rect" not in kwargs:
                 rect = mask_rect if mask_rect is not None else self.mask_rect
                 if rect is None:
@@ -3632,6 +3664,14 @@ if _HAS_ANYWIDGET:
             whatever record (checkpointed or pre-existing) is already known,
             not as a fresh empty one.
 
+            Because a complete position is skipped and a partial one resumes by
+            *count*, re-running over an existing ``registration_transforms.json``
+            never re-estimates frames a previous run already recorded --
+            including ones it recorded as failures. Changing ``low_confidence``
+            (or any method setting) therefore does not retroactively fix an
+            existing file: delete it, or the affected records, and register
+            those positions again.
+
             Args:
                 directory: Output directory for ``registration_transforms.json``;
                     defaults to the current working directory. Also the path
@@ -3655,7 +3695,10 @@ if _HAS_ANYWIDGET:
                     settings that differ per position -- calling this once per
                     position with that position's own
                     :class:`~acia.registration.GradientECC` ``exclude_rects``.
-                    Recorded in the manifest's ``method_params``.
+                    Not recorded in the manifest: ``method_params`` is a single
+                    manifest-level dict, so per-position settings have nowhere
+                    to go without mislabelling one position's values as
+                    another's.
 
             Returns:
                 dict: ``{"num_positions", "completed", "skipped",
@@ -3837,6 +3880,7 @@ if _HAS_ANYWIDGET:
                 method_params={
                     **self._method_kwargs,
                     "reference_mode": self._reference_mode,
+                    "low_confidence": self._low_confidence,
                 },
             )
 

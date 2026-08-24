@@ -68,6 +68,18 @@ whole module stays importable without `anywidget` installed):
     score, persisted per frame so a run's confidence trend is auditable.
     Reported by `GradientECC`, `MaskedTemplateCorrelation` and
     `FeatureRANSACEuclidean`; `None` elsewhere.
+  - `on_low_confidence` on each of those three methods (and
+    `RegistrationDashboard(low_confidence=...)`, which forwards it): `"keep"`
+    (new default) returns a fit scoring below the method's threshold anyway,
+    with its `confidence` set and a `LowConfidenceWarning` naming the score and
+    the threshold it missed; `"reject"` raises `RegistrationError` as before.
+    Keeping means `registration_transforms.json` holds a transform for *every*
+    frame, so `RegisteredSequenceSource` stops falling back to an uncorrected
+    (or nearest-neighbour) frame downstream — a weak fit is now reported by its
+    score rather than by its absence. Failures with no estimate to keep (blank
+    input, non-convergence, a non-finite result, a match pinned to the
+    search-window edge, too few correspondences to fit a model at all) still
+    raise regardless of the policy.
   - `RegistrationDashboard(method_kwargs=..., reference_mode=...)` and
     `batch_apply(..., method_kwargs=...)` for per-position settings —
     registration method settings are now a supported argument rather than
@@ -262,6 +274,21 @@ warning-free under `-W`.
   All are additive in both directions: older manifests load unchanged, and a
   fixed-reference run still writes exactly the JSON it always did (schema stays
   `acia.registration/v1`).
+- A registration fit scoring below its method's confidence threshold is now
+  **kept** by default (`on_low_confidence="keep"`), warned about, and stored
+  like any other transform, instead of raising and leaving the frame in
+  `failed_frames` without one. Two consequences worth knowing:
+  - `ReanchoringReference`'s fallback is driven by `RegistrationError`, so with
+    the default policy a merely unconfident fit no longer re-anchors — the
+    method reports success and the estimate is carried forward as-is.
+    `reference_mode="reanchor"` stays valid but now fires only on outright
+    failures; construct the method with `on_low_confidence="reject"` to get the
+    older interplay, where a low score re-anchors.
+  - Re-running `batch_apply` over an existing `registration_transforms.json`
+    does **not** repair it: a complete position is skipped and a partial one
+    resumes by frame *count*, so frames a previous run recorded as failures are
+    never re-estimated. Delete the file (or the affected records) and register
+    those positions again to pick up the new policy.
 - `RegisteredSequenceSource` now warns once per missing frame index instead of
   once per read, so a lazy multi-pass consumer (crop → write) no longer repeats
   the same warning on every pass.

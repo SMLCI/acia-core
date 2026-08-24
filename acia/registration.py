@@ -19,6 +19,7 @@ scope for this module.
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -32,12 +33,109 @@ from acia.base import RotatedCropSpec
 
 
 class RegistrationError(Exception):
-    """Raised when a :class:`RegistrationMethod` cannot produce a confident estimate.
+    """Raised when a :class:`RegistrationMethod` cannot produce an estimate at all.
 
-    Every method raises this instead of silently returning an identity/zero
-    transform: a silent zero-transform on failure would be indistinguishable
-    from "genuinely no drift" and would corrupt any downstream comparison.
+    No method ever silently returns an identity/zero transform it did not
+    actually measure: a silent zero-transform on failure would be
+    indistinguishable from "genuinely no drift" and would corrupt any
+    downstream comparison. Blank input, a non-convergent optimizer, a
+    non-finite result or a model with no support all raise this.
+
+    A fit that *was* measured but scored below its method's confidence
+    threshold is a different case, and is governed by ``on_low_confidence``
+    (see :data:`LOW_CONFIDENCE_POLICIES`): under the default ``"keep"`` the
+    estimate is returned with a warning and its ``confidence`` set, so the
+    caller can decide what to trust; under ``"reject"`` it raises this too.
     """
+
+
+class LowConfidenceWarning(UserWarning):
+    """Warned when a fit scoring below its threshold is kept anyway.
+
+    Its own category so a caller drowning in them can filter or collect them
+    (``warnings.simplefilter("once", LowConfidenceWarning)``) without silencing
+    unrelated warnings -- a long time-lapse whose content evolves can produce
+    one per frame for a contiguous tail of frames.
+    """
+
+
+LOW_CONFIDENCE_POLICIES: tuple[str, ...] = ("keep", "reject")
+"""What a method does with a fit that scores below its confidence threshold.
+
+- ``"keep"`` (default) -- return the estimate anyway, with its ``confidence``
+  set, after emitting a :class:`LowConfidenceWarning` naming the score and the
+  threshold it missed. Every frame then gets a stored transform, and
+  ``confidence`` is the signal for which ones to distrust.
+- ``"reject"`` -- raise :class:`RegistrationError` instead, so a weak fit never
+  reaches the caller.
+"""
+
+
+def _check_low_confidence_policy(policy: str) -> str:
+    """Validate an ``on_low_confidence`` argument, returning it unchanged.
+
+    Args:
+        policy: The candidate policy.
+
+    Returns:
+        str: ``policy``.
+
+    Raises:
+        ValueError: If ``policy`` is not one of :data:`LOW_CONFIDENCE_POLICIES`.
+    """
+    if policy not in LOW_CONFIDENCE_POLICIES:
+        raise ValueError(
+            f"Unknown on_low_confidence policy {policy!r}; expected one of "
+            f"{', '.join(LOW_CONFIDENCE_POLICIES)}."
+        )
+    return policy
+
+
+def _gate_confidence(
+    transform: FrameTransform,
+    *,
+    score: float,
+    threshold: float,
+    policy: str,
+    message: str,
+    hint: str = "",
+) -> FrameTransform:
+    """Apply a method's confidence gate to an estimate it already computed.
+
+    Every gated method builds its :class:`FrameTransform` *before* consulting
+    the gate, so the estimate exists whichever way the policy falls -- that is
+    what makes ``"keep"`` possible without recomputing anything.
+
+    Args:
+        transform: The estimate, with ``confidence`` already set.
+        score: The goodness-of-fit value being gated, in the gate's own units.
+        threshold: The value ``score`` must reach, same units.
+        policy: One of :data:`LOW_CONFIDENCE_POLICIES`.
+        message: Method-specific description of the shortfall, used to build
+            both the warning and the error.
+        hint: Extra guidance appended to the *error* only. Under ``"keep"``
+            the shortfall can recur every frame, so the warning stays a single
+            short line and the long-form explanation is left to the method's
+            own docstring.
+
+    Returns:
+        FrameTransform: ``transform``, when the score passes or the policy is
+            ``"keep"``.
+
+    Raises:
+        RegistrationError: If the score falls short and ``policy`` is
+            ``"reject"``.
+    """
+    if score >= threshold:
+        return transform
+    if policy == "reject":
+        raise RegistrationError(f"{message}; rejecting a low-confidence fit.{hint}")
+    warnings.warn(
+        f"{message}; keeping the estimate anyway.",
+        LowConfidenceWarning,
+        stacklevel=3,
+    )
+    return transform
 
 
 @dataclass(frozen=True)
@@ -57,9 +155,11 @@ class FrameTransform:
             (never omitted) so a translation-only result is unambiguous.
         confidence: The estimating method's own goodness-of-fit score for
             this transform, or ``None`` when the method has no honest scalar
-            to report. Purely diagnostic -- nothing in this module *acts* on
-            it; a method that wants to reject an unconfident fit raises
-            :class:`RegistrationError` instead. Scores are **not** comparable
+            to report. A gated method compares it against its own threshold
+            (see :data:`LOW_CONFIDENCE_POLICIES`): under the default
+            ``"keep"`` a shortfall only warns, so this score is what tells a
+            caller which stored transforms to distrust -- nothing downstream
+            drops a frame on its behalf. Scores are **not** comparable
             across methods (an ECC correlation coefficient and a RANSAC
             inlier fraction are different quantities), and for a method
             comparing against a fixed reference a score is only comparable
@@ -180,10 +280,16 @@ class RegistrationMethod(ABC):
                 convention as ``reference``.
 
         Returns:
-            FrameTransform: The estimated ``(dx, dy, theta)``.
+            FrameTransform: The estimated ``(dx, dy, theta)``. A method that
+                gates on confidence may return an estimate scoring below its
+                own threshold, having warned -- see
+                :data:`LOW_CONFIDENCE_POLICIES`; ``confidence`` is what
+                distinguishes those.
 
         Raises:
-            RegistrationError: If no confident estimate can be produced.
+            RegistrationError: If no estimate can be produced at all, or if a
+                gated method is configured with ``on_low_confidence="reject"``
+                and the fit scores below its threshold.
         """
 
 
@@ -648,9 +754,13 @@ class MaskedTemplateCorrelation(RegistrationMethod):
     This method is translation-only: ``theta`` is always ``0.0``.
 
     Limitation (not a bug -- no test required): the true shift must fall
-    within ``search_margin`` pixels of the template's nominal location, or
-    the match is rejected outright (see the "masked search exceeds window"
-    row of the I/O matrix) rather than returning a wrong answer.
+    within ``search_margin`` pixels of the template's nominal location. A shift
+    that exceeds it either pins the peak to the search-window border -- always
+    a hard :class:`RegistrationError` -- or lands inside the window on
+    unrelated content, which shows up as a score below ``min_score`` and is
+    therefore governed by ``on_low_confidence``. Under the default ``"keep"``
+    that returns a wrong shift carrying a low ``confidence``, so size
+    ``search_margin`` generously rather than relying on the gate to catch it.
 
     Attributes:
         mask_rect: The rectangle to crop from the reference frame as the
@@ -658,8 +768,10 @@ class MaskedTemplateCorrelation(RegistrationMethod):
         search_margin: Extra pixels of search radius (in each spatial
             direction) added around ``mask_rect``'s nominal location in the
             target frame.
-        min_score: Minimum acceptable ``TM_CCOEFF_NORMED`` peak score;
-            matches below this are rejected as unconfident.
+        min_score: Minimum ``TM_CCOEFF_NORMED`` peak score for a match to be
+            considered confident.
+        on_low_confidence: What to do with a match scoring below
+            ``min_score`` -- see :data:`LOW_CONFIDENCE_POLICIES`.
     """
 
     def __init__(
@@ -667,10 +779,13 @@ class MaskedTemplateCorrelation(RegistrationMethod):
         mask_rect: RotatedCropSpec,
         search_margin: int = 30,
         min_score: float = 0.5,
+        *,
+        on_low_confidence: str = "keep",
     ):
         self.mask_rect = mask_rect
         self.search_margin = search_margin
         self.min_score = min_score
+        self.on_low_confidence = _check_low_confidence_policy(on_low_confidence)
 
     def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
         """See :meth:`RegistrationMethod.estimate`."""
@@ -728,12 +843,12 @@ class MaskedTemplateCorrelation(RegistrationMethod):
                 "edge; the true shift likely exceeds search_margin="
                 f"{self.search_margin}."
             )
-        if max_val < self.min_score:
-            raise RegistrationError(
-                f"MaskedTemplateCorrelation: best correlation score {max_val:.3f} "
-                f"is below min_score={self.min_score}."
-            )
-
+        # Refine *before* gating on `min_score`: the estimate is wanted either
+        # way (`on_low_confidence="keep"` returns it). Safe to run here only
+        # because the search-window-edge guard above -- which stays a hard
+        # failure -- is what keeps `mx`/`my` off the border, and hence the
+        # `result[my, mx +/- 1]` / `result[my +/- 1, mx]` lookups in bounds.
+        # Do not reorder these two.
         dx_sub = _parabolic_refine(
             result[my, mx - 1], result[my, mx], result[my, mx + 1]
         )
@@ -753,7 +868,16 @@ class MaskedTemplateCorrelation(RegistrationMethod):
         dx = alpha * raw_dx - beta * raw_dy
         dy = beta * raw_dx + alpha * raw_dy
 
-        return FrameTransform(dx=dx, dy=dy, theta=0.0, confidence=float(max_val))
+        return _gate_confidence(
+            FrameTransform(dx=dx, dy=dy, theta=0.0, confidence=float(max_val)),
+            score=float(max_val),
+            threshold=float(self.min_score),
+            policy=self.on_low_confidence,
+            message=(
+                f"MaskedTemplateCorrelation: best correlation score "
+                f"{max_val:.3f} is below min_score={self.min_score}"
+            ),
+        )
 
 
 def _parabolic_refine(c_minus: float, c_zero: float, c_plus: float) -> float:
@@ -1147,8 +1271,14 @@ class FeatureRANSACEuclidean(RegistrationMethod):
         n_features: Maximum number of ORB features to detect per frame.
         ratio_thresh: Lowe's ratio-test threshold (lower = stricter).
         ransac_thresh: RANSAC reprojection-error threshold, in pixels.
-        min_inliers: Minimum number of RANSAC inlier correspondences required
-            to accept the fit.
+        min_inliers: Minimum number of RANSAC inlier correspondences for the
+            fit to be considered confident. Also a hard floor earlier in the
+            pipeline: too few *candidate* matches to run RANSAC at all is a
+            :class:`RegistrationError` regardless of ``on_low_confidence``,
+            because no model gets built in that case.
+        on_low_confidence: What to do with a fit whose RANSAC inlier count
+            falls below ``min_inliers`` -- see
+            :data:`LOW_CONFIDENCE_POLICIES`.
     """
 
     def __init__(
@@ -1157,11 +1287,14 @@ class FeatureRANSACEuclidean(RegistrationMethod):
         ratio_thresh: float = 0.75,
         ransac_thresh: float = 3.0,
         min_inliers: int = 3,
+        *,
+        on_low_confidence: str = "keep",
     ):
         self.n_features = n_features
         self.ratio_thresh = ratio_thresh
         self.ransac_thresh = ransac_thresh
         self.min_inliers = min_inliers
+        self.on_low_confidence = _check_low_confidence_policy(on_low_confidence)
 
     def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
         """See :meth:`RegistrationMethod.estimate`."""
@@ -1222,17 +1355,29 @@ class FeatureRANSACEuclidean(RegistrationMethod):
                 "FeatureRANSACEuclidean: estimateAffinePartial2D found no model."
             )
         n_inliers = int(inliers.sum()) if inliers is not None else 0
-        if n_inliers < self.min_inliers:
+        if n_inliers == 0:
+            # Not a weak fit but no fit: a model no correspondence supports
+            # describes nothing, so there is no estimate worth keeping.
             raise RegistrationError(
-                f"FeatureRANSACEuclidean: only {n_inliers} RANSAC inlier "
-                f"correspondences; need >= {self.min_inliers}."
+                "FeatureRANSACEuclidean: RANSAC kept no inlier correspondences."
             )
 
         h, w = ref_gray.shape
         transform = _decompose_similarity(matrix, (w / 2.0, h / 2.0))
         # Inlier fraction: the share of ratio-test matches RANSAC kept. Not
         # comparable to another method's score -- purely diagnostic.
-        return dataclasses.replace(transform, confidence=n_inliers / len(good))
+        return _gate_confidence(
+            dataclasses.replace(transform, confidence=n_inliers / len(good)),
+            # The gate counts inliers, while the reported confidence is the
+            # inlier *fraction* -- report the numbers actually compared.
+            score=float(n_inliers),
+            threshold=float(self.min_inliers),
+            policy=self.on_low_confidence,
+            message=(
+                f"FeatureRANSACEuclidean: only {n_inliers} RANSAC inlier "
+                f"correspondences; need >= {self.min_inliers}"
+            ),
+        )
 
 
 class GradientECC(RegistrationMethod):
@@ -1277,7 +1422,7 @@ class GradientECC(RegistrationMethod):
         registered against one fixed reference and the imaged content itself
         evolves -- a colony growing into the field of view, a channel filling
         with cells -- the coefficient decays with elapsed *biology*, not with
-        misalignment, and a fixed ``min_confidence`` gate eventually rejects
+        misalignment, and a fixed ``min_confidence`` gate eventually flags
         perfectly good fits in a contiguous tail of late frames. On a synthetic
         device fixture with growing content and known drift, the coefficient
         fell from 0.96 to 0.75 over 120 frames while the recovered drift stayed
@@ -1288,10 +1433,11 @@ class GradientECC(RegistrationMethod):
         only on static geometry. On that same fixture it then stayed above
         0.95 for the whole sequence at identical accuracy. Where that is not
         possible, register against a recent frame instead of a fixed one (see
-        :class:`ReanchoringReference`). Simply lowering ``min_confidence`` is
-        a poor substitute: once content changes, the coefficients of correct
-        and incorrect fits overlap, so the gate stops discriminating in either
-        direction.
+        :class:`ReanchoringReference`). Simply lowering ``min_confidence`` --
+        or relying on the default ``on_low_confidence="keep"`` to warn and
+        carry on -- is a poor substitute: once content changes, the
+        coefficients of correct and incorrect fits overlap, so the score stops
+        discriminating in either direction and a warning stops meaning much.
 
         Note also that with ``early_stop_delta_px`` set, the gated coefficient
         is the one from whichever pyramid level estimation stopped at, not
@@ -1305,9 +1451,10 @@ class GradientECC(RegistrationMethod):
         min_gradient_std: Minimum standard deviation of the gradient-magnitude
             image required to consider a frame to have detectable signal;
             below this, the frame is treated as blank/textureless.
-        min_confidence: Minimum acceptable ``cv2.findTransformECC`` final
-            correlation coefficient; below this, the fit is rejected as
-            unconfident rather than returned. Empirically (randomized
+        min_confidence: Minimum ``cv2.findTransformECC`` final correlation
+            coefficient for a fit to be considered confident; what happens
+            below it is governed by ``on_low_confidence``. Empirically
+            (randomized
             translation/rotation within this class's happy-path envelope,
             on structured synthetic data), correctly-converged fits cluster
             tightly around ``0.98``-``0.99``, while silently-wrong fits
@@ -1351,6 +1498,9 @@ class GradientECC(RegistrationMethod):
             precision, so excluding a rectangle right up to its border throws
             away the most useful features near it. Ignored when
             ``exclude_rects`` is ``None``.
+        on_low_confidence: What to do with a fit whose final correlation
+            coefficient falls below ``min_confidence`` -- see
+            :data:`LOW_CONFIDENCE_POLICIES`.
     """
 
     def __init__(
@@ -1365,6 +1515,8 @@ class GradientECC(RegistrationMethod):
         translation_only: bool = False,
         exclude_rects: Sequence[RotatedCropSpec] | None = None,
         exclude_shrink_px: float = 0.0,
+        *,
+        on_low_confidence: str = "keep",
     ):
         self.n_iterations = n_iterations
         self.epsilon = epsilon
@@ -1376,6 +1528,7 @@ class GradientECC(RegistrationMethod):
         self.translation_only = translation_only
         self.exclude_rects = tuple(exclude_rects) if exclude_rects else ()
         self.exclude_shrink_px = exclude_shrink_px
+        self.on_low_confidence = _check_low_confidence_policy(on_low_confidence)
 
     def estimate(self, reference: np.ndarray, frame: np.ndarray) -> FrameTransform:
         """See :meth:`RegistrationMethod.estimate`."""
@@ -1533,31 +1686,17 @@ class GradientECC(RegistrationMethod):
                         break
                 prev = (dx, dy, theta)
 
-        if cc < self.min_confidence:
-            hint = (
-                ""
-                if self.exclude_rects
-                else (
-                    " If this happens for a contiguous tail of late frames "
-                    "with a steadily decaying coefficient, the imaged content "
-                    "is most likely changing over time rather than the fit "
-                    "going wrong -- pass exclude_rects to leave those regions "
-                    "out of the objective, or register against a recent frame "
-                    "(ReanchoringReference)."
-                )
-            )
-            raise RegistrationError(
-                f"GradientECC: final correlation coefficient {cc:.3f} is "
-                f"below min_confidence={self.min_confidence}; rejecting a "
-                f"low-confidence fit rather than returning it.{hint}"
-            )
-
+        # Decompose *before* gating on `min_confidence`: the estimate is
+        # wanted either way (`on_low_confidence="keep"` returns it), and both
+        # `warp_matrix` and `cc` are already in hand. Safe here because the
+        # loop above rejected a non-finite warp_matrix at every level.
+        #
         # warp_matrix's translation is in whichever level was last processed
         # (full resolution unless early_stop_delta_px stopped it sooner) --
         # scale up to full-resolution-equivalent pixels for the returned
         # FrameTransform, the same scaling the loop above already applies.
         transform = _decompose_similarity(warp_matrix, (cur_w / 2.0, cur_h / 2.0))
-        return FrameTransform(
+        estimate = FrameTransform(
             dx=transform.dx * (full_w / cur_w),
             dy=transform.dy * (full_h / cur_h),
             # MOTION_TRANSLATION never touches warp_matrix's rotation block,
@@ -1566,6 +1705,30 @@ class GradientECC(RegistrationMethod):
             # module's other translation-only methods report theta.
             theta=0.0 if self.translation_only else transform.theta,
             confidence=float(cc),
+        )
+
+        hint = (
+            ""
+            if self.exclude_rects
+            else (
+                " If this happens for a contiguous tail of late frames "
+                "with a steadily decaying coefficient, the imaged content "
+                "is most likely changing over time rather than the fit "
+                "going wrong -- pass exclude_rects to leave those regions "
+                "out of the objective, or register against a recent frame "
+                "(ReanchoringReference)."
+            )
+        )
+        return _gate_confidence(
+            estimate,
+            score=float(cc),
+            threshold=float(self.min_confidence),
+            policy=self.on_low_confidence,
+            message=(
+                f"GradientECC: final correlation coefficient {cc:.3f} is "
+                f"below min_confidence={self.min_confidence}"
+            ),
+            hint=hint,
         )
 
 
@@ -1578,6 +1741,14 @@ class ReanchoringReference:
     to find them similar enough to trust, even though the *drift* between them
     is perfectly recoverable (see :class:`GradientECC`'s note on
     ``min_confidence``).
+
+    Note that the fallback is driven by :class:`RegistrationError`, so with the
+    default ``on_low_confidence="keep"`` a merely *unconfident* fit no longer
+    triggers it -- the method warns and returns its estimate, and this class
+    treats that as the success it is reported to be. Re-anchoring then fires
+    only on outright failures (blank input, non-convergence). Construct the
+    wrapped method with ``on_low_confidence="reject"`` to get the older
+    behaviour, where a low score re-anchors instead of being carried forward.
 
     This class wraps any :class:`RegistrationMethod` with a reference policy
     that handles that case without abandoning the fixed reference where it

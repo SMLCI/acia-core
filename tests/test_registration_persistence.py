@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -313,6 +314,63 @@ class TestRealSourceAndFingerprint(unittest.TestCase):
             )
             with self.assertWarns(UserWarning):
                 load_registration(m, source=seqfile)
+
+
+class TestNoMissingTransformsEndToEnd(unittest.TestCase):
+    """The acceptance criterion for keeping low-confidence fits.
+
+    A run whose late frames all miss the confidence gate must still leave a
+    transform for every frame, so reading the reconstructed source back never
+    trips ``RegisteredSequenceSource``'s "no stored correction" warning.
+    """
+
+    N_FRAMES = 6
+
+    def _write_tif(self, d):
+        path = Path(d) / "stack.tif"
+        stack = (np.random.rand(self.N_FRAMES, 30, 25) * 1000).astype(np.uint16)
+        tifffile.imwrite(path, stack)
+        return path
+
+    def test_every_frame_reads_back_corrected_and_silent(self):
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_tif(d)
+            # Every frame carries a below-threshold confidence, exactly as a
+            # kept low-confidence run writes them.
+            record = RegistrationRecord(
+                position=0,
+                method="GradientECC",
+                transforms={
+                    t: FrameTransform(dx=float(t), dy=0.0, theta=0.0, confidence=0.4)
+                    for t in range(self.N_FRAMES)
+                },
+            )
+            manifest = RegistrationManifest(
+                source={"path": str(path), "format": "tiff"},
+                records=[record],
+                method="GradientECC",
+                method_params={"low_confidence": "keep", "min_confidence": 0.9},
+            )
+            written = save_registration(manifest, d)
+            reloaded = RegistrationManifest.load(written)
+
+            source = load_registration(reloaded, source=open_sequence(path))[0]
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # any warning fails the test
+                for t in range(self.N_FRAMES):
+                    source.get_frame(t)
+            self.assertEqual(source.missing_frames, set())
+
+            # The weakness survives the round-trip as a score, which is what a
+            # reader has to judge these frames by.
+            self.assertTrue(
+                all(
+                    t.confidence == 0.4 for t in reloaded.records[0].transforms.values()
+                )
+            )
+            self.assertEqual(reloaded.method_params["low_confidence"], "keep")
 
 
 if __name__ == "__main__":
