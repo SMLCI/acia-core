@@ -21,7 +21,7 @@ from itertools import pairwise
 import cv2
 import numpy as np
 
-from acia.base import RotatedCropSpec
+from acia.base import ArrayImage, ImageSequenceSource, RotatedCropSpec
 from acia.registration import (
     FeatureRANSACEuclidean,
     FrameTransform,
@@ -36,6 +36,7 @@ from acia.registration import (
     _parabolic_refine,
     _rect_mask,
     apply_correction,
+    apply_correction_to_spec,
     compose,
     run_comparison,
 )
@@ -812,6 +813,131 @@ class TestApplyCorrection(unittest.TestCase):
         np.testing.assert_allclose(
             corrected.astype(np.float32), frame.astype(np.float32), atol=1.0
         )
+
+
+class _GraySource(ImageSequenceSource):
+    """Minimal (T, H, W) grayscale source (mirrors ``tests/test_base.py``)."""
+
+    def __init__(self, stack: np.ndarray):
+        self.stack = stack
+
+    def get_frame(self, frame: int) -> ArrayImage:
+        return ArrayImage(self.stack[frame], frame=frame)
+
+    @property
+    def size_t(self) -> int:
+        return self.stack.shape[0]
+
+    @property
+    def size_h(self) -> int:
+        return self.stack.shape[1]
+
+    @property
+    def size_w(self) -> int:
+        return self.stack.shape[2]
+
+    @property
+    def size_c(self) -> int:
+        return 1
+
+    @property
+    def num_channels(self) -> int:
+        return 1
+
+
+class TestApplyCorrectionToSpec(unittest.TestCase):
+    """Moving crop geometry across the same warp `apply_correction` applies
+    to pixels -- so an ROI drawn on a late frame still crops the region it was
+    drawn around once the sequence is registered onto frame 0."""
+
+    SPEC = RotatedCropSpec(center=(50.0, 40.0), size=(30, 20), angle=12.0)
+
+    def test_none_transform_returns_the_spec_itself(self):
+        self.assertIs(
+            apply_correction_to_spec(self.SPEC, None, shape=(SIZE, SIZE)), self.SPEC
+        )
+
+    def test_zero_transform_is_exactly_a_no_op(self):
+        mapped = apply_correction_to_spec(
+            self.SPEC, FrameTransform(0.0, 0.0, 0.0), shape=(SIZE, SIZE)
+        )
+        self.assertEqual(mapped, self.SPEC)
+
+    def test_translation_moves_the_center_the_other_way(self):
+        """A frame that drifted by (+7, -3) has its content sitting 7 px right
+        of where the reference had it, so a box drawn around that content maps
+        back by the same amount in the opposite direction."""
+        mapped = apply_correction_to_spec(
+            self.SPEC, FrameTransform(dx=7.0, dy=-3.0, theta=0.0), shape=(SIZE, SIZE)
+        )
+        self.assertAlmostEqual(mapped.center[0], 43.0, places=5)
+        self.assertAlmostEqual(mapped.center[1], 43.0, places=5)
+        self.assertAlmostEqual(mapped.angle, 12.0, places=5)
+
+    def test_rotation_adds_to_the_angle(self):
+        mapped = apply_correction_to_spec(
+            self.SPEC, FrameTransform(0.0, 0.0, 5.0), shape=(SIZE, SIZE)
+        )
+        self.assertAlmostEqual(mapped.angle, 17.0, places=5)
+
+    def test_size_is_preserved_as_positive_ints(self):
+        """RotatedCropSpec rejects a non-int size, so the tuple must be passed
+        through rather than recomputed."""
+        mapped = apply_correction_to_spec(
+            self.SPEC, FrameTransform(3.3, -1.7, 2.5), shape=(SIZE, SIZE)
+        )
+        self.assertEqual(mapped.size, (30, 20))
+        for value in mapped.size:
+            self.assertIsInstance(value, int)
+
+    def _registered_pair(self):
+        """A 2-frame source: frame 0 the reference, frame 1 drifted by a known
+        transform. Returns (source, transform, spec drawn on frame 1)."""
+        reference = _structured_frame(seed=1)
+        transform = FrameTransform(dx=6.0, dy=-4.0, theta=3.0)
+        frame_n = _warp(reference, dx=6.0, dy=-4.0, theta=3.0)
+        source = _GraySource(np.stack([reference, frame_n]))
+        # Well inside the frame, so no zero-border creeps into either crop.
+        spec = RotatedCropSpec(center=(100.0, 96.0), size=(40, 24), angle=15.0)
+        return source, transform, spec
+
+    @staticmethod
+    def _mean_abs(a, b):
+        return float(np.abs(a.astype(np.float64) - b.astype(np.float64)).mean())
+
+    def test_registered_crop_matches_the_crop_from_the_anchor_frame(self):
+        source, transform, spec = self._registered_pair()
+        want = source.crop_rotated(spec).get_frame(1).raw
+
+        mapped = apply_correction_to_spec(
+            spec, transform, shape=(source.size_h, source.size_w)
+        )
+        registered = source.register({0: FrameTransform(0.0, 0.0, 0.0), 1: transform})
+        got = registered.crop_rotated(mapped).get_frame(1).raw
+
+        self.assertEqual(got.shape, want.shape)
+        # Interpolation runs twice on the `got` side (correct, then crop), so
+        # compare on mean absolute error rather than exactly.
+        self.assertLess(self._mean_abs(got, want), 12.0)
+
+    def test_the_unmapped_spec_is_measurably_worse(self):
+        """The negative control: without it the test above would still pass if
+        `apply_correction_to_spec` were `return spec`."""
+        source, transform, spec = self._registered_pair()
+        want = source.crop_rotated(spec).get_frame(1).raw
+        registered = source.register({0: FrameTransform(0.0, 0.0, 0.0), 1: transform})
+
+        mapped = apply_correction_to_spec(
+            spec, transform, shape=(source.size_h, source.size_w)
+        )
+        mapped_error = self._mean_abs(
+            registered.crop_rotated(mapped).get_frame(1).raw, want
+        )
+        unmapped_error = self._mean_abs(
+            registered.crop_rotated(spec).get_frame(1).raw, want
+        )
+
+        self.assertGreater(unmapped_error, 3.0 * mapped_error)
 
 
 class TestRunComparisonProgress(unittest.TestCase):

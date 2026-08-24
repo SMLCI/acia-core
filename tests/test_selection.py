@@ -212,5 +212,63 @@ class TestRealCropAndFingerprint(unittest.TestCase):
                 load_selection(m, source=seqfile)
 
 
+class TestAnchorFrame(unittest.TestCase):
+    """The frame an ROI was drawn on, carried through the manifest."""
+
+    def _sel(self, **kwargs):
+        return RoiSelection(
+            position=0,
+            roi=RotatedCropSpec(center=(10.0, 12.0), size=(6, 4), angle=0.0),
+            **kwargs,
+        )
+
+    def test_roundtrips_through_to_dict(self):
+        data = self._sel(anchor_frame=42).to_dict()
+        self.assertEqual(data["anchor_frame"], 42)
+        self.assertEqual(RoiSelection.from_dict(data).anchor_frame, 42)
+
+    def test_defaults_to_zero(self):
+        self.assertEqual(self._sel().anchor_frame, 0)
+
+    def test_survives_a_manifest_save_load(self):
+        m = _mk_manifest([(0, (10.0, 12.0), (6, 4), 0.0, "a")])
+        m.selections[0].anchor_frame = 17
+        with tempfile.TemporaryDirectory() as d:
+            save_selection(m, d)
+            reloaded = SelectionManifest.load(d)
+        self.assertEqual(reloaded.selections[0].anchor_frame, 17)
+
+
+class TestBackwardCompatibility(unittest.TestCase):
+    """Older selection.json files must keep loading, and a session curated on
+    frame 0 must keep writing exactly the JSON it always did -- anchor_frame is
+    purely additive in both directions."""
+
+    _LEGACY_KEYS = {"id", "position", "roi", "label", "notes", "preview"}
+
+    def test_pre_anchor_selection_loads_as_frame_zero(self):
+        legacy = {
+            "id": "sel0",
+            "position": 2,
+            "roi": {"center": [10.0, 12.0], "size": [6, 4], "angle": 0.0},
+            "label": "roi_01",
+            "notes": "",
+            "preview": None,
+        }
+        sel = RoiSelection.from_dict(legacy)
+        self.assertEqual(sel.anchor_frame, 0)
+        self.assertEqual(sel.position, 2)
+
+    def test_frame_zero_selection_serializes_without_the_new_key(self):
+        data = RoiSelection(
+            position=0,
+            roi=RotatedCropSpec(center=(10.0, 12.0), size=(6, 4), angle=0.0),
+            id="sel0",
+        ).to_dict()
+        self.assertNotIn("anchor_frame", data)
+        # ...and nothing else drifted either: byte-for-byte the old key set.
+        self.assertEqual(set(data), self._LEGACY_KEYS)
+
+
 if __name__ == "__main__":
     unittest.main()

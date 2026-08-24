@@ -19,6 +19,8 @@ import tifffile
 
 pytest.importorskip("anywidget")
 
+import traitlets  # noqa: E402
+
 from acia.notebook import SequenceDashboard  # noqa: E402
 from acia.segm.open import open_sequence  # noqa: E402
 from acia.selection import SelectionManifest  # noqa: E402
@@ -54,6 +56,32 @@ class TestConstruct(unittest.TestCase):
             self.assertEqual(dash.selections, [])
             self.assertEqual(dash.roi_mode, "single")
             self.assertTrue(dash.auto_save)
+
+    def test_preview_frame_defaults_to_the_middle(self):
+        """Frame 0 of a growing culture is usually empty, so the dashboard
+        opens mid-sequence instead."""
+        for n_frames, expected in ((1, 0), (2, 1), (3, 1), (8, 4)):
+            with tempfile.TemporaryDirectory() as d:
+                dash = SequenceDashboard(open_sequence(_tif(d, t=n_frames)))
+                self.assertEqual(dash.preview_frame, expected, f"t={n_frames}")
+
+    def test_preview_frame_kwarg_overrides_the_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = SequenceDashboard(open_sequence(_tif(d, t=3)), preview_frame=0)
+            self.assertEqual(dash.preview_frame, 0)
+
+    def test_preview_frame_clamps_to_the_last_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = SequenceDashboard(open_sequence(_tif(d, t=3)), preview_frame=99)
+            self.assertEqual(dash.preview_frame, 2)
+
+    def test_negative_preview_frame_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(traitlets.TraitError):
+                SequenceDashboard(open_sequence(_tif(d, t=3)), preview_frame=-1)
+            dash = SequenceDashboard(open_sequence(_tif(d, t=3)))
+            with self.assertRaises(traitlets.TraitError):
+                dash.preview_frame = -1
 
     def test_metadata_carries_source_identity(self):
         """The header's read-only Source field renders ``metadata['path']``."""
@@ -173,6 +201,36 @@ class TestMessages(unittest.TestCase):
             self.assertEqual(content["pos"], 0)
             self.assertIn("message", content)
             self.assertIsNone(buffers)
+
+
+class TestThumbnailFrame(unittest.TestCase):
+    """The gallery preview must come from `preview_frame`, not frame 0."""
+
+    def _thumb_bytes(self, dash):
+        dash.send = _Recorder()
+        dash._on_custom_msg(None, {"type": "thumb", "pos": 0, "downscale": 2}, None)
+        content, buffers = dash.send.sent[-1]
+        self.assertEqual(content["type"], "thumb", content)
+        return buffers[0]
+
+    def test_thumb_uses_the_preview_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif(d, t=3)
+            seqfile = open_sequence(path)
+            got = self._thumb_bytes(SequenceDashboard(open_sequence(path)))
+            # _tif writes random frames, so frame 1 and frame 0 really differ:
+            # the inequality is what proves the default actually moved.
+            self.assertEqual(got, seqfile.thumbnail_png(0, downscale=2, frame=1))
+            self.assertNotEqual(got, seqfile.thumbnail_png(0, downscale=2, frame=0))
+
+    def test_thumb_honours_an_explicit_preview_frame(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif(d, t=3)
+            seqfile = open_sequence(path)
+            got = self._thumb_bytes(
+                SequenceDashboard(open_sequence(path), preview_frame=2)
+            )
+            self.assertEqual(got, seqfile.thumbnail_png(0, downscale=2, frame=2))
 
 
 class TestManifestAndSave(unittest.TestCase):
@@ -302,6 +360,52 @@ class TestResume(unittest.TestCase):
             dash.save(out)
             with self.assertRaises(ValueError):
                 SequenceDashboard.resume(out)
+
+
+class TestAnchorFrameRoundTrip(unittest.TestCase):
+    """The frame an ROI was drawn on has to survive widget -> manifest -> disk
+    -> widget, or the export cannot place the crop after drift correction."""
+
+    def _sel(self, sel_id, anchor=None):
+        item = {
+            "id": sel_id,
+            "position": 0,
+            "label": f"roi_{sel_id}",
+            "ci": 0,
+            "roi": {"center": [5.0, 4.0], "size": [6, 4], "angle": 0.0},
+        }
+        if anchor is not None:
+            item["anchor_frame"] = anchor
+        return item
+
+    def test_manifest_carries_the_anchor(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = SequenceDashboard(open_sequence(_tif(d)))
+            dash.selections = [self._sel(1, anchor=2)]
+            self.assertEqual(dash.manifest.selections[0].anchor_frame, 2)
+
+    def test_manifest_defaults_the_anchor_when_absent(self):
+        """Trait dicts built before this field existed carry no key."""
+        with tempfile.TemporaryDirectory() as d:
+            dash = SequenceDashboard(open_sequence(_tif(d)))
+            dash.selections = [self._sel(1)]
+            self.assertEqual(dash.manifest.selections[0].anchor_frame, 0)
+
+    def test_resume_restores_mixed_anchors(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif(d)
+            dash = SequenceDashboard(open_sequence(path), roi_mode="multi")
+            dash.selections = [self._sel(1, anchor=0), self._sel(2, anchor=2)]
+            out = Path(d) / "curation"
+            dash.save(out)
+
+            resumed = SequenceDashboard.resume(out)
+            anchors = [item.get("anchor_frame") for item in resumed.selections]
+            self.assertEqual(anchors, [0, 2])
+            # ...and they survive a second hop back out to a manifest.
+            self.assertEqual(
+                [sel.anchor_frame for sel in resumed.manifest.selections], [0, 2]
+            )
 
 
 if __name__ == "__main__":

@@ -1101,6 +1101,13 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
 .acia-sd .sd-cstatus.err{background:rgba(140,30,20,.55);}
 .acia-sd .roi{position:absolute;border:2px solid var(--rc,#e08a12);cursor:move;
   background:color-mix(in srgb,var(--rc,#e08a12) 12%,transparent);}
+/* Annotated on a different frame than the one on screen: these
+   coordinates describe frame `anchor_frame`, so here the box is only
+   approximate (it is exact again once drift correction is applied).
+   Dashed as well as muted, so it does not read as colour alone. */
+.acia-sd .roi.stale{--rc:#8b8b8b;border-style:dashed;}
+.acia-sd .roi.stale .tag{opacity:.75;}
+.acia-sd .sd-frhint{color:var(--text-faint);cursor:help;border-bottom:1px dotted currentColor;}
 .acia-sd .roi.active{box-shadow:0 0 0 3px color-mix(in srgb,var(--rc) 30%,transparent);}
 .acia-sd .roi .tag{position:absolute;left:0;top:-18px;font-family:var(--font-mono);font-size:10px;
   background:var(--rc);color:#fff;padding:0 5px;border-radius:4px;white-space:nowrap;}
@@ -1171,6 +1178,9 @@ function render({ model, el }) {
   const ASPECT = dims[1] / dims[0];
   const NPOS = md.num_positions || (model.get("positions") || []).length || 1;
   const NT = md.num_timepoints || 1;
+  // The frame the editor opens on -- the middle one by default, since frame 0
+  // of a growing culture is usually empty (see SequenceDashboard.preview_frame).
+  const FRAME0 = Math.max(0, Math.min(NT - 1, +model.get("preview_frame") || 0));
   const PX = md.pixel_size_um || null;
   const COLORS = ["--roi-1","--roi-2","--roi-3","--roi-4","--roi-5"];
   const cvar = (v) => getComputedStyle(root).getPropertyValue(v).trim();
@@ -1202,8 +1212,12 @@ function render({ model, el }) {
         "<div class='sd-spec'>no ROI selected</div></div>" +
         "<div class='sd-card sd-crop-card' hidden><h3>Crop Preview</h3>" +
         "<canvas class='sd-crop'></canvas></div></div></div>" +
-        "<div class='sd-frbar'>frame <input type='range' class='sd-frame' min='0' max='" + (NT - 1) + "' value='0'>" +
-        " <span class='sd-frlbl'>0 / " + NT + "</span> (view only)</div>" +
+        "<div class='sd-frbar'>frame <input type='range' class='sd-frame' min='0' max='" + (NT - 1) + "' value='" + FRAME0 + "'>" +
+        " <span class='sd-frlbl'>" + FRAME0 + " / " + NT + "</span>" +
+        " <span class='sd-frhint' title='An ROI you draw or edit here is anchored to this frame. " +
+        "The anchor is saved in selection.json and used to place the crop correctly after drift " +
+        "correction. A dashed, greyed box was annotated on a different frame -- move it to re-anchor " +
+        "it here.'>· ROI anchor &#9432;</span></div>" +
         "<div class='sd-tools'><button class='sd-draw'>✎ Draw ROI</button>" +
         "<button class='sd-point primary' title='Click the 4 corners of the rectangle'>✛ Point-fit ROI</button>" +
         "<button class='sd-del' title='Delete the active ROI (Delete/Backspace)'>🗑 Delete</button>" +
@@ -1254,7 +1268,7 @@ function render({ model, el }) {
   const collapsedPos = new Set(); // position headers collapsed in the selections list
   // start past the highest id already present (e.g. resumed from a saved
   // selection.json) so newly drawn/fitted ROIs never collide with those ids
-  let frame = 0, uid = selections.reduce((m, x) => Math.max(m, +x.id || 0), 0) + 1, picking = false, points = [];
+  let frame = FRAME0, uid = selections.reduce((m, x) => Math.max(m, +x.id || 0), 0) + 1, picking = false, points = [];
   const frameImg = new Image();
   // Which position/frame `frameImg` currently holds -- lets the crop preview
   // tell "the loaded pixels match the active ROI's position" apart from
@@ -1358,6 +1372,14 @@ function render({ model, el }) {
   }
 
   // ---- editor ----
+  // Move the scrubber, its label and the requested frame together. An ROI is
+  // anchored to whichever frame is shown while it is drawn or edited, so these
+  // three must never drift apart.
+  function setFrame(t) {
+    frame = Math.max(0, Math.min(NT - 1, +t || 0));
+    $(".sd-frame").value = frame;
+    $(".sd-frlbl").textContent = frame + " / " + NT;
+  }
   let frameTimer = null;
   function requestFrame() {
     clearTimeout(frameTimer);
@@ -1369,11 +1391,16 @@ function render({ model, el }) {
     wrap.querySelectorAll(".roi:not(.preview)").forEach((n) => n.remove());
     roisAt(currentPos).forEach((sel) => {
       const eln = document.createElement("div");
-      eln.className = "roi" + (sel.id === activeId ? " active" : "");
+      // An ROI's coordinates belong to the frame it was drawn on; on any other
+      // frame it is shown muted+dashed and labelled with that frame, so it is
+      // obvious whether the annotation belongs to what is on screen.
+      const anchor = sel.anchor_frame || 0, stale = anchor !== frame;
+      eln.className = "roi" + (sel.id === activeId ? " active" : "") + (stale ? " stale" : "");
       eln.style.cssText = "--rc:" + hexOf(sel.ci) + ";left:" + D(sel.x) + "px;top:" + D(sel.y) +
         "px;width:" + D(sel.w) + "px;height:" + D(sel.h) +
         "px;transform:translate(-50%,-50%) rotate(" + sel.angle + "deg)";
-      eln.innerHTML = "<span class='tag'>" + sel.label + "</span><span class='knob'></span>" +
+      eln.innerHTML = "<span class='tag'>" + sel.label +
+        (stale ? " · f" + anchor : "") + "</span><span class='knob'></span>" +
         "<span class='rz' data-c='tl'></span><span class='rz' data-c='tr'></span>" +
         "<span class='rz' data-c='bl'></span><span class='rz' data-c='br'></span>";
       eln.addEventListener("pointerdown", (ev) => startDrag(ev, sel, "move", eln));
@@ -1391,8 +1418,11 @@ function render({ model, el }) {
     const sel = selections.find((x) => x.id === activeId);
     if (!sel || sel.position !== currentPos) { box.textContent = "no ROI selected"; renderCropPreview(null); return; }
     const um = PX ? " (" + (sel.w * PX).toFixed(1) + "×" + (sel.h * PX).toFixed(1) + " µm)" : "";
+    const anchor = sel.anchor_frame || 0;
     box.innerHTML = "center " + Math.round(sel.x) + ", " + Math.round(sel.y) + " px<br>" +
-      "size " + Math.round(sel.w) + "×" + Math.round(sel.h) + " px" + um + "<br>angle " + sel.angle.toFixed(1) + "°";
+      "size " + Math.round(sel.w) + "×" + Math.round(sel.h) + " px" + um + "<br>angle " + sel.angle.toFixed(1) + "°" +
+      "<br>anchor frame " + anchor +
+      (anchor === frame ? "" : " <span style='color:var(--text-faint)'>(not this frame)</span>");
     renderCropPreview(sel);
   }
   // Renders exactly what crop_rotated(RotatedCropSpec(...)) would produce for
@@ -1433,7 +1463,10 @@ function render({ model, el }) {
     if (picking) exitPick();
     currentPos = p; const h = roisAt(p); activeId = h.length ? h[0].id : null;
     root.querySelectorAll(".sd-thumb").forEach((t) => t.classList.toggle("sel", +t.dataset.ix === p));
-    frame = 0; $(".sd-frame").value = 0; $(".sd-frlbl").textContent = "0 / " + NT;
+    // The frame is deliberately NOT reset here: comparing the same timepoint
+    // across positions is what a curator actually wants, and resetting made
+    // this inconsistent with clicking a row in the selections list, which
+    // never reset it either.
     requestFrame(); renderEditor(); renderList();
   }
 
@@ -1442,6 +1475,7 @@ function render({ model, el }) {
   function pushSelections() {
     model.set("selections", selections.map((x) => ({
       id: x.id, position: x.position, label: x.label, ci: x.ci,
+      anchor_frame: x.anchor_frame || 0,
       roi: { center: [x.x, x.y], size: [Math.round(x.w), Math.round(x.h)], angle: x.angle },
     })));
     model.save_changes();
@@ -1473,9 +1507,13 @@ function render({ model, el }) {
         row.innerHTML = "<span class='sw' style='background:" + hexOf(sel.ci) + "'></span>" +
           "<span class='nm'>" + sel.label + "</span>" +
           "<span style='font-family:var(--font-mono);font-size:10px;color:var(--text-faint)'>" +
-          Math.round(sel.w) + "×" + Math.round(sel.h) + "</span>";
+          Math.round(sel.w) + "×" + Math.round(sel.h) +
+          " · f" + (sel.anchor_frame || 0) + "</span>";
         row.onclick = () => { currentPos = sel.position; activeId = sel.id;
           root.querySelectorAll(".sd-thumb").forEach((t) => t.classList.toggle("sel", +t.dataset.ix === currentPos));
+          // Jump to the frame this ROI was drawn on, so it shows solid over
+          // the pixels its coordinates actually describe.
+          setFrame(sel.anchor_frame || 0);
           requestFrame(); renderEditor(); renderList(); };
         list.appendChild(row);
       });
@@ -1493,7 +1531,7 @@ function render({ model, el }) {
     const h = roisAt(currentPos), ci = h.length ? Math.max.apply(null, h.map((x) => x.ci)) + 1 : 0;
     const sel = { id: uid++, position: currentPos, x: dims[0] / 2, y: dims[1] / 2,
       w: Math.round(dims[0] / 3), h: Math.round(dims[1] / 3), angle: 0,
-      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci };
+      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci, anchor_frame: frame };
     selections.push(sel); activeId = sel.id;
     renderEditor(); renderList(); pushSelections();
   }
@@ -1513,7 +1551,11 @@ function render({ model, el }) {
       x: Math.max(5, Math.min(dims[0] - 5, src.x + offX)),
       y: Math.max(5, Math.min(dims[1] - 5, src.y + offY)),
       w: src.w, h: src.h, angle: src.angle,
-      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci };
+      // The copy's geometry is the source's, so it is correct in the *source's*
+      // anchor frame -- not in whatever frame happens to be on screen. The drag
+      // that follows re-anchors it.
+      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci,
+      anchor_frame: src.anchor_frame || 0 };
     selections.push(sel); activeId = sel.id;
     renderEditor(); renderList(); pushSelections(); toast("Duplicated ROI -- drag it into place");
   }
@@ -1549,6 +1591,7 @@ function render({ model, el }) {
   }
   function onMove(ev) {
     if (!drag) return;
+    drag.moved = true;
     const { sel, kind, rect } = drag, mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
     if (kind === "move") {
       sel.x = Math.max(5, Math.min(dims[0] - 5, drag.ox + I(ev.clientX - drag.px)));
@@ -1572,7 +1615,15 @@ function render({ model, el }) {
     eln.style.transform = "translate(-50%,-50%) rotate(" + sel.angle + "deg)";
     renderSpec();
   }
-  function onUp() { window.removeEventListener("pointermove", onMove); drag = null; renderList(); pushSelections(); }
+  function onUp() {
+    window.removeEventListener("pointermove", onMove);
+    // Re-anchor to the frame the user was actually looking at while editing --
+    // the new coordinates are in *that* frame's system. Gated on an actual
+    // move: a bare click just selects a box (pointerdown -> pointerup with no
+    // pointermove), and must not silently re-anchor an ROI merely looked at.
+    if (drag && drag.moved) { drag.sel.anchor_frame = frame; renderEditor(); }
+    drag = null; renderList(); pushSelections();
+  }
 
   // ---- point-fit (via Python cv2) ----
   const FIT_POINTS = 4; // one click per corner of the intended rectangle
@@ -1609,7 +1660,7 @@ function render({ model, el }) {
     if (mode === "single") selections = selections.filter((x) => x.position !== currentPos);
     const hh = roisAt(currentPos), ci = hh.length ? Math.max.apply(null, hh.map((x) => x.ci)) + 1 : 0;
     const sel = { id: uid++, position: currentPos, x: cx, y: cy, w: w, h: h, angle: roi.angle,
-      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci };
+      label: "roi_" + String(ci + 1).padStart(2, "0"), ci: ci, anchor_frame: frame };
     selections.push(sel); activeId = sel.id; exitPick();
     renderEditor(); renderList(); pushSelections(); toast("Fitted ROI from points");
   }
@@ -1643,8 +1694,8 @@ function render({ model, el }) {
     else applyViewSize(preFsViewSize);
   }
   document.addEventListener("fullscreenchange", onFsChange);
-  $(".sd-frame").addEventListener("input", (e) => { frame = +e.target.value;
-    $(".sd-frlbl").textContent = frame + " / " + NT; requestFrame(); });
+  $(".sd-frame").addEventListener("input", (e) => {
+    setFrame(e.target.value); requestFrame(); renderEditor(); });
   $(".sd-draw").onclick = () => { if (picking) exitPick(); addRoi(); };
   $(".sd-point").onclick = () => { picking ? exitPick() : enterPick(); if (!picking) renderEditor(); };
   $(".sd-del").onclick = () => { if (activeId) removeSel(activeId); };
@@ -2786,12 +2837,19 @@ if _HAS_ANYWIDGET:
         roi_mode = traitlets.Unicode("single").tag(sync=True)
         view_size = traitlets.Int(430).tag(sync=True)
         auto_save = traitlets.Bool(True).tag(sync=True)
+        preview_frame = traitlets.Int(0).tag(sync=True)
 
         _esm = _SEQUENCE_DASHBOARD_ESM
         _css = _SEQUENCE_DASHBOARD_CSS
 
         def __init__(
-            self, source, *, roi_mode: str = "single", save_dir=None, **kwargs
+            self,
+            source,
+            *,
+            roi_mode: str = "single",
+            save_dir=None,
+            preview_frame: int | None = None,
+            **kwargs,
         ) -> None:
             """Build the dashboard from a source (no pixel reads at construction).
 
@@ -2802,8 +2860,19 @@ if _HAS_ANYWIDGET:
                 save_dir: Default output directory for :meth:`save` (and hence for
                     auto-save, which is on by default). ``None`` keeps the previous
                     behaviour of writing into the current working directory.
+                preview_frame: Which frame the gallery thumbnails and the ROI
+                    editor open on. ``None`` (the default) picks the middle
+                    frame, ``num_timepoints // 2``: in a growing culture frame 0
+                    is typically empty, so opening there gives no indication
+                    whether a chamber holds cells at all. Clamped into range.
+                    Note this indexes the *source's* timepoints -- if a later
+                    export step truncates the sequence, pick a frame inside
+                    that range (see :attr:`~acia.selection.RoiSelection.anchor_frame`).
                 **kwargs: Forwarded to ``anywidget.AnyWidget`` (e.g. ``auto_save``
                     to start with auto-save switched off).
+
+            Raises:
+                traitlets.TraitError: If ``preview_frame`` is negative.
             """
             from acia.segm.open import open_sequence
 
@@ -2813,6 +2882,16 @@ if _HAS_ANYWIDGET:
             self._save_dir = None if save_dir is None else os.fspath(save_dir)
 
             meta = source.metadata
+            # Cells need time to grow, so frame 0 of a chamber is usually blank
+            # and says nothing about whether it is worth curating. Open on the
+            # middle frame instead -- thumbnails and editor alike. Clamped here,
+            # where num_timepoints is known for certain, rather than in the
+            # trait validator.
+            num_t = max(1, int(meta.num_timepoints or 1))
+            chosen = num_t // 2 if preview_frame is None else int(preview_frame)
+            if chosen < 0:
+                raise traitlets.TraitError(f"preview_frame must be >= 0, got {chosen}.")
+            preview_frame = min(num_t - 1, chosen)
             positions = [
                 {"index": p.index, "name": p.name, "has_roi": False}
                 for p in source.positions
@@ -2830,9 +2909,24 @@ if _HAS_ANYWIDGET:
                 positions=positions,
                 selections=[],
                 roi_mode=roi_mode,
+                preview_frame=preview_frame,
                 **kwargs,
             )
             self.on_msg(self._on_custom_msg)
+
+        @traitlets.validate("preview_frame")
+        def _validate_preview_frame(self, proposal):
+            """Reject a negative frame index.
+
+            Only the lower bound is checked here: the upper one depends on the
+            source's ``num_timepoints``, which ``__init__`` clamps against
+            directly rather than relying on trait-assignment ordering inside
+            ``super().__init__``.
+            """
+            value = int(proposal["value"])
+            if value < 0:
+                raise traitlets.TraitError(f"preview_frame must be >= 0, got {value}.")
+            return value
 
         def _on_custom_msg(self, _widget, content, buffers) -> None:
             """Serve lazy frames/thumbnails and run point-fit for the ESM.
@@ -2862,8 +2956,15 @@ if _HAS_ANYWIDGET:
             if kind == "thumb":
                 pos = int(content["pos"])
                 try:
+                    # The gallery shows one fixed frame for every position:
+                    # thumbnails are fetched lazily as rows scroll into view and
+                    # inserted once, so letting the editor's scrubber drive them
+                    # would fire a blocking read per row per scrub and leave the
+                    # gallery showing a mix of timepoints.
                     png = self._file.thumbnail_png(
-                        pos, downscale=int(content.get("downscale", 8))
+                        pos,
+                        downscale=int(content.get("downscale", 8)),
+                        frame=self.preview_frame,
                     )
                 except Exception as exc:  # noqa: BLE001 - report to the frontend
                     self.send(
@@ -2947,6 +3048,9 @@ if _HAS_ANYWIDGET:
                         roi=spec,
                         label=item.get("label", ""),
                         id=str(item.get("id", "")),
+                        # .get with a default: trait dicts built before this
+                        # field existed (and any set from Python) omit the key.
+                        anchor_frame=int(item.get("anchor_frame", 0)),
                     )
                 )
             return SelectionManifest(
@@ -3038,6 +3142,7 @@ if _HAS_ANYWIDGET:
                         "position": sel.position,
                         "label": sel.label,
                         "ci": ci,
+                        "anchor_frame": sel.anchor_frame,
                         "roi": sel.roi.to_dict(),
                     }
                 )

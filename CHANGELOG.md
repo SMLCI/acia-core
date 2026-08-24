@@ -86,11 +86,27 @@ whole module stays importable without `anywidget` installed):
     something a caller has to reach in and patch.
   - `batch_apply(sources={position: source})` registers a supplied (e.g. lazily
     sliced) source per position instead of the full position.
+  - `acia.registration.apply_correction_to_spec` carries a `RotatedCropSpec`
+    drawn on one frame onto the drift-corrected (reference-frame) view, so
+    `source.register(transforms).crop_rotated(spec)` takes the region the spec
+    was drawn around rather than wherever that frame had drifted to. It shares
+    its matrix with `apply_correction`, so crop geometry and corrected pixels
+    cannot disagree.
   - `ImageSequenceSource.register(..., on_missing=...)`, also on
     `load_registration`: `"warn"` (default), `"nearest"` (correct a failed
     frame with its neighbor's transform instead of exporting it uncorrected,
     which is off by the full accumulated drift), or `"error"`.
     `RegisteredSequenceSource.missing_frames` reports every gap at once.
+
+**ROI curation** (`acia.selection`, `acia.notebook`):
+- `SequenceDashboard(preview_frame=...)` chooses the frame the gallery
+  thumbnails and the ROI editor open on, defaulting to the **middle** frame. In
+  a growing culture frame 0 is typically empty, so opening there gave no
+  indication whether a chamber held any cells worth curating.
+- `RoiSelection.anchor_frame`: the frame an ROI was drawn on, recorded in
+  `selection.json`. Additive and omitted when zero, so manifests written by
+  earlier versions load unchanged and are re-saved byte-identically (schema
+  stays `acia.selection/v1`).
 
 **Image sources and I/O**:
 - `open_sequence(path)`: one entry point that dispatches by suffix to the ND2,
@@ -289,6 +305,14 @@ warning-free under `-W`.
     resumes by frame *count*, so frames a previous run recorded as failures are
     never re-estimated. Delete the file (or the affected records) and register
     those positions again to pick up the new policy.
+- `SequenceDashboard` no longer resets the frame scrubber when you switch
+  position — matching what clicking a row in the selections list already did,
+  and letting the same timepoint be compared across positions. The scrubber's
+  "(view only)" label is gone: the frame on screen is now the frame a newly
+  drawn or edited ROI is anchored to. An ROI whose anchor is not the frame
+  being shown renders muted and dashed with its anchor frame on the label;
+  moving it re-anchors it to the displayed frame. Merely *clicking* an ROI
+  selects it without re-anchoring.
 - `RegisteredSequenceSource` now warns once per missing frame index instead of
   once per read, so a lazy multi-pass consumer (crop → write) no longer repeats
   the same warning on every pass.
@@ -319,6 +343,12 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- Cropping a drift-corrected source with an ROI drawn on a frame other than the
+  registration reference placed the crop off by the drift accumulated up to
+  that frame — silently, and worse the later the frame. The ROI's
+  `anchor_frame` is now recorded and applied via `apply_correction_to_spec`
+  before cropping. ROIs drawn on frame 0 — every selection made before this
+  release, since frame 0 was the only frame the editor showed — are unaffected.
 - `scale()` aborted the whole batch when a notebook's kernel failed to start.
   Both the sequential and the parallel path caught only
   `papermill.PapermillExecutionError` — which means "a cell raised" — while a

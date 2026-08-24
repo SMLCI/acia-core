@@ -211,6 +211,34 @@ class FrameTransform:
         )
 
 
+def _correction_matrix(shape: tuple[int, int], transform: FrameTransform) -> np.ndarray:
+    """The 2x3 affine mapping frame-N pixel coordinates onto the reference frame.
+
+    ``transform`` is estimated as reference->frame N and expressed as a rotation
+    about the **full frame's** center followed by an explicit translation (the
+    ``cv2.getRotationMatrix2D``-then-add-to-the-translation-column convention
+    this module uses throughout). Inverting it gives the direction a *consumer*
+    of a corrected frame needs: a point in frame N -> where that same physical
+    point sits in the reference frame's coordinate system, which is the system
+    corrected frames live in.
+
+    Args:
+        shape: ``(H, W)`` of the **full** frame the transform was estimated on.
+            The rotation pivots about that frame's center, so a crop's (or a
+            pyramid level's) dimensions would silently give a different matrix.
+        transform: The reference->frame-N transform.
+
+    Returns:
+        np.ndarray: A ``(2, 3)`` affine mapping frame-N coordinates to
+            reference-frame coordinates.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), transform.theta, 1.0)
+    matrix[0, 2] += transform.dx
+    matrix[1, 2] += transform.dy
+    return cv2.invertAffineTransform(matrix)
+
+
 def apply_correction(frame: np.ndarray, transform: FrameTransform) -> np.ndarray:
     """Undo an estimated drift by inverting and applying its forward transform.
 
@@ -222,7 +250,8 @@ def apply_correction(frame: np.ndarray, transform: FrameTransform) -> np.ndarray
 
     This is the single place this warp math lives -- the verify view, the
     batch-apply step, and :class:`~acia.base.RegisteredSequenceSource` all call
-    this one implementation.
+    this one implementation, and :func:`apply_correction_to_spec` moves crop
+    geometry with the very same matrix, so pixels and geometry cannot disagree.
 
     Args:
         frame: The frame to correct, grayscale ``(H, W)`` or multi-channel
@@ -234,11 +263,7 @@ def apply_correction(frame: np.ndarray, transform: FrameTransform) -> np.ndarray
             system, same shape as ``frame``.
     """
     h, w = frame.shape[:2]
-    center = (w / 2.0, h / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, transform.theta, 1.0)
-    matrix[0, 2] += transform.dx
-    matrix[1, 2] += transform.dy
-    inverse = cv2.invertAffineTransform(matrix)
+    inverse = _correction_matrix((h, w), transform)
 
     if frame.ndim == 2:
         # grayscale (H, W): warpAffine handles directly
@@ -258,6 +283,63 @@ def apply_correction(frame: np.ndarray, transform: FrameTransform) -> np.ndarray
         for c in range(frame.shape[2])
     ]
     return np.stack(channels, axis=-1)
+
+
+def apply_correction_to_spec(
+    spec: RotatedCropSpec,
+    transform: FrameTransform | None,
+    *,
+    shape: tuple[int, int],
+) -> RotatedCropSpec:
+    """Carry a crop spec drawn on one frame onto the drift-corrected view.
+
+    A :class:`~acia.base.RotatedCropSpec` lives in the pixel coordinate system
+    of the frame it was drawn on. :func:`apply_correction` puts corrected
+    frames into the **reference** frame's coordinate system, so cropping a
+    :class:`~acia.base.RegisteredSequenceSource` with a spec drawn on some
+    later frame lands the crop wherever that frame had drifted to -- off by the
+    full drift accumulated up to it, silently, and worse the later the frame.
+    This maps the spec across, so ``registered.crop_rotated(mapped)`` takes the
+    region ``raw.crop_rotated(spec)`` would have taken from the frame it was
+    drawn on.
+
+    The rectangle is rigid, so only its pose moves: the center rides the same
+    inverse warp :func:`apply_correction` applies to pixels (via the shared
+    :func:`_correction_matrix`), the angle picks up ``transform.theta`` --
+    rotations about a common center compose additively, the same homomorphism
+    :func:`compose` relies on -- and ``size`` is untouched.
+
+    Args:
+        spec: The crop spec, in the coordinate system of the frame it was drawn
+            on.
+        transform: The reference->that-frame transform, or ``None`` to return
+            ``spec`` unchanged. ``None`` is the honest answer for a spec drawn
+            on the reference frame itself and for an unregistered source --
+            both need no mapping.
+        shape: ``(H, W)`` of the **full** frame, the same shape
+            :func:`apply_correction` sees -- not the crop's. Keyword-only
+            because this module's rect geometry is ``(w, h)`` while its image
+            shapes are ``(H, W)``, and getting them the wrong way round would
+            mis-place the crop without raising.
+
+    Returns:
+        RotatedCropSpec: The equivalent spec in the reference frame's
+            coordinate system, ready to use against a source returned by
+            :meth:`~acia.base.ImageSequenceSource.register`.
+    """
+    if transform is None:
+        return spec
+
+    inverse = _correction_matrix(shape, transform)
+    point = np.asarray(spec.center, dtype=np.float64)
+    center = inverse[:, :2] @ point + inverse[:, 2]
+    return RotatedCropSpec(
+        # size is passed through untouched on purpose: RotatedCropSpec requires
+        # positive *ints*, so routing it through numpy would raise.
+        center=(float(center[0]), float(center[1])),
+        size=spec.size,
+        angle=float(spec.angle + transform.theta),
+    )
 
 
 class RegistrationMethod(ABC):
