@@ -108,9 +108,14 @@ def to_openlineage(
             # eventTime is required by the spec; a manifest predating the timestamps
             # still has finished_at, but be defensive rather than emit an invalid event
             finished_at = entry.get("finished_at") or _stage_io._utc()
+            # a stage that recorded itself as failed is a failed run, not a
+            # complete one; entries written before `status` existed have none and
+            # are complete by construction -- they were only written by record()
+            status = entry.get("status")
+            state = RunState.COMPLETE if status in (None, "ok") else RunState.FAIL
             client.emit(
                 RunEvent(
-                    eventType=RunState.COMPLETE,
+                    eventType=state,
                     eventTime=finished_at,
                     run=Run(runId=str(uuid.uuid4())),
                     job=Job(namespace=JOB_NAMESPACE, name=f"{name}/{population}"),

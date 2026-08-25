@@ -17,32 +17,74 @@ population this is, and what has already run here.
 
 ## Writing a stage
 
-Write files wherever the context points and say what you did at the end:
+Name the stage when you build the context, then record as you go:
 
 ```python
+ctx = StageContext.for_image(image_id, output_folder, stage='Segment')
+
 source = open_sequence(image_id)
+ctx.log_calibration(source)
+ctx.log_params(backend='omnipose', diameter_px=12)
+
 props = extract_properties(source)
+write_units_csv(ctx.keyed(props), ctx.output_path('cell_properties.csv'))
+np.savez(ctx.output_path('segmentation.npz'), **segmentation)
 
-write_units_csv(ctx.keyed(props), ctx.path('cell_properties.csv'))
-np.savez(ctx.path('segmentation.npz'), **segmentation)
-
-ctx.record('Segment', pixel_size=str(source.pixel_size), n_cells=len(props))
+ctx.log_metrics(n_cells=len(props))
+ctx.log_figure(fig, 'size_distribution', caption='cell area distribution')
+ctx.finish()
 ```
 
-{meth}`~acia.analysis.StageContext.path` joins a name onto the output folder, and
+Everything logged is written to `stage_manifest.json` **the moment it happens**, not at
+the end. That matters more than it sounds: parameters and figures are the parts of a run
+that re-running cannot recover, and a notebook that dies half-way used to record nothing
+at all — while `scale(exist_skip=True)` then skips that stage on every later run. Until
+{meth}`~acia.analysis.StageContext.finish`, the entry is marked `"running"`, so an
+interrupted stage is never mistaken for a finished one.
+
+{meth}`~acia.analysis.StageContext.output_path` joins a name onto the output folder and
+creates its parent; {meth}`~acia.analysis.StageContext.input_path` does the same for a
+file this stage reads, failing with a useful message instead of a confusing one further
+down:
+
+```python
+segmentation = load_segmentation(ctx.input_path('segmentation.npz'))
+```
+
+The pair is about saying what you *meant* to read and write. Direction itself is still
+observed rather than taken from these calls — see below — but a name declared and never
+written shows up in the manifest as `io.missing`, which is usually a typo.
+
 {meth}`~acia.analysis.StageContext.keyed` stamps the population's identity columns onto a
 table so many populations concatenate cleanly later.
-{meth}`~acia.analysis.StageContext.record` appends this stage's entry to
-`stage_manifest.json`; the keyword arguments are yours — whatever settings and counts
-make the run worth reading back.
 
-Reading what an earlier stage produced goes through
-{meth}`~acia.analysis.StageContext.require`, which fails with a useful message instead of
-a confusing one further down:
+Under {func}`~acia.analysis.scale`, the parameters papermill injected are recorded on
+their own — you do not have to repeat your parameter cell into `log_params`.
+
+### Seeing what is there
+
+Put the context at the end of a cell and it renders the folder: which stages ran and how
+they ended, this stage's parameters, metrics and figures, and every file with the stage
+that produced it.
 
 ```python
-segmentation = load_segmentation(ctx.require('segmentation.npz'))
+ctx
 ```
+
+### Calibration
+
+{meth}`~acia.analysis.StageContext.log_calibration` records the pixel size and frame
+interval a stage actually resolved. The movie stays the single authority — this does not
+become a second place to read calibration from — but it means "what interval did this run
+use?" has an answer, and a later stage that resolves a different value **warns** instead
+of quietly producing results that cannot be compared with the earlier ones.
+
+### `record()`
+
+`ctx.record('Segment', n_cells=…)` still works and still writes exactly what it always
+did; it is the explicit finalize, equivalent to logging those keyword arguments and
+calling `finish()`. A context built without a `stage=` name behaves exactly as before:
+nothing is written until `record()`.
 
 A later stage does not need to be told the source again — the folder already records it:
 

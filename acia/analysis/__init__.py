@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import multiprocessing
 import os
@@ -29,13 +30,15 @@ from tqdm.auto import tqdm
 from acia import Q_, U_
 from acia.analysis._scale_progress import _WorkerBars
 from acia.analysis._scale_progress import register_engine as register_progress_engine
-from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV
+from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV, STAGE_PARAMS_ENV
 from acia.analysis.growth_rate import AggMode as AggMode
 from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
 from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
+from acia.analysis.stage import CALIBRATION_SCHEMA as CALIBRATION_SCHEMA
 from acia.analysis.stage import DEFAULT_KEY_PATTERN as DEFAULT_KEY_PATTERN
 from acia.analysis.stage import IO_SCHEMA as IO_SCHEMA
 from acia.analysis.stage import MANIFEST_NAME as MANIFEST_NAME
+from acia.analysis.stage import STAGE_SCHEMA as STAGE_SCHEMA
 from acia.analysis.stage import StageContext as StageContext
 from acia.analysis.stage import check_stale as check_stale
 from acia.analysis.stage import population_id_of as population_id_of
@@ -1085,6 +1088,12 @@ def _scale_execute_one(
         # destroy the one question it exists to answer -- did this batch all run the
         # same code?
         os.environ[STAGE_NOTEBOOK_ENV] = str(src)
+        # ... and which parameters it was given, so StageContext records the run's
+        # real settings without every notebook having to repeat them into
+        # log_params(). Same reasoning as the line above: an env var needs no
+        # `parameters` cell and raises no "unknown parameter" warning.
+        with contextlib.suppress(TypeError, ValueError):
+            os.environ[STAGE_PARAMS_ENV] = json.dumps(parameters, default=str)
 
         try:
             _execute_notebook(
@@ -1096,6 +1105,11 @@ def _scale_execute_one(
                 **extra,
             )
         finally:
+            os.environ.pop(STAGE_PARAMS_ENV, None)
+            # papermill writes the executed notebook back into `dst` only after it
+            # returns, so this cannot be done from inside the notebook -- the last
+            # cell never sees the finished document
+            _export_notebook_html(dst)
             if progress_queue is not None:
                 # papermill closes the reporter itself, but not when it fails
                 # before the notebook manager exists -- make sure the parent's
@@ -1104,6 +1118,25 @@ def _scale_execute_one(
 
         executions.append(dict(parameters=parameters, storage_folder=dst.parent))
     return executions
+
+
+def _export_notebook_html(notebook: Path) -> Path | None:
+    """Write an HTML rendering of an executed notebook beside it.
+
+    A run's own record of what it looked like, readable without Jupyter. Entirely
+    best-effort: ``nbconvert`` is an optional dependency and a failed export must
+    never be the reason a completed analysis reports failure.
+    """
+    try:
+        from nbconvert import HTMLExporter  # noqa: PLC0415 -- optional dependency
+
+        body, _ = HTMLExporter().from_filename(str(notebook))
+        target = notebook.with_suffix(".html")
+        target.write_text(body, encoding="utf-8")
+        return target
+    except Exception:
+        logger.debug("could not export %s to HTML", notebook, exc_info=True)
+        return None
 
 
 def scale(

@@ -16,6 +16,39 @@ as the work lands.
 
 ### Added
 
+**Recording a stage as it happens** (`acia.analysis.StageContext`) — the record is now
+written while the stage runs, and is visible in the notebook that produced it:
+- `StageContext.for_image(..., stage='Segment')` names the stage up front, which is what
+  lets everything below be written immediately rather than in one call at the end.
+- `log_params()`, `log_metrics()`, `log_figure()`, `log_artifact()` persist to
+  `stage_manifest.json` the moment they are called. Parameters and figures are the parts
+  of a run that re-running cannot recover, and a notebook that died half-way used to
+  record nothing — while `scale(exist_skip=True)` then skips that stage on every later
+  run, so the run that died was exactly the one whose record was wanted.
+- An unfinished stage is marked `"running"` and a stage whose cell raised is marked
+  `"failed"`, with the exception recorded. `finish()` marks it `"ok"`. Previously a
+  crashed stage was indistinguishable from one that never ran.
+- `input_path()` / `output_path()` state which artifacts a stage reads and writes.
+  Direction is still *observed* rather than declared — that is what makes the dependency
+  graph unable to fall out of date — but a declared output never written is reported as
+  `io.missing`, and a declared read is recorded even for readers the audit hook cannot
+  see (OpenCV's C++ layer, a remote OMERO source). `require()` is now an alias of
+  `input_path()`.
+- `log_calibration(source)` records the pixel size and frame interval a stage actually
+  resolved, and warns when a later stage of the same population resolves a different one.
+  The movie stays the single authority; this exists so that "what interval did this run
+  use?" has an answer and a silent disagreement between two stages has something to
+  notice it. `calibration()` reads it back.
+- `ctx` now renders in a notebook: stages and how they ended, this stage's parameters,
+  metrics and figures, and every file in the folder with the stage that produced it.
+- `scale()` records the parameters papermill injected, so a notebook no longer has to
+  repeat its parameter cell into `log_params()`, and renders each executed stage notebook
+  to HTML beside it (needs the new `report` extra; best-effort, never fatal).
+- The manifest gains `status`, `params`, `metrics`, `figures`, `calibration`, `error` and
+  `io.declared_inputs`, under `acia.stage/v2`. Additive: entries written by earlier
+  versions have no `schema` key and are read unchanged, and `record()` still writes its
+  `**extra` flat at the top of the entry.
+
 **Interactive curation widgets** (`acia.notebook`, new `widget` extra — the
 whole module stays importable without `anywidget` installed):
 - `SequenceDashboard`: a three-pane curation UI (position gallery, ROI editor,
@@ -343,6 +376,16 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- `stage_manifest.json` was rewritten non-atomically. With one write per stage the window
+  was academic; recording as the stage runs widens it a hundredfold, and a truncated
+  manifest is not a lost record but a poisoned folder — every later `for_image()` reads it
+  while resolving the source, so the next run would die on a `JSONDecodeError`. Writes now
+  go through a temp file and `os.replace`.
+- `StageContext.clear()` `rmtree`d a directory artifact even when another stage also wrote
+  into it, so clearing one stage could delete another's figures. A shared directory is now
+  left alone.
+- `stage_table()` let a recorded setting shadow a derived column — a stage recording
+  `duration_s=...` overwrote the real duration. Derived columns are now applied last.
 - Tracking input was **silently misaligned** for any overlay whose first
   detection was not on frame 0. `overlay_to_masks` built its stack from
   `Overlay.timeIterator()`, which starts at the first *populated* frame, so an

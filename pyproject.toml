@@ -87,6 +87,10 @@ docs = [
     "sphinx-design>=0.6",
     "ipykernel>=6.0",
 ]
+# scale() renders each executed stage notebook to HTML beside it, so a run is
+# readable without Jupyter. Optional: the export is best-effort and a missing
+# nbconvert costs nothing but that file.
+report = ["nbconvert>=7.0"]
 omero = ["omero-py>=5.9.3"]
 # export recorded stage runs as OpenLineage events (acia.analysis.lineage). The
 # manifest stays the source of truth; this is only for handing lineage to tooling
