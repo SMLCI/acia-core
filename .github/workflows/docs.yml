@@ -51,14 +51,14 @@ jobs:
 
       # ~20 MB of individual frames, fetched over WebDAV by the notebooks.
       - name: Cache tutorial sample data
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: docs/tutorials/data
           key: tutorial-data-colony-v1
 
       # bact_phase_omni weights (~25 MB) are fetched on first model load.
       - name: Cache segmentation model weights
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cellpose
           key: omnipose-weights-v1
@@ -67,7 +67,7 @@ jobs:
       # is pinned in docs/conf.py (nb_execution_cache_path) so it does not move
       # with the output directory.
       - name: Cache notebook execution
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: docs/_build/.jupyter_cache
           key: jupyter-cache-${{ hashFiles('docs/tutorials/*.ipynb', 'pyproject.toml') }}
