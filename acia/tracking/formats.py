@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ import tifffile
 
 from acia.base import Contour, ImageSequenceSource, Overlay
 from acia.segm.formats import read_ctc_segmentation_native
+from acia.segm.rasterize import frame_label_mask
 
 
 def parse_simple_tracking(file_content: str) -> tuple[Overlay, nx.DiGraph]:
@@ -184,12 +186,26 @@ def write_ctc_tracking(
     # get the image size
     height, width = next(iter(images)).raw.shape[:2]
 
-    # Write segmentation information
-    for i, frame_overlay in enumerate(overlay.timeIterator()):
-        local_mask = np.zeros((height, width), dtype=np.uint16)
-        for cont in frame_overlay:
-            cont_mask = cont.toMask(height, width).astype(np.uint16) * cont.label
-            local_mask = np.maximum(local_mask, cont_mask)
+    # Write segmentation information. Frames are indexed absolutely so the file
+    # numbering matches the overlay's frames: building this from timeIterator()
+    # started at the first *populated* frame, so an overlay whose earliest
+    # detection sat on frame 3 wrote it as man_track0000.tif.
+    by_frame: dict[int, list] = defaultdict(list)
+    for cont in overlay:
+        by_frame[cont.frame].append(cont)
+
+    frames = overlay.frames()
+    num_frames = int(np.max(frames)) + 1 if len(frames) else 0
+    if by_frame:
+        num_frames = max(num_frames, int(max(by_frame)) + 1)
+
+    for i in range(num_frames):
+        conts = by_frame.get(i, [])
+        # exact_polygons: these masks are the persisted record of the
+        # segmentation, so polygons keep the pixel-centre rule they always had
+        local_mask = frame_label_mask(
+            conts, height=height, width=width, exact_polygons=True
+        ).astype(np.uint16)
 
         # zlib-compress the label masks: they are mostly background and highly
         # repetitive, so this is ~50x smaller than the uncompressed write (1 GiB

@@ -27,6 +27,7 @@ wrapped, and a failure degrades to "no record", never to an error.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import platform
@@ -41,6 +42,12 @@ logger = logging.getLogger(__name__)
 #: environment variable through which :func:`acia.analysis.scale` tells a kernel
 #: which stage notebook it is executing (the kernel cannot know otherwise)
 STAGE_NOTEBOOK_ENV = "ACIA_STAGE_NOTEBOOK"
+
+#: environment variable through which ``acia.analysis.scale`` passes the
+#: parameters it injected into a stage notebook, as JSON. Lets ``StageContext``
+#: record what a run was actually parameterised with instead of relying on every
+#: notebook to repeat its own parameter cell into ``log_params()``.
+STAGE_PARAMS_ENV = "ACIA_STAGE_PARAMS"
 
 #: modes that mean "this file is being produced" -- everything else is a read
 _WRITE_MODES = set("wax+")
@@ -302,3 +309,19 @@ class _TrackRegion:
                     activate(self._previous)
         except Exception:
             logger.debug("could not close a tracking region", exc_info=True)
+
+
+def injected_params() -> dict[str, Any]:
+    """Parameters ``scale()`` injected into this notebook, or ``{}``.
+
+    Never raises and never guesses: an unset variable, malformed JSON or a
+    non-object payload all mean "nothing known", which is the pre-feature state.
+    """
+    raw = os.environ.get(STAGE_PARAMS_ENV)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}

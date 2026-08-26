@@ -16,6 +16,42 @@ as the work lands.
 
 ### Added
 
+**Recording a stage as it happens** (`acia.analysis.StageContext`) — the record is now
+written while the stage runs, and is visible in the notebook that produced it:
+- `StageContext.for_image(..., stage='Segment')` names the stage up front, which is what
+  lets everything below be written immediately rather than in one call at the end.
+- `log_params()`, `log_metrics()`, `log_figure()`, `log_artifact()` persist to
+  `stage_manifest.json` the moment they are called. Parameters and figures are the parts
+  of a run that re-running cannot recover, and a notebook that died half-way used to
+  record nothing — while `scale(exist_skip=True)` then skips that stage on every later
+  run, so the run that died was exactly the one whose record was wanted.
+- An unfinished stage is marked `"running"` and a stage whose cell raised is marked
+  `"failed"`, with the exception recorded. `finish()` marks it `"ok"`. Previously a
+  crashed stage was indistinguishable from one that never ran.
+- `input_path()` / `output_path()` state which artifacts a stage reads and writes.
+  Direction is still *observed* rather than declared — that is what makes the dependency
+  graph unable to fall out of date — but a declared output never written is reported as
+  `io.missing`, and a declared read is recorded even for readers the audit hook cannot
+  see (OpenCV's C++ layer, a remote OMERO source). `require()` is now an alias of
+  `input_path()`.
+- `log_calibration(source)` records the pixel size and frame interval a stage actually
+  resolved, and warns when a later stage of the same population resolves a different one.
+  The movie stays the single authority; this exists so that "what interval did this run
+  use?" has an answer and a silent disagreement between two stages has something to
+  notice it. `calibration()` reads it back.
+- `stage_table()` gains `error_type` and `error_message`, so a fan-out can say *why* a
+  population stopped rather than only that it did — across a batch that is what separates
+  one ROI running out of GPU memory from a chain that is broken for everything.
+- `ctx` now renders in a notebook: stages and how they ended, this stage's parameters,
+  metrics and figures, and every file in the folder with the stage that produced it.
+- `scale()` records the parameters papermill injected, so a notebook no longer has to
+  repeat its parameter cell into `log_params()`, and renders each executed stage notebook
+  to HTML beside it (needs the new `report` extra; best-effort, never fatal).
+- The manifest gains `status`, `params`, `metrics`, `figures`, `calibration`, `error` and
+  `io.declared_inputs`, under `acia.stage/v2`. Additive: entries written by earlier
+  versions have no `schema` key and are read unchanged, and `record()` still writes its
+  `**extra` flat at the top of the entry.
+
 **Interactive curation widgets** (`acia.notebook`, new `widget` extra — the
 whole module stays importable without `anywidget` installed):
 - `SequenceDashboard`: a three-pane curation UI (position gallery, ROI editor,
@@ -68,17 +104,45 @@ whole module stays importable without `anywidget` installed):
     score, persisted per frame so a run's confidence trend is auditable.
     Reported by `GradientECC`, `MaskedTemplateCorrelation` and
     `FeatureRANSACEuclidean`; `None` elsewhere.
+  - `on_low_confidence` on each of those three methods (and
+    `RegistrationDashboard(low_confidence=...)`, which forwards it): `"keep"`
+    (new default) returns a fit scoring below the method's threshold anyway,
+    with its `confidence` set and a `LowConfidenceWarning` naming the score and
+    the threshold it missed; `"reject"` raises `RegistrationError` as before.
+    Keeping means `registration_transforms.json` holds a transform for *every*
+    frame, so `RegisteredSequenceSource` stops falling back to an uncorrected
+    (or nearest-neighbour) frame downstream — a weak fit is now reported by its
+    score rather than by its absence. Failures with no estimate to keep (blank
+    input, non-convergence, a non-finite result, a match pinned to the
+    search-window edge, too few correspondences to fit a model at all) still
+    raise regardless of the policy.
   - `RegistrationDashboard(method_kwargs=..., reference_mode=...)` and
     `batch_apply(..., method_kwargs=...)` for per-position settings —
     registration method settings are now a supported argument rather than
     something a caller has to reach in and patch.
   - `batch_apply(sources={position: source})` registers a supplied (e.g. lazily
     sliced) source per position instead of the full position.
+  - `acia.registration.apply_correction_to_spec` carries a `RotatedCropSpec`
+    drawn on one frame onto the drift-corrected (reference-frame) view, so
+    `source.register(transforms).crop_rotated(spec)` takes the region the spec
+    was drawn around rather than wherever that frame had drifted to. It shares
+    its matrix with `apply_correction`, so crop geometry and corrected pixels
+    cannot disagree.
   - `ImageSequenceSource.register(..., on_missing=...)`, also on
     `load_registration`: `"warn"` (default), `"nearest"` (correct a failed
     frame with its neighbor's transform instead of exporting it uncorrected,
     which is off by the full accumulated drift), or `"error"`.
     `RegisteredSequenceSource.missing_frames` reports every gap at once.
+
+**ROI curation** (`acia.selection`, `acia.notebook`):
+- `SequenceDashboard(preview_frame=...)` chooses the frame the gallery
+  thumbnails and the ROI editor open on, defaulting to the **middle** frame. In
+  a growing culture frame 0 is typically empty, so opening there gave no
+  indication whether a chamber held any cells worth curating.
+- `RoiSelection.anchor_frame`: the frame an ROI was drawn on, recorded in
+  `selection.json`. Additive and omitted when zero, so manifests written by
+  earlier versions load unchanged and are re-saved byte-identically (schema
+  stays `acia.selection/v1`).
 
 **Image sources and I/O**:
 - `open_sequence(path)`: one entry point that dispatches by suffix to the ND2,
@@ -195,6 +259,20 @@ whole module stays importable without `anywidget` installed):
   triple used directly, a number mapped through `cmap`, anything else categorical.
 
 **Segmentation**:
+- Three new backends, each a `SegmentationProcessor` subclass behind its own
+  optional-dependency extra: `StarDistSegmenter` (`acia.segm.processor.stardist`,
+  `stardist` extra) wraps StarDist's star-convex instance segmentation — no
+  bacteria-specific pretrained model exists upstream, so it's a contrast baseline
+  for round/oval targets rather than a primary bacterial segmenter;
+  `MicroSAMSegmenter` (`acia.segm.processor.microsam`, `microsam` extra) wraps
+  micro-sam's (μSAM) AIS automatic-instance-segmentation path via the
+  light-microscopy-finetuned `vit_b_lm` checkpoint by default; `DeltaSegmenter`
+  (`acia.segm.processor.delta`, `delta` extra) wraps DeLTA 3.x's segmentation
+  U-Net only (no tracking model touched), selectable by imaging `regime`
+  (`"2D"` agar-pad vs `"mothermachine"`), targeting the torch backend so it
+  shares a torch stack with Cellpose/Omnipose instead of pulling in
+  TensorFlow. See
+  `_bmad-output/implementation-artifacts/spec-additional-segmentation-backends.md`.
 - `FlowposeRTSegmenter` (`acia.segm.processor.flowpose_rt`): omnipose-compatible
   segmentation backed by the lightweight `flowpose-rt` package (no
   cellpose/omnipose/numba at runtime), selectable via the new `flowpose-rt` extra.
@@ -248,6 +326,29 @@ warning-free under `-W`.
   All are additive in both directions: older manifests load unchanged, and a
   fixed-reference run still writes exactly the JSON it always did (schema stays
   `acia.registration/v1`).
+- A registration fit scoring below its method's confidence threshold is now
+  **kept** by default (`on_low_confidence="keep"`), warned about, and stored
+  like any other transform, instead of raising and leaving the frame in
+  `failed_frames` without one. Two consequences worth knowing:
+  - `ReanchoringReference`'s fallback is driven by `RegistrationError`, so with
+    the default policy a merely unconfident fit no longer re-anchors — the
+    method reports success and the estimate is carried forward as-is.
+    `reference_mode="reanchor"` stays valid but now fires only on outright
+    failures; construct the method with `on_low_confidence="reject"` to get the
+    older interplay, where a low score re-anchors.
+  - Re-running `batch_apply` over an existing `registration_transforms.json`
+    does **not** repair it: a complete position is skipped and a partial one
+    resumes by frame *count*, so frames a previous run recorded as failures are
+    never re-estimated. Delete the file (or the affected records) and register
+    those positions again to pick up the new policy.
+- `SequenceDashboard` no longer resets the frame scrubber when you switch
+  position — matching what clicking a row in the selections list already did,
+  and letting the same timepoint be compared across positions. The scrubber's
+  "(view only)" label is gone: the frame on screen is now the frame a newly
+  drawn or edited ROI is anchored to. An ROI whose anchor is not the frame
+  being shown renders muted and dashed with its anchor frame on the label;
+  moving it re-anchors it to the displayed frame. Merely *clicking* an ROI
+  selects it without re-anchoring.
 - `RegisteredSequenceSource` now warns once per missing frame index instead of
   once per read, so a lazy multi-pass consumer (crop → write) no longer repeats
   the same warning on every pass.
@@ -278,6 +379,41 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- Re-running a recorded stage left the manifest describing two runs as one. The new run
+  inherited the previous one's recorded outputs, so until it collected its own the entry
+  showed fresh parameters beside stale outputs — and a re-run that died half-way left
+  exactly that mixture looking like a completed run. A new run now starts from a clean
+  entry, and re-running a stage warns, naming when it last ran and which downstream
+  stages its results have just made stale.
+- `stage_manifest.json` was rewritten non-atomically. With one write per stage the window
+  was academic; recording as the stage runs widens it a hundredfold, and a truncated
+  manifest is not a lost record but a poisoned folder — every later `for_image()` reads it
+  while resolving the source, so the next run would die on a `JSONDecodeError`. Writes now
+  go through a temp file and `os.replace`.
+- `StageContext.clear()` `rmtree`d a directory artifact even when another stage also wrote
+  into it, so clearing one stage could delete another's figures. A shared directory is now
+  left alone.
+- `stage_table()` let a recorded setting shadow a derived column — a stage recording
+  `duration_s=...` overwrote the real duration. Derived columns are now applied last.
+- Tracking input was **silently misaligned** for any overlay whose first
+  detection was not on frame 0. `overlay_to_masks` built its stack from
+  `Overlay.timeIterator()`, which starts at the first *populated* frame, so an
+  overlay beginning on frame 3 handed the tracker frame 3's cells as frame 0 —
+  associating every cell against the wrong image. Frames are now indexed
+  absolutely. Overlays from `load_segmentation(path, source)` carry an explicit
+  frame extent and were never affected. `write_ctc_tracking` had the same bug in
+  its `man_track{i:04d}.tif` numbering, and is fixed the same way.
+- `overlay_to_masks` on an empty overlay raised
+  `ValueError: zero-size array to reduction operation minimum`; it now returns an
+  empty `(0, height, width)` stack.
+- Label values above 65535 silently wrapped in the `uint16` mask stack. The stack
+  now widens to `uint32` when any label needs it.
+- Cropping a drift-corrected source with an ROI drawn on a frame other than the
+  registration reference placed the crop off by the drift accumulated up to
+  that frame — silently, and worse the later the frame. The ROI's
+  `anchor_frame` is now recorded and applied via `apply_correction_to_spec`
+  before cropping. ROIs drawn on frame 0 — every selection made before this
+  release, since frame 0 was the only frame the editor showed — are unaffected.
 - `scale()` aborted the whole batch when a notebook's kernel failed to start.
   Both the sequential and the parallel path caught only
   `papermill.PapermillExecutionError` — which means "a cell raised" — while a
@@ -405,6 +541,33 @@ warning-free under `-W`.
 
   `render_tracking` output is byte-identical; `render_tracking_mask` differs by
   at most 1/255 per channel, from blending in uint8 instead of float32.
+
+- Overlay → label-mask rasterisation, the conversion every tracking backend runs
+  before it can start (`overlay_to_masks`, used by `TrackastraTracker`,
+  `LapTrack*`, `PyUATTracker`, `UltrackTracker`), plus `Overlay.toMasks`, the two
+  CTC exporters and fluorescence extraction. Each rasterised **every cell over
+  the whole frame** and combined the results with `np.maximum`, so cost tracked
+  `n_cells × frame area` with 3–5 frame-sized temporaries per cell. The shared
+  fast path from the viz work (`_frame_label_mask`) now lives in
+  `acia.segm.rasterize` and backs all of them.
+
+      overlay_to_masks 1024², 5×150 cells, Contour-backed:  1.70 → 0.031 s  (55×)
+      overlay_to_masks 1024², 5×150 cells, Instance-backed: 0.27 → 0.010 s  (27×)
+
+  The `Contour`-backed figure is the one that matters after `load_segmentation`,
+  which returns polygon-backed detections: those went through a full-frame
+  `rasterio` pass *per cell*. A frame of polygons is now burned in a single
+  `rasterio` call, and mask-backed instances are written through their cached
+  bounding box. Output is byte-identical — polygons keep rasterio's pixel-centre
+  rule via the new `exact_polygons` flag rather than taking the renderers'
+  `cv2.fillPoly` shortcut, which fills inclusively and would have dilated every
+  cell by a pixel (~+11% area on bacterium-sized cells).
+
+  Fluorescence extraction additionally stopped re-decoding the channel inside the
+  per-cell loop (`image.get_channel()` ran once per cell *per channel*) and now
+  gathers each cell's pixels inside its bounding box instead of building a
+  frame-sized `np.ma.masked_array`. Values are unchanged.
+
 
 ## [0.3.2] - 2025-10-27
 

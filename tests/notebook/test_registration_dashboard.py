@@ -16,6 +16,7 @@ import importlib
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import cv2
@@ -30,7 +31,10 @@ import traitlets  # noqa: E402
 
 from acia.base import RotatedCropSpec  # noqa: E402
 from acia.notebook import RegistrationDashboard  # noqa: E402
-from acia.registration import FrameTransform  # noqa: E402
+from acia.registration import (  # noqa: E402
+    FrameTransform,
+    LowConfidenceWarning,
+)
 from acia.registration_persistence import (  # noqa: E402
     RegistrationManifest,
     RegistrationRecord,
@@ -936,10 +940,27 @@ class TestReferenceMode(unittest.TestCase):
 class TestGrowingColonyEndToEnd(unittest.TestCase):
     """The reported failure and its fix, at the layer the notebook calls."""
 
-    def _run(self, directory, path, *, reference_mode, method_kwargs=None):
-        dash = RegistrationDashboard(open_sequence(path), reference_mode=reference_mode)
+    def _run(
+        self,
+        directory,
+        path,
+        *,
+        reference_mode,
+        method_kwargs=None,
+        low_confidence="reject",
+    ):
+        # These cases are about what a *rejected* frame does to the run, so
+        # they opt into the gate; the default "keep" policy has its own case
+        # below.
+        dash = RegistrationDashboard(
+            open_sequence(path),
+            reference_mode=reference_mode,
+            low_confidence=low_confidence,
+        )
         dash.send = _Recorder()
-        dash.batch_apply(directory=directory, method_kwargs=method_kwargs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", LowConfidenceWarning)
+            dash.batch_apply(directory=directory, method_kwargs=method_kwargs)
         return dash.manifest.records[0]
 
     def test_fixed_reference_without_exclusion_fails_on_late_frames(self):
@@ -950,6 +971,33 @@ class TestGrowingColonyEndToEnd(unittest.TestCase):
             record.failed_frames,
             "expected a fixed reference on changing content to reject late frames",
         )
+
+    def test_default_policy_stores_a_transform_for_every_frame(self):
+        """The same fixed-reference run that leaves holes above leaves none
+        under the default policy -- which is the whole point of it."""
+        with tempfile.TemporaryDirectory() as d:
+            path, _specs = _tif_growing_colony(d)
+            n_frames = open_sequence(path).position(0).size_t
+            record = self._run(d, path, reference_mode="fixed", low_confidence="keep")
+        self.assertEqual(record.failed_frames, {})
+        self.assertEqual(set(record.transforms), set(range(n_frames)))
+        # The weak frames are still identifiable -- by their score, not by
+        # their absence.
+        self.assertLess(min(t.confidence for t in record.transforms.values()), 0.9)
+
+    def test_the_policy_is_recorded_in_the_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, _specs = _tif_growing_colony(d)
+            dash = RegistrationDashboard(open_sequence(path))
+            self.assertEqual(dash.manifest.method_params["low_confidence"], "keep")
+            dash = RegistrationDashboard(open_sequence(path), low_confidence="reject")
+            self.assertEqual(dash.manifest.method_params["low_confidence"], "reject")
+
+    def test_unknown_policy_is_rejected_at_construction(self):
+        with tempfile.TemporaryDirectory() as d:
+            path, _specs = _tif_growing_colony(d)
+            with self.assertRaisesRegex(ValueError, "low_confidence"):
+                RegistrationDashboard(open_sequence(path), low_confidence="warn")
 
     def test_excluding_the_roi_interiors_registers_every_frame(self):
         with tempfile.TemporaryDirectory() as d:

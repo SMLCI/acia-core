@@ -25,7 +25,28 @@ SCHEMA = "acia.selection/v1"
 
 @dataclass
 class RoiSelection:
-    """One curated ROI: a rotated-rectangle crop of a single position."""
+    """One curated ROI: a rotated-rectangle crop of a single position.
+
+    Attributes:
+        position: Index of the position the ROI was drawn on.
+        roi: The rotated rectangle, in the pixel coordinate system of the
+            frame it was drawn on -- see :attr:`anchor_frame`.
+        label: Free-text label, shown in the curation UI and available to
+            export naming templates.
+        id: Stable identifier; also names the preview PNG.
+        notes: Free-text notes.
+        preview: Optional file name of a preview image for this ROI.
+        anchor_frame: The frame index :attr:`roi` was drawn on. Cropping the
+            **raw** source ignores this -- the spec is already in that source's
+            coordinates. It matters after drift correction: a
+            :class:`~acia.base.RegisteredSequenceSource` puts every frame into
+            the *reference* frame's coordinate system, so a spec anchored
+            anywhere else must first be carried across with
+            :func:`acia.registration.apply_correction_to_spec` or the crop
+            lands off by the drift accumulated up to this frame. Defaults to
+            ``0``, which is what every selection written before this field
+            existed in fact was -- frame 0 was the only frame the editor showed.
+    """
 
     position: int
     roi: RotatedCropSpec
@@ -33,6 +54,7 @@ class RoiSelection:
     id: str = ""
     notes: str = ""
     preview: str | None = None
+    anchor_frame: int = 0
 
     @property
     def spec(self) -> RotatedCropSpec:
@@ -40,7 +62,7 @@ class RoiSelection:
         return self.roi
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "position": int(self.position),
             "roi": self.roi.to_dict(),
@@ -48,6 +70,13 @@ class RoiSelection:
             "notes": self.notes,
             "preview": self.preview,
         }
+        # Emitted only when it carries information, so a session curated
+        # entirely on frame 0 writes byte-identically to what earlier versions
+        # of acia wrote (and still read) -- the same additive-field convention
+        # as acia.registration_persistence.RegistrationRecord.to_dict.
+        if self.anchor_frame:
+            data["anchor_frame"] = int(self.anchor_frame)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> RoiSelection:
@@ -58,6 +87,7 @@ class RoiSelection:
             id=data.get("id", ""),
             notes=data.get("notes", ""),
             preview=data.get("preview"),
+            anchor_frame=int(data.get("anchor_frame", 0)),
         )
 
 
@@ -182,6 +212,14 @@ def load_selection(manifest: SelectionManifest, source=None) -> list:
 
     Returns:
         A list of lazy cropped ``ImageSequenceSource`` (one per selection).
+
+    Note:
+        Each selection's :attr:`~RoiSelection.anchor_frame` is deliberately
+        ignored here: the crop is taken from the **raw** source, whose
+        coordinate system is the one the ROI was drawn in, so the spec already
+        applies as-is. It only needs translating once the source has been
+        drift-corrected onto a reference frame -- see
+        :func:`acia.registration.apply_correction_to_spec`.
 
     Raises:
         ValueError: If a selection's ``position`` is out of range for the source.

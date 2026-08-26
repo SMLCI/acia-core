@@ -14,6 +14,7 @@ import tifffile
 from tqdm.auto import tqdm
 
 from acia.base import BaseImage, Contour, ImageSequenceSource, Overlay
+from acia.segm.rasterize import frame_label_mask
 from acia.tracking import TrackingSource
 from acia.utils import largest_polygon, multi_mask_to_polygons
 
@@ -287,17 +288,22 @@ class CTCTrackingHelper:
         """
         assert height > 0 and width > 0
 
-        image_mask = np.zeros((height, width), dtype=np.uint16)
-        for cont in overlay:
-            life_cycle_id = (
-                contour_life_cycle_lookup[cont.id] + 1
-            )  # lifecycle ids must start with 1
-            cont_mask = cont.toMask(height, width)
-            image_mask = np.maximum(
-                image_mask, (cont_mask * life_cycle_id).astype(np.uint16)
-            )
+        # numbered by life cycle rather than by cont.label, so the labels are
+        # passed in explicitly; exact_polygons keeps the pixel-centre rule this
+        # exported mask has always had
+        contours = list(overlay)
+        life_cycle_ids = [
+            contour_life_cycle_lookup[cont.id] + 1  # lifecycle ids must start with 1
+            for cont in contours
+        ]
 
-        return image_mask
+        return frame_label_mask(
+            contours,
+            height=height,
+            width=width,
+            labels=life_cycle_ids,
+            exact_polygons=True,
+        ).astype(np.uint16)
 
     @staticmethod
     def __load_masks(mask_path: Path) -> Overlay:

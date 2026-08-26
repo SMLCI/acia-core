@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import multiprocessing
 import os
@@ -23,20 +24,21 @@ import numpy as np
 import pandas as pd
 import papermill as pm
 import shapely
-from numpy import ma
 from pint._typing import UnitLike
 from tqdm.auto import tqdm
 
 from acia import Q_, U_
 from acia.analysis._scale_progress import _WorkerBars
 from acia.analysis._scale_progress import register_engine as register_progress_engine
-from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV
+from acia.analysis._stage_io import STAGE_NOTEBOOK_ENV, STAGE_PARAMS_ENV
 from acia.analysis.growth_rate import AggMode as AggMode
 from acia.analysis.growth_rate import GrowthRateResult as GrowthRateResult
 from acia.analysis.growth_rate import estimate_growth_rate as estimate_growth_rate
+from acia.analysis.stage import CALIBRATION_SCHEMA as CALIBRATION_SCHEMA
 from acia.analysis.stage import DEFAULT_KEY_PATTERN as DEFAULT_KEY_PATTERN
 from acia.analysis.stage import IO_SCHEMA as IO_SCHEMA
 from acia.analysis.stage import MANIFEST_NAME as MANIFEST_NAME
+from acia.analysis.stage import STAGE_SCHEMA as STAGE_SCHEMA
 from acia.analysis.stage import StageContext as StageContext
 from acia.analysis.stage import check_stale as check_stale
 from acia.analysis.stage import population_id_of as population_id_of
@@ -51,6 +53,7 @@ from acia.analysis.units import read_units_csv as read_units_csv
 from acia.analysis.units import strip_units as strip_units
 from acia.analysis.units import write_units_csv as write_units_csv
 from acia.base import BaseImage, ImageSequenceSource, Overlay
+from acia.segm.rasterize import contour_pixels
 
 logger = logging.getLogger(__name__)
 
@@ -806,25 +809,23 @@ class FluorescenceEx(PropertyExtractor):
             pd.DataFrame: pandas data frame containing columns of channel_names and the rows represent the extracted fluorescence
         """
 
+        # hoisted out of the contour loop: get_channel() was being re-run once
+        # per cell per channel, decoding the same frame thousands of times
+        raw_images = [image.get_channel(channel) for channel in channels]
+
         data = []
 
         for cont in overlay:
             local_data = {"id": cont.id}
-            for ch_id, channel in enumerate(channels):
-                raw_image = image.get_channel(channel)
+            for ch_id, raw_image in enumerate(raw_images):
+                # the cell's pixels, gathered inside its bounding box. The
+                # previous ma.masked_array(raw_image, mask=~cont.toMask(...))
+                # .compressed() built three frame-sized temporaries per cell per
+                # channel; contour_pixels returns the same values in the same
+                # order at O(cell) cost.
+                values = contour_pixels(cont, raw_image)
 
-                height, width = raw_image.shape[:2]
-
-                # draw cell mask
-                roi_mask = cont.toMask(height=height, width=width)
-
-                # create masked array
-                masked_roi: ma.MaskedArray = ma.masked_array(raw_image, mask=~roi_mask)
-
-                # compute fluorescence response
-                value = summarize_operator(masked_roi.compressed())
-
-                local_data[channel_names[ch_id]] = value
+                local_data[channel_names[ch_id]] = summarize_operator(values)
             data.append(local_data)
 
         return _id_indexed(data, list(channel_names))
@@ -1087,6 +1088,12 @@ def _scale_execute_one(
         # destroy the one question it exists to answer -- did this batch all run the
         # same code?
         os.environ[STAGE_NOTEBOOK_ENV] = str(src)
+        # ... and which parameters it was given, so StageContext records the run's
+        # real settings without every notebook having to repeat them into
+        # log_params(). Same reasoning as the line above: an env var needs no
+        # `parameters` cell and raises no "unknown parameter" warning.
+        with contextlib.suppress(TypeError, ValueError):
+            os.environ[STAGE_PARAMS_ENV] = json.dumps(parameters, default=str)
 
         try:
             _execute_notebook(
@@ -1098,6 +1105,11 @@ def _scale_execute_one(
                 **extra,
             )
         finally:
+            os.environ.pop(STAGE_PARAMS_ENV, None)
+            # papermill writes the executed notebook back into `dst` only after it
+            # returns, so this cannot be done from inside the notebook -- the last
+            # cell never sees the finished document
+            _export_notebook_html(dst)
             if progress_queue is not None:
                 # papermill closes the reporter itself, but not when it fails
                 # before the notebook manager exists -- make sure the parent's
@@ -1106,6 +1118,25 @@ def _scale_execute_one(
 
         executions.append(dict(parameters=parameters, storage_folder=dst.parent))
     return executions
+
+
+def _export_notebook_html(notebook: Path) -> Path | None:
+    """Write an HTML rendering of an executed notebook beside it.
+
+    A run's own record of what it looked like, readable without Jupyter. Entirely
+    best-effort: ``nbconvert`` is an optional dependency and a failed export must
+    never be the reason a completed analysis reports failure.
+    """
+    try:
+        from nbconvert import HTMLExporter  # noqa: PLC0415 -- optional dependency
+
+        body, _ = HTMLExporter().from_filename(str(notebook))
+        target = notebook.with_suffix(".html")
+        target.write_text(body, encoding="utf-8")
+        return target
+    except Exception:
+        logger.debug("could not export %s to HTML", notebook, exc_info=True)
+        return None
 
 
 def scale(
