@@ -1,3 +1,11 @@
+CLAUDE.md
+lineage.html
+lineage.png
+report.xml
+test_resources/
+tracking_output/
+.auto-claude-security.json
+
 coco/
 images/
 mlruns/
@@ -83,6 +91,20 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+# GitLab Pages builds the site into public/ (see .gitlab-ci.yml); myst-nb writes
+# its executed copies next to the output dir, so that build also drops a
+# jupyter_execute/ at the repo root
+/public/
+/jupyter_execute/
+# Cellpose weights, relocated into the project dir so GitLab CI can cache them
+/.cellpose-models/
+# autosummary writes the API reference stubs here on every build
+docs/api/generated/
+# sample data the tutorials download at run time (~46 MB); myst-nb executes each
+# notebook with its own directory as the cwd, so it lands here
+docs/tutorials/data/
+# notebook byproducts (videos are already covered by *.mp4 above)
+docs/tutorials/*.csv
 
 # PyBuilder
 target/
@@ -122,3 +144,13 @@ ENV/
 
 # IDE settings
 .vscode/
+
+# Auto Claude data directory
+.auto-claude/
+
+.claude_settings.json
+.worktrees/
+.auto-claudo-status
+
+# macOS
+.DS_Store

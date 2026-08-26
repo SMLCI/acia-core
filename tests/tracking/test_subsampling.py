@@ -1,7 +1,6 @@
 """Unit test cases for tracking subsampling"""
 
 import unittest
-from typing import List
 
 import networkx as nx
 import numpy as np
@@ -16,9 +15,8 @@ class TestSubsampling(unittest.TestCase):
 
     @staticmethod
     def linear_track(
-        length, frame_start, id_start=None, successors: List[TrackingSource] = None
+        length, frame_start, id_start=None, successors: list[TrackingSource] = None
     ):
-
         if successors is None:
             successors = []
 
@@ -31,12 +29,18 @@ class TestSubsampling(unittest.TestCase):
         frames = [frame_start + i for i in range(length)]
 
         overlay = Overlay(
-            [Contour(None, -1, frame, id) for id, frame in zip(ids, frames)]
+            [
+                Contour(None, -1, frame, id)
+                for id, frame in zip(ids, frames, strict=False)
+            ]
         )
         tracking_graph = nx.DiGraph()
         tracking_graph.add_nodes_from([cont.id for cont in overlay])
         tracking_graph.add_edges_from(
-            [(a.id, b.id) for a, b in zip(overlay.contours, overlay.contours[1:])]
+            [
+                (a.id, b.id)
+                for a, b in zip(overlay.contours, overlay.contours[1:], strict=False)
+            ]
         )
 
         linear_ts = TrackingSourceInMemory(overlay, tracking_graph)
@@ -110,7 +114,7 @@ def linear_track(start_frame: int, num_frames: int) -> nx.DiGraph:
     for n in lineage.nodes:
         lineage.nodes[n]["frame"] = n
 
-    for a, b in zip(nodes, nodes[1:]):
+    for a, b in zip(nodes, nodes[1:], strict=False):
         lineage.add_edge(a, b)
 
     return lineage

@@ -1,23 +1,75 @@
-# This file is a template, and might need editing before it works on your project.
-# To contribute improvements to CI/CD templates, please follow the Development guide at:
-# https://docs.gitlab.com/ee/development/cicd/templates.html
-# This specific template is located at:
-# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Python.gitlab-ci.yml
+# GitLab CI/CD configuration for acia
+# Python 3.10+ project with Ruff linting, mypy type checking, and pytest testing
 
-# Official language image. Look for the different tagged releases at:
-# https://hub.docker.com/r/library/python/tags/
 image: python:3.10
 
-# Change pip's cache directory to be inside the project directory since we can
-# only cache local items.
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
+# Global pip cache - persisted between pipeline runs
+cache:
+  key: pip-${CI_JOB_IMAGE}
+  paths:
+    - .cache/pip/
+
 stages:
+  - lint
   - build
   - test
   - deploy
 
+# Lint and format check with Ruff
+lint:
+  stage: lint
+  script:
+    # PINNED, and it must stay pinned: an unpinned ruff silently upgrades under
+    # you and changes what "formatted" means. ruff 0.16 began formatting Python
+    # code blocks inside Markdown, which reformats the illustrative snippets in
+    # docs/*.md and fails this job on a green working tree. Keep in lockstep with
+    # .github/workflows/ci.yml and .pre-commit-config.yaml.
+    - pip install ruff==0.15.15
+    # docs/ is included because ruff lints .ipynb by default -- the tutorial
+    # notebooks are real source and regress like any other code.
+    - ruff check acia tests docs
+    - ruff format --check acia tests docs
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# Type checking with mypy
+typecheck:
+  stage: lint
+  script:
+    # PINNED to match .github/workflows/ci.yml and .pre-commit-config.yaml.
+    # Unpinned, this job installs whatever mypy is current -- mypy 2.x reports 5
+    # errors in acia/notebook.py that 1.19.1 does not, so the job goes orange for
+    # reasons unrelated to the commit that triggered it.
+    - pip install mypy==1.19.1
+    - mypy acia --ignore-missing-imports
+  allow_failure: true  # Start permissive, remove once types are added
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# Build wheel for each Python version
+build:
+  image: python:$PY_VERSION
+  parallel:
+    matrix:
+      - PY_VERSION: ['3.10', '3.11', '3.12', '3.13']
+  stage: build
+  tags:
+    - biggpu
+  script:
+    - pip install build twine
+    - python -m build
+    - pip install dist/*.whl
+    - twine check dist/*
+  artifacts:
+    paths:
+      - dist/*.whl
+
+# Test on each Python version
 test:
   image: python:$PY_VERSION
   parallel:
@@ -25,24 +77,36 @@ test:
       - PY_VERSION: ['3.10', '3.11', '3.12', '3.13']
   stage: test
   tags:
-  - biggpu
+    - biggpu
+  needs:
+    - job: build
+      parallel:
+        matrix:
+          - PY_VERSION: ['3.10', '3.11', '3.12', '3.13']
+  cache:
+    - key: pip-${CI_JOB_IMAGE}
+      paths:
+        - .cache/pip/
+    - key: test-resources-v1
+      paths:
+        - test_resources/
   script:
-    # test dependencies
-    - pip install pytest pytest-sugar pytest-cov python-dotenv coverage unittest-xml-reporting
+    # test dependencies. ipykernel provides the "python3" kernelspec that
+    # tests/analysis/test_scale.py needs to run notebooks through papermill.
+    - pip install pytest pytest-sugar pytest-cov python-dotenv unittest-xml-reporting ipykernel
     - pip install git+https://github.com/JojoDevel/trackastra.git
     - pip install laptrack
-    # unittest-xml-reporting trackastra laptrack
-    - pip install build
-    - python -m build
+    # install the pre-built wheel from build job
     - pip install dist/*.whl
-    # download data for testing
-    - mkdir test_resources
-    - wget -O test_resources/ctc_format.zip https://fz-juelich.sciebo.de/s/8dEFaTKl26H26wO/download
-    - unzip test_resources/ctc_format.zip -d test_resources/ctc_format
-    - ls
+    # download data for testing (only if not cached)
+    - |
+      if [ ! -d "test_resources/ctc_format" ]; then
+        mkdir -p test_resources
+        wget -O test_resources/ctc_format.zip https://fz-juelich.sciebo.de/s/8dEFaTKl26H26wO/download
+        unzip test_resources/ctc_format.zip -d test_resources/ctc_format
+      fi
     # perform the tests
-    - coverage run -m pytest --junitxml=report.xml --cov-report term --cov-report xml --cov=acia tests/
-    - python -m xmlrunner discover ./tests/ -o reports/
+    - pytest --cov=acia --cov-report=term --cov-report=xml --junitxml=report.xml tests/
   coverage: '/TOTAL.*\s+(\d+%)/'
   artifacts:
     reports:
@@ -51,75 +115,52 @@ test:
         path: coverage.xml
       junit: report.xml
 
-#installation:
-#  image: mambaorg/micromamba:2.0.5-debian12-slim
-#  tags:
-#    - big-ram
-#  stage: build
-#  script:
-#    - micromamba env create -f conda.yaml
-#    - micromamba run -n acia pip install -e .
-#    - micromamba run -n acia python -c "import acia"
-
-build:
-  image: python:$PY_VERSION
-  parallel:
-    matrix:
-      - PY_VERSION: ['3.9', '3.10', '3.11', '3.12', '3.13']
-  stage: build
-  tags:
-  - biggpu
-  script:
-    - pip install build twine
-    - python -m build
-    # an alternative approach is to install and run:
-    - pip install dist/*.whl
-    - twine check dist/*
-  artifacts:
-    paths:
-      - dist/*.whl
-
-.deploy_common:
-  # common config
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-
-
-
-#upload_package:
-#  stage: deploy
-#  # dot pass artifacts from other stages
-#  dependencies: []
-#  cache: []
-#  extends: .deploy_common
-#  script:
-#    - set -e
-#    - pip install twine bump2version
-#    - git config --global user.email "${GITLAB_USER_EMAIL}"
-#    - git config --global user.name "${GITLAB_USER_NAME}"
-#    - git log
-#    # list tags
-#    - git tag
-#    - bump2version patch
-#    - python setup.py sdist bdist_wheel
-#    - ls -all dist/
-#    - TWINE_PASSWORD=${CI_JOB_TOKEN} TWINE_USERNAME=gitlab-ci-token python -m twine upload --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/*
-#    - git remote set-url origin "https://${CI_PUSH_NAME}:${CI_PUSH_TOKEN}@jugit.fz-juelich.de/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}.git"
-#    - git push -o ci.skip --tags origin HEAD:${CI_COMMIT_REF_NAME}
-#    - TWINE_PASSWORD=${PYPI_API_TOKEN} TWINE_USERNAME=__token__ twine upload --repository pypi dist/*
-#  artifacts:
-#    paths:
-#      - dist/
-
-
-
+# Build the documentation and publish it to GitLab Pages.
+#
+# The tutorials under docs/tutorials/ are committed WITHOUT outputs and executed
+# by myst-nb during the build, so this job needs everything they import -- which
+# is why it installs the package itself plus a segmentation backend, unlike the
+# job that used to live here (it installed neither `acia`, which docs/conf.py
+# imports for __version__, nor myst-parser, so it cannot have worked).
+#
+# Only ONE segmentation backend can be installed: cellpose<4, cellpose>=4 and
+# omnipose pin conflicting versions. The getting-started path uses Omnipose,
+# which runs the tutorial in about a minute on a CPU, so this job does not
+# actually need the GPU runner -- it just benefits from it.
+#
+# Note this publishes a SECOND copy of the site; GitHub Pages
+# (https://smlci.github.io/acia-core) remains the URL declared in
+# pyproject.toml's [project.urls]. Keep them from drifting.
 pages:
   stage: deploy
-  extends: .deploy_common
+  # Omnipose pins numpy<2 / scipy==1.11.4 and does not support 3.12.
+  image: python:3.10
+  tags:
+    - biggpu
+  variables:
+    # GitLab can only cache paths inside CI_PROJECT_DIR, so move the model
+    # store (default ~/.cellpose/models) into the project. Omnipose shares that
+    # directory and honours the same environment variable.
+    CELLPOSE_LOCAL_MODELS_PATH: "$CI_PROJECT_DIR/.cellpose-models"
+  cache:
+    - key: pip-${CI_JOB_IMAGE}
+      paths:
+        - .cache/pip/
+    # ~20 MB of individual frames the notebooks fetch over WebDAV
+    - key: docs-tutorial-data-colony-v1
+      paths:
+        - docs/tutorials/data/
+    - key: docs-omnipose-weights-v1
+      paths:
+        - .cellpose-models/
+    # myst-nb re-executes only notebooks whose source changed
+    - key: docs-jupyter-cache-v1
+      paths:
+        - docs/_build/.jupyter_cache/
   script:
-    - pip install sphinx sphinx-rtd-theme pint
-    - cd docs ; make html
-    - mv _build/html/ ../public/
+    - pip install -e ".[docs,omnipose]" --use-pep517
+    # -W: the build must stay warning-free, exactly as it does on GitHub
+    - sphinx-build -b html -W --keep-going docs public
   artifacts:
     paths:
       - public

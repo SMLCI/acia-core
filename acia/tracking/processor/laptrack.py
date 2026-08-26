@@ -58,7 +58,6 @@ class LAPTracker(TrackingProcessor):
 
             new_label = np.zeros_like(labels[frame])
             for _, row in frame_df.iterrows():
-
                 label = row["label"]
                 track_id = row["track_id"] + 1
                 mask = labels[frame] == label
@@ -111,7 +110,7 @@ class LAPTracker(TrackingProcessor):
         with tempfile.TemporaryDirectory() as td:
             self.__export(td, track_df, split_df, masks)
 
-            ov, tracklet_graph, tracking_graph = read_ctc_tracking(td)
+            ov, tracklet_graph, tracking_graph = read_ctc_tracking(Path(td))
 
             attribute_tracking(ov, tracking_graph, tracking_graph, self)
 
@@ -146,7 +145,6 @@ class LAPTracker2(TrackingProcessor):
 
             new_label = np.zeros_like(labels[frame])
             for _, row in frame_df.iterrows():
-
                 label = row["label"]
                 track_id = row["track_id"] + 1
                 mask = labels[frame] == label
@@ -199,7 +197,7 @@ class LAPTracker2(TrackingProcessor):
         with tempfile.TemporaryDirectory() as td:
             self.__export(Path(td), track_df, split_df, masks)
 
-            ov, tracklet_graph, tracking_graph = read_ctc_tracking(td)
+            ov, tracklet_graph, tracking_graph = read_ctc_tracking(Path(td))
 
             return ov, tracklet_graph, tracking_graph
 
@@ -254,14 +252,14 @@ class LaptrackTracker(TrackingProcessor):
 
         track_sequences = {}
 
-        for track_id, track_id_df in track_df.groupby("track_id"):
+        for _track_id, track_id_df in track_df.groupby("track_id"):
             track_seq = [(frame, label) for (frame, label), _ in track_id_df.iterrows()]
             label = track_id_df.iloc[0].name[1]
             track_sequences[label] = track_seq
 
         for label, track_seq in track_sequences.items():
             # add sequence
-            for a, b in zip(track_seq[0:-1], track_seq[1:]):
+            for a, b in zip(track_seq[0:-1], track_seq[1:], strict=False):
                 tracking_graph.add_edge(
                     frame_label_lookup[a].id, frame_label_lookup[b].id
                 )

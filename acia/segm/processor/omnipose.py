@@ -15,18 +15,28 @@ from . import SegmentationProcessor
 
 
 def batch(iterable, n=1):
-    l = len(iterable)
-    for ndx in range(0, l, n):
-        yield iterable[ndx : min(ndx + n, l)]
+    length = len(iterable)
+    for ndx in range(0, length, n):
+        yield iterable[ndx : min(ndx + n, length)]
 
 
 class OmniposeSegmenter(SegmentationProcessor):
     """Omnipose segmentation implementation"""
 
-    def __init__(self, use_GPU: bool = None, model="bact_phase_omni"):
+    def __init__(
+        self,
+        use_GPU: bool | None = None,
+        model="bact_phase_omni",
+        autorelease: bool = True,
+    ):
+        super().__init__(autorelease=autorelease)
         if use_GPU is None:
             use_GPU = torch.cuda.is_available()
         self.use_GPU = use_GPU
+        self.model_spec = model
+
+    def _load_model(self):
+        model = self.model_spec
 
         model_type = None
         model_path = None
@@ -41,15 +51,15 @@ class OmniposeSegmenter(SegmentationProcessor):
             )
 
         if model_type:
-            self.model = models.CellposeModel(gpu=use_GPU, model_type=model_type)
-        if model_path:
-            self.model = models.CellposeModel(
-                gpu=use_GPU, pretrained_model=model_path, nclasses=3, nchan=2
-            )
+            return models.CellposeModel(gpu=self.use_GPU, model_type=model_type)
+        return models.CellposeModel(
+            gpu=self.use_GPU, pretrained_model=model_path, nclasses=3, nchan=2
+        )
 
     @staticmethod
-    def __predict(images, model, omnipose_parameters: dict = None, batch_size=20):
-
+    def __predict(
+        images, model, omnipose_parameters: dict | None = None, batch_size=20
+    ):
         if omnipose_parameters is None:
             omnipose_parameters = {}
 
@@ -77,7 +87,6 @@ class OmniposeSegmenter(SegmentationProcessor):
         )
 
         for image_batch in batch(images, n=batch_size):
-
             # Make evaluation (flows and styles are not needed)
             masks, _, _ = model.eval(
                 image_batch,
@@ -104,10 +113,9 @@ class OmniposeSegmenter(SegmentationProcessor):
     def predict(self, images: ImageSequenceSource) -> Overlay:
         return self(images)
 
-    def __call__(
-        self, images: ImageSequenceSource, omnipose_parameters: dict = None
+    def _segment(
+        self, images: ImageSequenceSource, omnipose_parameters: dict | None = None
     ) -> Overlay:
-
         imgs = []
         for image in images:
             raw_image = image.raw

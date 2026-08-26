@@ -1,4 +1,5 @@
 """Console script for acia."""
+
 import argparse
 import sys
 
@@ -10,7 +11,7 @@ def main():
     args = parser.parse_args()
 
     print("Arguments: " + str(args._))
-    print("Replace this message by putting your code into " "acia.cli.main")
+    print("Replace this message by putting your code into acia.cli.main")
     return 0
 
 

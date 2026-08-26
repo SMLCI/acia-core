@@ -16,13 +16,37 @@ TOKEN = "58M8R17lQgh-U17snMPjya139MFD9_de2KqseKmJihcAZ6mkohozd-9-rvz71SZLI7GI1Qz
 URL = "https://worldofmicrobes.ddnss.org:8086"
 ORG = "com.microbes"
 
+TRACK_USER = os.getenv("ATTRIBUTE_TRACK_USER", "0") == "1"
+TRACK_USAGE = os.getenv("ATTRIBUTE_TRACK_USAGE", "1") == "1"
+
+
+def get_user() -> str:
+    """Obtain the current username or return 'Anonymous' if tracking the user is not enabled by the ATTRIBUTE_TRACK_USER env variable.
+
+    Returns:
+        str: Current username or 'Anonymous'
+    """
+    user = "Anonymous"
+    if TRACK_USER:
+        user = (
+            os.environ.get("JUPYTERHUB_USER")
+            or os.environ.get("USER")
+            or os.environ.get("USERNAME")
+            or "Anonymous"
+        )
+    return user
+
+
 #### Attribute functionality
 def attribute_segmentation(overlay: Overlay, segmentation_processor=None):
+    if TRACK_USAGE is False:
+        logger.info("Usage tracking disabled!")
+        return
+
     # pylint: disable=broad-except
     try:
-        user = os.environ.get(
-            "JUPYTERHUB_USER", os.environ.get("USER", os.environ.get("USERNAME"))
-        )
+        user = get_user()
+
         bucket = "segmentation"
 
         # initialize client from environment properties
@@ -58,11 +82,13 @@ def attribute_tracking(
     tracking_graph: nx.DiGraph,
     tracker=None,
 ):
+    if TRACK_USAGE is False:
+        logger.info("Usage tracking disabled!")
+        return
+
     # pylint: disable=broad-except
     try:
-        user = os.environ.get(
-            "JUPYTERHUB_USER", os.environ.get("USER", os.environ.get("USERNAME"))
-        )
+        user = get_user()
         bucket = "tracking"
 
         # initialize client from environment properties

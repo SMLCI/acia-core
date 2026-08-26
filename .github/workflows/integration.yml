@@ -1,0 +1,39 @@
+name: Integration tests
+
+# Heavy tests only — external Sciebo dataset + trackastra/laptrack. Manual only.
+on:
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: "Python version"
+        type: string
+        default: "3.12"
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+      - run: pip install -e .
+      - run: pip install pytest pytest-cov pytest-sugar laptrack
+      - run: pip install git+https://github.com/JojoDevel/trackastra.git
+      - name: Cache test resources
+        id: cache-data
+        uses: actions/cache@v4
+        with:
+          path: test_resources
+          key: test-resources-v1
+      - name: Download test data (on cache miss)
+        if: steps.cache-data.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p test_resources
+          wget -O test_resources/ctc_format.zip https://fz-juelich.sciebo.de/s/8dEFaTKl26H26wO/download
+          unzip test_resources/ctc_format.zip -d test_resources/ctc_format
+      - run: pytest -m integration --cov=acia --cov-report=xml

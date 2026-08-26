@@ -5,17 +5,17 @@ from __future__ import annotations
 import shutil
 from collections import deque
 from pathlib import Path
+from typing import Any
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import tifffile
-from shapely.geometry import MultiPolygon
 from tqdm.auto import tqdm
 
 from acia.base import BaseImage, Contour, ImageSequenceSource, Overlay
 from acia.tracking import TrackingSource
-from acia.utils import multi_mask_to_polygons
+from acia.utils import largest_polygon, multi_mask_to_polygons
 
 
 class CellTrackingChallengeDatasetGT:
@@ -41,7 +41,6 @@ class CellTrackingChallengeDatasetGT:
         base_folder.mkdir(exist_ok=True, parents=True)
 
         for i, (image_source, tracking_source) in enumerate(self.sources):
-
             mode = "GT"
 
             image_dir = base_folder / f"{i + offset:02}"
@@ -101,16 +100,14 @@ class CellTrackingDatasetResult:
         self.sources.append(content)
 
     def write(self, base_folder: str | Path = "data", offset=0):
-
         base_folder = Path(base_folder)
 
         base_folder.mkdir(exist_ok=True, parents=True)
 
         for i, (tracking_source, (height, width)) in enumerate(self.sources):
-
             mode = "RES"
 
-            ann_dir = base_folder / f"{i+offset:02}_{mode}"
+            ann_dir = base_folder / f"{i + offset:02}_{mode}"
 
             if ann_dir.exists():
                 shutil.rmtree(ann_dir)
@@ -148,7 +145,7 @@ class CTCTrackingHelper:
         self.life_cycles = CTCTrackingHelper.compute_life_cycles(self.tracking_graph)
         # create lookup (cont id --> life cycle index)
         self.life_cycle_lookup = CTCTrackingHelper.create_life_cycle_lookup(
-            self.life_cycles
+            self.life_cycles  # type: ignore[arg-type]
         )
         self.overlay = overlay
         self.height = height
@@ -177,7 +174,7 @@ class CTCTrackingHelper:
             )
             ctc_masks.append(mask)
 
-        return ctc_masks, ctc_tracking_format
+        return ctc_masks, ctc_tracking_format  # type: ignore[return-value]
 
     @staticmethod
     def compute_life_cycles(tracking_graph: nx.DiGraph) -> list[list[str]]:
@@ -213,7 +210,7 @@ class CTCTrackingHelper:
     @staticmethod
     def txt_format(
         tracking_graph: nx.DiGraph,
-        life_cycles: list[list[any]],
+        life_cycles: list[list[Any]],
         contour_lookup,
         life_cycle_lookup,
     ) -> list[str]:
@@ -248,7 +245,7 @@ class CTCTrackingHelper:
                 )
 
             lines.append(
-                f"{i+1} {start_frame} {end_frame} {parent}"
+                f"{i + 1} {start_frame} {end_frame} {parent}"
             )  # life-cycle enumeration starts with one
 
         return lines
@@ -266,9 +263,9 @@ class CTCTrackingHelper:
         contour_life_cycle_lookup = {}
         for i, life_cycle in enumerate(life_cycles):
             for cont_id in life_cycle:
-                contour_life_cycle_lookup[
-                    cont_id
-                ] = i  # life cycle enumeration starts with 1
+                contour_life_cycle_lookup[cont_id] = (
+                    i  # life cycle enumeration starts with 1
+                )
 
         return contour_life_cycle_lookup
 
@@ -278,15 +275,15 @@ class CTCTrackingHelper:
         contour_life_cycle_lookup: dict[str, int],
         height: int,
         width: int,
-    ) -> list[np.ndarray]:
-        """Creates a ctc masks with correct numbering for a frame overlay
+    ) -> np.ndarray:
+        """Creates a ctc mask with correct numbering for a frame overlay
 
         Args:
             overlay (Overlay): overlay containing the contours
             contour_life_cycle_lookup (Dict[str, int]): lookup for the life cycle
 
         Returns:
-            List[np.ndarray]: list of ctc masks
+            np.ndarray: the ctc mask for the frame
         """
         assert height > 0 and width > 0
 
@@ -329,12 +326,11 @@ class CTCTrackingHelper:
             tqdm(all_polygons, desc="Convert to overlay...")
         ):
             for id, poly in frame_polygons:
-
-                if isinstance(poly, MultiPolygon):
-                    # if it comes to parsing problems take the polygon with the largest area
-                    polygons = list(poly.geoms)
-                    areas = [p.area for p in polygons]
-                    poly = polygons[np.argmax(areas)]
+                # a label whose mask has disconnected components has no single
+                # outline; its largest part represents the object
+                poly = largest_polygon(poly)
+                if poly is None:
+                    continue
 
                 cc = np.stack(poly.exterior.coords.xy, axis=-1)
                 contours.append(Contour(cc, -1, frame, f"{frame}_{id}"))
@@ -378,7 +374,7 @@ class CTCTrackingHelper:
                 tracking_graph.add_node(f"{frame}_{id}", frame=frame)
 
             # add trajectory edges
-            for a, b in zip(node_items, node_items[1:]):
+            for a, b in zip(node_items, node_items[1:], strict=False):
                 tracking_graph.add_edge(a, b)
 
             # add edge to parent (0 means no parent)
@@ -424,7 +420,7 @@ class CTCTrackingHelper:
         # remove nodes in overlay
         conts_to_remove = set(seg_ids).intersection(id_sym_difference)
         for cont_id in conts_to_remove:
-            seg_ids = np.array([cont.id for cont in overlay])
+            seg_ids = np.array([cont.id for cont in overlay])  # type: ignore[assignment]
             index = np.argmin(seg_ids == cont_id)
             del overlay.contours[index]
 

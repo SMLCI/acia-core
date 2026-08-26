@@ -1,10 +1,12 @@
-""" Module to convert tracking formats """
+"""Module to convert tracking formats"""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import networkx as nx
 import numpy as np
@@ -35,13 +37,10 @@ def parse_simple_tracking(file_content: str) -> tuple[Overlay, nx.DiGraph]:
 
     # create contours
     for det in segmentation_data:
-
         det_id = det["id"]
         # try to convert to integer
-        try:
+        with contextlib.suppress(ValueError):
             det_id = int(det_id)
-        except ValueError:
-            pass
 
         all_detections.append(
             Contour(det["contour"], -1, det["frame"], det_id, det["label"])
@@ -78,7 +77,6 @@ def gen_simple_tracking(overlay: Overlay, tracking_graph: nx.Graph) -> str:
 
     segmentation_data = []
     for cont in overlay:
-
         coordinates = cont.coordinates
 
         if isinstance(coordinates, np.ndarray):
@@ -160,7 +158,6 @@ def write_ctc_tracking(
     # Write tracklet information
     data = []
     for n in tracklet_graph.nodes:
-
         predecessors = list(tracklet_graph.predecessors(n))
         if len(predecessors) == 0:
             parent_label = 0
@@ -194,7 +191,144 @@ def write_ctc_tracking(
             cont_mask = cont.toMask(height, width).astype(np.uint16) * cont.label
             local_mask = np.maximum(local_mask, cont_mask)
 
-        tifffile.imwrite(output_path / f"man_track{i:04d}.tif", local_mask)
+        # zlib-compress the label masks: they are mostly background and highly
+        # repetitive, so this is ~50x smaller than the uncompressed write (1 GiB
+        # -> 18 MiB for a 500-frame 1024x1024 movie) at no readability cost --
+        # tifffile decompresses transparently, and it stays a valid TIFF.
+        tifffile.imwrite(
+            output_path / f"man_track{i:04d}.tif", local_mask, compression="zlib"
+        )
+
+
+def save_tracking(
+    path: str | Path,
+    images: ImageSequenceSource,
+    overlay: Overlay,
+    tracklet_graph: nx.DiGraph,
+) -> Path:
+    """Store a tracking result as a CTC folder, guaranteeing full frame coverage.
+
+    The counterpart of :func:`load_tracking`, and the recommended way to persist
+    a tracker's ``(overlay, tracklet_graph)`` output. It wraps
+    :func:`write_ctc_tracking` and adds the one guarantee that function cannot
+    give on its own: the written mask stack is aligned with ``images``.
+
+    ``write_ctc_tracking`` names its masks by enumerating
+    :meth:`~acia.base.Overlay.timeIterator`, which starts at the overlay's
+    *first populated* frame when the overlay carries no explicit frame list. An
+    overlay whose frame 0 happens to hold no detections would therefore write a
+    stack shifted against the movie -- every reloaded detection landing on the
+    wrong frame, with no error anywhere. This function re-wraps such an overlay
+    over ``range(images.size_t)`` first (the caller's overlay is not mutated).
+
+    Args:
+        path: output directory (created if missing). It must be owned by this
+            artifact: :func:`load_tracking` reads *every* ``*.tif`` in it.
+        images: the image sequence the tracking was computed on -- used for the
+            mask size and the frame extent.
+        overlay: tracked overlay; ``label`` carries the tracklet id.
+        tracklet_graph: one node per tracklet (``start_frame``/``end_frame``).
+
+    Returns:
+        The directory written.
+
+    Raises:
+        ValueError: if the overlay holds a frame beyond ``images.size_t``, i.e.
+            overlay and images do not belong to the same sequence.
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    size_t = images.size_t
+    frames = [int(f) for f in overlay.frames()]
+
+    if frames and frames[-1] >= size_t:
+        raise ValueError(
+            f"Overlay holds frame {frames[-1]} but the image sequence has only "
+            f"{size_t} frames -- overlay and images do not match."
+        )
+
+    # re-wrap (never mutate) when the overlay does not already span the movie, so
+    # timeIterator emits exactly one mask per image frame, starting at frame 0
+    if not frames or frames[0] != 0 or frames[-1] + 1 != size_t:
+        overlay = Overlay(overlay.contours, frames=list(range(size_t)))
+
+    write_ctc_tracking(path, images, overlay, tracklet_graph)
+
+    return path
+
+
+def load_tracking(
+    path: str | Path, source: ImageSequenceSource
+) -> tuple[Overlay, nx.DiGraph, nx.DiGraph]:
+    """Load a tracking stored by :func:`save_tracking`, with time re-attached.
+
+    Returns the same ``(overlay, tracklet_graph, tracking_graph)`` triple, in the
+    same order, that a tracking processor (e.g.
+    :class:`~acia.tracking.processor.trackastra.TrackastraTracker`) returns -- so
+    a step that loads is a drop-in for a step that tracked.
+
+    This is **not** equivalent to :func:`read_ctc_tracking`. That function builds
+    the tracking graph while the reloaded overlay is still uncalibrated, and
+    :func:`ctc_track_graph` reads each detection's ``time`` to stamp its nodes --
+    so re-attaching the time model afterwards leaves the graph timeless, and a
+    lineage plotted over ``time_feature="time"`` silently has nothing to plot.
+    Here the calibration is attached *first* and the tracking graph is built from
+    the calibrated overlay.
+
+    Detection ids are **not** stable across this round-trip: the CTC mask format
+    stores label images, so ids are renumbered on load (this is already true of
+    the trackers themselves, which round-trip through the same format). After
+    tracking, ``label`` -- the tracklet id -- is the stable key; do not join these
+    ids against a property table exported before tracking.
+
+    Args:
+        path: the CTC directory written by :func:`save_tracking`.
+        source: the image sequence the tracking was computed on. Required: it is
+            the only carrier of the time calibration.
+
+    Returns:
+        ``(overlay, tracklet_graph, tracking_graph)``. When ``source`` is
+        uncalibrated, the graphs simply carry no time attributes.
+
+    Raises:
+        FileNotFoundError: if the directory or its ``man_track.txt`` is missing.
+    """
+    # local import: acia.tracking imports this module, so this cannot be top-level
+    from acia.tracking import annotate_tracklet_times
+
+    path = Path(path)
+    track_file = path / "man_track.txt"
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"No tracking artifact at {path} -- expected a directory written by "
+            "acia.tracking.formats.save_tracking()."
+        )
+    if not track_file.exists():
+        raise FileNotFoundError(
+            f"{path} holds no man_track.txt -- it is not a CTC tracking directory."
+        )
+
+    overlay = read_ctc_segmentation_native(path)
+    tracklet_graph = read_ctc_tracklet_graph(track_file)
+
+    if overlay.numFrames() != source.size_t:
+        logging.warning(
+            "Tracking artifact has %d frames but the image sequence has %d -- "
+            "they may not belong to the same acquisition.",
+            overlay.numFrames(),
+            source.size_t,
+        )
+
+    # attach the time model BEFORE building the tracking graph (see docstring)
+    timepoints = source.timepoints
+    if timepoints is not None:
+        overlay = overlay.with_timepoints(timepoints)
+        annotate_tracklet_times(tracklet_graph, timepoints)
+
+    tracking_graph = ctc_track_graph(overlay, tracklet_graph)
+
+    return overlay, tracklet_graph, tracking_graph
 
 
 def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
@@ -212,11 +346,22 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
 
     track_graph = nx.DiGraph()
 
-    # add all the nodes
+    # add all the nodes -- carrying real time (not just frame index) when the
+    # overlay is time-calibrated, so the lineage can plot against real time.
+    time_unit: str | None = None
+    all_timed = True
     for cont in ov:
-        track_graph.add_node(cont.id, frame=cont.frame)
+        t = getattr(cont, "time", None)
+        if t is None:
+            all_timed = False
+            track_graph.add_node(cont.id, frame=cont.frame)
+        else:
+            track_graph.add_node(cont.id, frame=cont.frame, time=float(t.magnitude))
+            time_unit = time_unit or f"{t.units:~P}"
+    if all_timed and time_unit is not None:
+        track_graph.graph["time_unit"] = time_unit
 
-    tracklets = {}
+    tracklets: dict[Any, list[Any]] = {}
     for cont in ov:
         tracklets[cont.label] = tracklets.get(cont.label, []) + [cont]
 
@@ -226,9 +371,8 @@ def ctc_track_graph(ov: Overlay, tracklet_graph: nx.DiGraph):
         )
 
     for tracklet_label, tracklet_nodes in tracklets.items():
-
         # add tracklet edges
-        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:]):
+        for contA, contB in zip(tracklet_nodes, tracklet_nodes[1:], strict=False):
             track_graph.add_edge(contA.id, contB.id)
 
         for pred_label in tracklet_graph.predecessors(tracklet_label):
@@ -265,7 +409,6 @@ def tracking_to_graph(data: list[dict]) -> nx.DiGraph:
     # add division links
     for item in data:
         if int(item["parent_id"]) != 0:
-
             # get the time it divides
             # split_frame = int(item["start_frame"]) - 1
 

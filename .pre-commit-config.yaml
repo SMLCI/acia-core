@@ -1,39 +1,47 @@
-exclude: ^(docs)/
+# Only the generated/derived parts of docs/ are exempt. The hand-written pages
+# and the tutorial notebooks under docs/ are checked like any other source --
+# in particular check-added-large-files, which is what stops a notebook full of
+# embedded video from ever being committed.
+exclude: ^docs/(_build|api/generated|tutorials/data)/
 repos:
-- repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: v4.0.1
-  hooks:
-    - id: check-merge-conflict
-    - id: check-toml
-    - id: check-yaml
-    - id: trailing-whitespace
-    - id: end-of-file-fixer
-    # - id: requirements-txt-fixer
-- repo: https://github.com/PyCQA/isort
-  rev: 5.10.1
-  hooks:
-    - id: isort
-      name: isort
-      args: ["--profile", "black"]
-- repo: https://github.com/asottile/pyupgrade
-  rev: v2.29.1
-  hooks:
-    - id: pyupgrade
-      args: [--py38-plus]
-- repo: https://github.com/psf/black
-  rev: 22.6.0
-  hooks:
-  - id: black
-    name: black
-    description: "Black: The uncompromising Python code formatter"
-    entry: black
-    language: python
-    minimum_pre_commit_version: 2.9.2
-    require_serial: true
-    types_or: [python, pyi]
-- repo: https://github.com/PyCQA/pylint
-  rev: v2.12.2
-  hooks:
-    - id: pylint
-      args: [--rcfile=.pylintrc]
-      files: ^.*\.py
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+
+  # Tutorial notebooks are committed as SOURCE ONLY. Outputs are produced by the
+  # docs build (myst-nb executes every notebook), so nothing binary -- rendered
+  # videos, base64 PNGs, embedded figures -- ever enters git history.
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.17.0
+    hooks:
+      - id: pyupgrade
+        args: [--py310-plus]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      # Run the linter
+      - id: ruff
+        args: [--fix]
+      # Run the formatter
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1
+    hooks:
+      - id: mypy
+        additional_dependencies: []
+        args: [--ignore-missing-imports]
+        pass_filenames: false
+        entry: mypy acia/

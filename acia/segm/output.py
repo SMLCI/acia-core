@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from functools import partial
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -47,7 +48,6 @@ class MMSegmentationDataset(DatasetExporter):
         self.label_converter = label_coverter
 
     def write(self, base_folder: str | Path = "data", mode="train"):
-
         img_path = Path(base_folder).absolute() / "img_dir" / mode
         ann_path = Path(base_folder).absolute() / "ann_dir" / mode
 
@@ -109,7 +109,7 @@ class MMSegmentationDataset(DatasetExporter):
 
 
 def no_crop(frame: int, _: Overlay):
-    return (slice(0, frame.shape[0]), slice(0, frame.shape[1]))
+    return (slice(0, frame.shape[0]), slice(0, frame.shape[1]))  # type: ignore[attr-defined]
 
 
 def __video_export_from_str(
@@ -129,17 +129,17 @@ def __video_export_from_str(
         VideoExporter2: generate appropriate video exporter
     """
     if codec == "vp09":
-        ve = VideoExporter2.default_vp9(filename=filename, framerate=framerate)
+        ve = VideoExporter2.default_vp9(filename=filename, framerate=framerate)  # type: ignore[arg-type]
     elif codec == "h264":
-        ve = VideoExporter2.default_h264(filename=filename, framerate=framerate)
+        ve = VideoExporter2.default_h264(filename=filename, framerate=framerate)  # type: ignore[arg-type]
     elif codec == "h265":
-        ve = VideoExporter2.default_h265(filename=filename, framerate=framerate)
+        ve = VideoExporter2.default_h265(filename=filename, framerate=framerate)  # type: ignore[arg-type]
     elif codec == "mjpg":
-        ve = VideoExporter2.default_mjpg(filename=filename, framerate=framerate)
+        ve = VideoExporter2.default_mjpg(filename=filename, framerate=framerate)  # type: ignore[arg-type]
     else:
         raise ValueError(f"Unknown/Unsupported codec: {codec}")
 
-    return ve
+    return ve  # type: ignore[no-any-return]
 
 
 def renderVideo(
@@ -148,7 +148,7 @@ def renderVideo(
     filename="output.mp4",
     framerate=3,
     codec: Literal["vp09", "mjpg", "h264", "h265"] = "vp09",
-    scaleBar: ScaleBar = None,
+    scaleBar: ScaleBar | None = None,
     draw_frame_number=False,
     cropper=no_crop,
     filter_contours=lambda i, cont: True,
@@ -176,16 +176,15 @@ def renderVideo(
         roiSource = iter(always_none())
 
     # make codec lower case
-    codec = codec.lower()
+    codec = codec.lower()  # type: ignore[assignment]
 
     # create the video exporter
     ve = __video_export_from_str(filename, codec, framerate)
 
     with ve:
         for frame, (image, overlay) in enumerate(
-            tqdm.tqdm(zip(imageSource, roiSource))
+            tqdm.tqdm(zip(imageSource, roiSource, strict=False))
         ):
-
             # extract the numpy image
             if isinstance(image, BaseImage):
                 image = image.raw
@@ -230,7 +229,9 @@ def renderVideo(
 
             if scaleBar:
                 image = scaleBar.draw(
-                    image, width - scaleBar.pixelWidth - 10, height - 10
+                    image,
+                    width - scaleBar.pixelWidth - 10,
+                    height - 10,
                 )
 
             # output images
