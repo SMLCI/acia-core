@@ -1265,15 +1265,32 @@ class TestGradientECCExcludeRects(unittest.TestCase):
             confidence = method.estimate(self.frames[0], self.frames[t]).confidence
             self.assertGreater(confidence, 0.9)
 
-    def test_no_exclusion_is_bit_identical_to_the_unmasked_path(self):
-        """Passing no rects must not perturb an existing calibration."""
+    def test_no_exclusion_takes_the_unmasked_path(self):
+        """Passing no rects must not perturb an existing calibration.
+
+        Checked where the guarantee actually lives -- an empty rect list yields
+        no mask, so both callers hand ``cv2.findTransformECC`` the same
+        ``inputMask=None`` and it runs the identical code. Comparing the two
+        results *bit* for bit looks stronger but is not: ``confidence`` is the
+        final correlation coefficient of an iterative optimiser, and OpenCV does
+        not promise two invocations on identical input agree in the last bits
+        (observed on CI, differing at the 9th decimal while dx/dy/theta matched
+        exactly). So the geometry is compared exactly and the score to a
+        precision far below anything that could perturb a calibration.
+        """
+        self.assertIsNone(_rect_mask((64, 64), ()))
+
         reference = _structured_frame()
         moved = _warp(reference, dx=3.0, dy=-2.0, theta=1.0)
         plain = GradientECC(min_confidence=0.0).estimate(reference, moved)
         empty = GradientECC(min_confidence=0.0, exclude_rects=[]).estimate(
             reference, moved
         )
-        self.assertEqual(plain, empty)
+
+        self.assertEqual(plain.dx, empty.dx)
+        self.assertEqual(plain.dy, empty.dy)
+        self.assertEqual(plain.theta, empty.theta)
+        self.assertAlmostEqual(plain.confidence, empty.confidence, places=6)
 
     def test_excluding_everything_raises(self):
         huge = [RotatedCropSpec(center=(256.0, 256.0), size=(2000, 2000), angle=0.0)]
