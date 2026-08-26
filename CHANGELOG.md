@@ -39,6 +39,9 @@ written while the stage runs, and is visible in the notebook that produced it:
   The movie stays the single authority; this exists so that "what interval did this run
   use?" has an answer and a silent disagreement between two stages has something to
   notice it. `calibration()` reads it back.
+- `stage_table()` gains `error_type` and `error_message`, so a fan-out can say *why* a
+  population stopped rather than only that it did — across a batch that is what separates
+  one ROI running out of GPU memory from a chain that is broken for everything.
 - `ctx` now renders in a notebook: stages and how they ended, this stage's parameters,
   metrics and figures, and every file in the folder with the stage that produced it.
 - `scale()` records the parameters papermill injected, so a notebook no longer has to
@@ -376,6 +379,12 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- Re-running a recorded stage left the manifest describing two runs as one. The new run
+  inherited the previous one's recorded outputs, so until it collected its own the entry
+  showed fresh parameters beside stale outputs — and a re-run that died half-way left
+  exactly that mixture looking like a completed run. A new run now starts from a clean
+  entry, and re-running a stage warns, naming when it last ran and which downstream
+  stages its results have just made stale.
 - `stage_manifest.json` was rewritten non-atomically. With one write per stage the window
   was academic; recording as the stage runs widens it a hundredfold, and a truncated
   manifest is not a lost record but a poisoned folder — every later `for_image()` reads it

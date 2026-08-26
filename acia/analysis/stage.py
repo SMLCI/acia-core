@@ -230,6 +230,8 @@ class _StageRun:
     #: ``(name, data-uri)`` thumbnails, in memory only -- never in the manifest
     thumbnails: list[tuple[str, str]] = field(default_factory=list)
     finalized: bool = False
+    #: whether *this* run has collected its own observed I/O yet
+    io_collected: bool = False
     last_io_at: float = 0.0
     last_io_cost: float = 0.0
     last_persist: float = 0.0
@@ -346,6 +348,114 @@ def _warn_if_stale(output_dir: Path) -> None:
         )
 
 
+def _warn_on_producer_mismatch(
+    output_dir: Path, name: str | Path, produced_by: str
+) -> None:
+    """Warn when a stated producer disagrees with what the folder recorded.
+
+    ``produced_by`` used to be consulted only when the artifact was *missing*, to
+    say what to run. But a hint that is wrong while the file happens to exist is
+    the more dangerous case: it reads as a checked dependency and is not one. The
+    manifest already knows who wrote what, so the claim can simply be verified --
+    the same declared-versus-observed check that ``io.missing`` applies to outputs.
+
+    It names a **stage**, matched exactly against the manifest's keys. Accepting
+    the notebook file name too would be worse than strict: a stage named
+    ``"Segment"`` in ``01_Segment.ipynb`` would then match under
+    :func:`~acia.analysis.scale` (which records the notebook) and not match
+    interactively, so a wrong hint would pass in one place and warn in the other.
+
+    Reports, never decides: the recorded producer stays *derived* from what stages
+    actually wrote, and this never changes which file is returned.
+    """
+    manifest = read_manifest(output_dir)
+    stages = manifest.get("stages") or {}
+    if not stages:
+        # nothing has ever run here, so there is nothing to check the claim
+        # against -- the artifact was put here by other means, which is the
+        # caller's business
+        return
+
+    if produced_by not in stages:
+        if Path(produced_by).suffix == ".ipynb":
+            # a notebook file name where a stage name belongs: point at the fix
+            # rather than reporting it as an unknown stage
+            warnings.warn(
+                f"produced_by names a notebook ({produced_by!r}), but it takes the "
+                f"stage name -- the name passed to StageContext.for_image(stage=...). "
+                f"Stages recorded here: {', '.join(stages)}.",
+                stacklevel=3,
+            )
+            return
+        warnings.warn(
+            f"{str(name)!r} is said to be produced by stage {produced_by!r}, but no "
+            f"such stage has run in this folder -- recorded here: "
+            f"{', '.join(stages)}. Either the name is wrong, or this is not the "
+            "folder you meant.",
+            stacklevel=3,
+        )
+        return
+
+    recorded = _producers(manifest).get(str(name))
+    if recorded is None:
+        # the artifact has no recorded producer (capture off, or written before
+        # the stage that claims it). The named stage did run, so there is nothing
+        # solid enough to contradict -- provenance is a bonus, not a gate
+        return
+    if recorded != produced_by:
+        warnings.warn(
+            f"{str(name)!r} is said to be produced by stage {produced_by!r}, but "
+            f"this folder records it as written by stage {recorded!r}. The stage "
+            "this input actually depends on is the one that wrote it.",
+            stacklevel=3,
+        )
+
+
+def _warn_on_rerun(output_dir: Path, stage: str) -> None:
+    """Warn that a stage already recorded here is being run again.
+
+    Replacing the entry is the right thing -- a stage is re-run because its
+    settings changed, and the folder should describe the run that produced the
+    files now in it. What is worth saying out loud is the part that is *not*
+    visible from this notebook: the stages downstream of this one still describe
+    results computed from the previous version of these outputs, so they are
+    stale until re-run. :func:`check_stale` will say so on their next run, but
+    that is too late to be useful when the decision to re-run is being made here.
+    """
+    entry = (read_manifest(output_dir).get("stages") or {}).get(stage)
+    if not entry:
+        return
+
+    status = entry.get("status", "ok")
+    if status != "ok":
+        # a previous attempt that never finished: nothing downstream can have
+        # consumed it, so there is no staleness to report -- but silently
+        # resuming over a failed run hides that it failed
+        warnings.warn(
+            f"stage {stage!r} was started in this folder before and did not finish "
+            f"(status {status!r}); its entry will be replaced by this run.",
+            stacklevel=3,
+        )
+        return
+
+    when = entry.get("finished_at")
+    ran = f" (finished {when})" if when else ""
+    downstream = sorted(
+        {d for upstream, _, d in stage_graph(output_dir) if upstream == stage}
+    )
+    consequence = (
+        f" Stages that read its results are now out of date until they are re-run "
+        f"too: {', '.join(downstream)}."
+        if downstream
+        else ""
+    )
+    warnings.warn(
+        f"stage {stage!r} already ran in this folder{ran}; this run replaces its "
+        f"entry.{consequence}",
+        stacklevel=3,
+    )
+
+
 @dataclass(frozen=True)
 class StageContext:
     """Where one stage writes, which population it is on, and what it may read.
@@ -448,6 +558,7 @@ class StageContext:
         ctx._begin(track_io=track_io, track_roots=track_roots)
         _warn_if_stale(output_dir)
         if stage is not None:
+            _warn_on_rerun(output_dir, stage)
             # Nothing is written here on purpose: a folder that has only *built* a
             # context has not run a stage, and read_manifest() must still be empty.
             # The first write is the first log_*/cell boundary/finish.
@@ -554,12 +665,19 @@ class StageContext:
 
         Args:
             name: artifact inside this population's output folder.
-            produced_by: optional hint naming the notebook that makes it; see
-                :meth:`require` for how the error message uses it.
+            produced_by: optional name of the **stage** that makes it -- the name
+                passed to :meth:`for_image` as ``stage=``, not the notebook file.
+                It is *checked*: naming a stage that never ran here, or one that
+                did not write this file, warns. It never decides anything -- the
+                producer recorded in the manifest stays derived from what stages
+                actually wrote -- and it still shapes the error when the artifact
+                is missing (see :meth:`require`).
         """
         target = self.path(name)
         if not target.exists():
             raise FileNotFoundError(_missing_artifact_message(self, name, produced_by))
+        if produced_by is not None:
+            _warn_on_producer_mismatch(self.output_dir, name, produced_by)
         recorder = self._recorder
         if recorder is not None:
             # explicit, so it survives readers the audit hook cannot see -- anything
@@ -840,9 +958,11 @@ class StageContext:
         if env:
             entry["env"] = env
 
-        # an earlier persist may already have collected io; a cheap one must not
-        # drop it again
-        io = dict(previous.get("io") or {})
+        # An earlier persist *of this run* may already have collected io, and a cheap
+        # one must not drop it. A previous *run* of the same stage is different: its
+        # outputs describe work this run has not done, and carrying them would show a
+        # half-old, half-new entry as if it were one complete run.
+        io = dict(previous.get("io") or {}) if run.io_collected else {}
         if collect_io:
             began = time.monotonic()
             fresh = self._collect_io(manifest, entry["artifacts"])
@@ -850,6 +970,7 @@ class StageContext:
             run.last_io_at = time.monotonic()
             if fresh is not None:
                 io.update(fresh)
+                run.io_collected = True
         if io:
             entry["io"] = io
 
@@ -1630,6 +1751,15 @@ def stage_table(
         stale: check each run's inputs against the files on disk and add a ``stale``
             column. Set it to ``False`` for a large tree where the extra ``stat``
             calls are not worth it.
+
+    Returns:
+        pd.DataFrame: one row per (population, stage). Besides the population's key
+            columns it carries ``status`` and, for a stage that failed,
+            ``error_type``/``error_message``; the timing, notebook and
+            ``code_sha256`` of the run; ``n_inputs``/``n_outputs``/``n_figures``;
+            the resolved ``pixel_size_um``/``frame_interval_s``; and every
+            parameter and metric the stages logged, flattened into columns of its
+            own name so a whole fan-out can be compared in one table.
     """
     rows: list[dict[str, Any]] = []
     for output_dir in sorted(Path(root).glob(pattern)):
@@ -1644,6 +1774,7 @@ def stage_table(
             io = entry.get("io") or {}
             code = entry.get("code") or {}
             calibration = entry.get("calibration") or {}
+            error = entry.get("error") or {}
 
             # Settings the stage recorded become columns, so they can be compared
             # across a batch. Logged parameters and metrics flatten into the *same*
@@ -1672,6 +1803,11 @@ def stage_table(
                     "n_inputs": len(io.get("inputs", [])) if io else None,
                     "n_outputs": len(io.get("outputs", [])) if io else None,
                     "n_figures": len(entry.get("figures") or []),
+                    # what went wrong, not merely that something did: across a
+                    # fan-out this is the column that separates "one ROI ran out
+                    # of GPU memory" from "the chain is broken for everything"
+                    "error_type": error.get("type"),
+                    "error_message": error.get("message"),
                     "pixel_size_um": calibration.get("pixel_size_um"),
                     "frame_interval_s": calibration.get("frame_interval_s"),
                     "stale": name in stale_stages,

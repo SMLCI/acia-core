@@ -79,6 +79,29 @@ become a second place to read calibration from — but it means "what interval d
 use?" has an answer, and a later stage that resolves a different value **warns** instead
 of quietly producing results that cannot be compared with the earlier ones.
 
+### Re-running a stage
+
+Re-running is normal and allowed — a stage is re-run because its settings changed, and
+the folder should describe the run that produced the files now in it. Two things happen:
+
+- the previous entry is **replaced, not merged**. Its metrics, figures and recorded
+  outputs are dropped when the new run starts, so a re-run that dies half-way can never
+  read as one complete run built from two;
+- you get a warning naming what the re-run invalidates:
+
+```text
+stage 'Segment' already ran in this folder (finished 2026-08-25T08:00:24+00:00); this
+run replaces its entry. Stages that read its results are now out of date until they are
+re-run too: Track.
+```
+
+That last clause is the part you cannot see from the notebook you are in.
+{func}`~acia.analysis.check_stale` reports it too, but only on *Track's* next run —
+which is too late to be useful when the decision to re-run is being made here.
+
+A previous run that never finished says so instead, and claims no staleness: nothing
+downstream can have consumed it.
+
 ### `record()`
 
 `ctx.record('Segment', n_cells=…)` still works and still writes exactly what it always
@@ -164,11 +187,21 @@ from acia.analysis import stage_table
 runs = stage_table('automated_executions_stages')
 
 runs[runs.stale]                                          # what needs redoing
+runs[runs.status != 'ok'][['population_id', 'stage', 'error_type', 'error_message']]
 runs[runs.stage == 'Segment'].pixel_size.value_counts()   # settings drift in the batch
 runs.groupby(['stage', 'code_sha256']).size()             # did it all run the same code?
 runs.pivot_table(index='population_id', columns='stage',
-                 values='finished_at', aggfunc='first')   # coverage matrix
+                 values='status', aggfunc='first')        # coverage matrix
 ```
+
+Every parameter and metric the stages logged is a column of its own name, so the headline
+numbers of a whole fan-out — `n_detections_after`, `n_tracklets`, `growth_rate_CC` — are
+answerable here without opening a single result CSV.
+
+`status` reports how each stage *ended*, and `error_type`/`error_message` say why one did
+not: across a batch that is what separates a single ROI running out of GPU memory from a
+chain that is broken for every population. Counting the stages that left an entry cannot
+tell those apart — a stage that ran and failed still left one.
 
 The `code_sha256` column is worth knowing about: it is a digest of the notebook that ran,
 so when two populations disagree you can tell whether they were produced by the same
