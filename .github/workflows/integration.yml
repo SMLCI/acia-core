@@ -26,7 +26,7 @@ jobs:
       - run: pip install git+https://github.com/JojoDevel/trackastra.git
       - name: Cache test resources
         id: cache-data
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: test_resources
           key: test-resources-v1
