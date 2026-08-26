@@ -54,7 +54,7 @@ dependencies = [
     "platformdirs>=3.0.0",
     "tomli>=2.0.0; python_version < '3.11'",
     "imageio>=2.0",
-    "moviepy<2",
+    "moviepy<3",
     "statsmodels>=0.14",
 ]
 
