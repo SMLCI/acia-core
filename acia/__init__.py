@@ -2,7 +2,7 @@
 
 __author__ = """Johannes Seiffarth"""
 __email__ = "j.seiffarth@fz-juelich.de"
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 
 import pint

@@ -14,6 +14,8 @@ as the work lands.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-27
+
 ### Added
 
 **Recording a stage as it happens** (`acia.analysis.StageContext`) — the record is now
