@@ -107,7 +107,7 @@ widget = ["anywidget>=0.9"]
 # (e.g. `pip install acia[omnipose]`). Pins mirror the acia-workflows
 # segmentation notebooks (notebooks/segmentation/*.ipynb). The backends have
 # CONFLICTING torch / numpy / cellpose requirements (classic Cellpose is
-# `cellpose<4`, Cellpose-SAM is `cellpose>=4`, Omnipose pins `scipy==1.11.4`),
+# `cellpose<4`, Cellpose-SAM is `cellpose>=4`, Omnipose pins `scipy==1.15.3`),
 # so they are MUTUALLY EXCLUSIVE -- install exactly one per environment.
 cellpose = ["cellpose<4"]  # classic Cellpose (cyto / nuclei models)
 # Cellpose-SAM; the notebook used git@8ef88040 before the 4.0 release, which is
@@ -119,7 +119,7 @@ omnipose = [
     "torchvision",
     "torchaudio",
     "natsort",
-    "scipy==1.11.4",
+    "scipy==1.15.3",
 ]
 # flowpose-rt: lightweight omnipose-compatible backend (no cellpose/omnipose/numba
 # at runtime). Not on PyPI yet -- install the flowpose-rt package from source
