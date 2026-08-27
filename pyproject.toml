@@ -114,7 +114,7 @@ cellpose = ["cellpose<4"]  # classic Cellpose (cyto / nuclei models)
 # now the released `cellpose>=4` line.
 cellpose-sam = ["cellpose>=4"]
 omnipose = [
-    "omnipose==1.0.6",  # provides the `cellpose_omni` backend
+    "omnipose==1.1.4",  # provides the `cellpose_omni` backend
     "torch",
     "torchvision",
     "torchaudio",
