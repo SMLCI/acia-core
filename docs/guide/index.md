@@ -9,6 +9,7 @@ these pages are meant to be entered from the middle — read the one you need.
 
 remote-sources
 slicing-and-calibration
+acquisition-slips
 units
 stages
 scaling

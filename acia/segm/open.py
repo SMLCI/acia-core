@@ -58,6 +58,9 @@ class SequenceMetadata:
     dtype: str
     num_positions: int
     num_timepoints: int
+    # raw slots holding a repeated image, corrected in memory (see
+    # :mod:`acia.segm.acquisition_fixes`); frame indices downstream depend on them
+    acquisition_fixes: tuple = ()
 
     def to_dict(self) -> dict:
         """Emit the manifest ``source`` metadata block (plain floats + strings)."""
@@ -76,6 +79,7 @@ class SequenceMetadata:
             "dtype": self.dtype,
             "num_positions": self.num_positions,
             "num_timepoints": self.num_timepoints,
+            "acquisition_fixes": [s.to_dict() for s in self.acquisition_fixes],
         }
 
 
@@ -104,13 +108,20 @@ class SequenceFile:
         pixel_size=None,
         frame_interval=None,
         pattern=None,
+        acquisition_fixes=None,
     ) -> None:
         self.path = str(path)
         self.format = fmt
         self._pixel_size = pixel_size
         self._frame_interval = frame_interval
         self._pattern = pattern
+        # None -> the sidecar (resolved lazily: opening stays IO-free); a list ->
+        # verbatim, [] meaning "raw order"
+        self._fixes_arg = acquisition_fixes
+        self._slot_map = None
+        self._fixes_resolved = False
         self._pos_cache: dict[int, object] = {}
+        self._corrected_cache: dict[int, object] = {}
         self._meta: SequenceMetadata | None = None
         self._positions: list[PositionInfo] | None = None
         self._layout: tuple[list[str], bool] | None = None
@@ -180,15 +191,103 @@ class SequenceFile:
         return self._pos_cache[0]
 
     def position(self, index: int):
-        """Return the per-position lazy ``ImageSequenceSource`` for ``index``."""
+        """Return the per-position lazy ``ImageSequenceSource`` for ``index``.
+
+        With acquisition fixes in effect this is a
+        :class:`~acia.segm.acquisition_fixes.CorrectedPositionSource`, which reads
+        each frame from the raw slot where its image actually landed; use
+        :meth:`raw_position` for the file's own order.
+        """
+        slot_map = self._resolve_fixes()
+        if slot_map is None:
+            return self.raw_position(index)
+        self._check_index(index)
+        if index not in self._corrected_cache:
+            from acia.segm.acquisition_fixes import CorrectedPositionSource
+
+            self._corrected_cache[index] = CorrectedPositionSource(
+                self, index, slot_map
+            )
+        return self._corrected_cache[index]
+
+    def raw_position(self, index: int):
+        """The per-position source in the file's own (uncorrected) slot order."""
+        self._check_index(index)
+        if index not in self._pos_cache:
+            self._pos_cache[index] = self._make_source(index)
+        return self._pos_cache[index]
+
+    def _check_index(self, index: int) -> None:
         n = self.num_positions
         if not 0 <= index < n:
             raise ValueError(
                 f"position {index} out of range for {n} position(s) in {self.path!r}"
             )
-        if index not in self._pos_cache:
-            self._pos_cache[index] = self._make_source(index)
-        return self._pos_cache[index]
+
+    # --- acquisition fixes -----------------------------------------------------
+
+    def _resolve_fixes(self):
+        """Resolve (once) the :class:`SlotMap` in effect, or ``None`` for raw order."""
+        if self._fixes_resolved:
+            return self._slot_map
+        from acia.segm.acquisition_fixes import SlotMap, coerce_slips, load_fixes
+
+        multi = self.format in ("nd2", "czi")
+        if self._fixes_arg is None:
+            slips = []
+            if multi:
+                probe = self._probe()
+                slips = load_fixes(
+                    self.path,
+                    num_t=int(probe.size_t),
+                    num_p=self._raw_num_positions(),
+                )
+        else:
+            slips = coerce_slips(self._fixes_arg)
+            if slips and not multi:
+                raise ValueError(
+                    f"acquisition_fixes only apply to multi-position ND2/CZI files, "
+                    f"not to {self.format!r} ({self.path!r})"
+                )
+        if slips:
+            self._slot_map = SlotMap(
+                int(self._probe().size_t), self._raw_num_positions(), slips
+            )
+        self._fixes_resolved = True
+        return self._slot_map
+
+    def _raw_num_positions(self) -> int:
+        probe = self._probe()
+        if self.format == "nd2":
+            return int(probe.sizes.get("P", 1))
+        return int(getattr(probe, "n_scenes", probe.sizes.get("S", 1)))
+
+    @property
+    def acquisition_fixes(self) -> list:
+        """The :class:`~acia.segm.acquisition_fixes.AcquisitionSlip` s in effect."""
+        slot_map = self._resolve_fixes()
+        return [] if slot_map is None else list(slot_map.slips)
+
+    def stage_positions(self) -> np.ndarray:
+        """Recorded stage XY (µm) of every **raw** slot, shape ``(T, P, 2)``.
+
+        NaN where the file carries no stage metadata for a slot. Reads metadata
+        only -- no pixels -- but touches every image's metadata, so it is not free
+        on a large file.
+        """
+        num_p = self.num_positions
+        num_t = int(self._probe().size_t)
+        out = np.full((num_t, num_p, 2), np.nan)
+        for p in range(num_p):
+            src = self.raw_position(p)
+            stage_xy = getattr(src, "stage_xy", None)
+            if stage_xy is None:
+                continue
+            for t in range(num_t):
+                xy = stage_xy(t)
+                if xy is not None:
+                    out[t, p] = xy
+        return out
 
     # --- metadata --------------------------------------------------------------
 
@@ -255,6 +354,7 @@ class SequenceFile:
             dtype=str(getattr(probe, "dtype", "") or ""),
             num_positions=num_positions,
             num_timepoints=int(probe.size_t),
+            acquisition_fixes=tuple(self.acquisition_fixes),
         )
 
     def _position_names(self) -> dict[int, str | None]:
@@ -277,7 +377,11 @@ class SequenceFile:
         Reads exactly one frame of ``index``, takes the display channel (0),
         min-max normalizes, strides by ``downscale``, and returns an RGB preview.
         """
-        raw = self.position(index).get_frame(frame).raw  # (H, W, C) or (H, W)
+        source = self.position(index)
+        # a slip-corrected position may end a frame early: show its last frame
+        if 0 <= frame < self.metadata.num_timepoints:
+            frame = min(frame, source.size_t - 1)
+        raw = source.get_frame(frame).raw  # (H, W, C) or (H, W)
         plane = raw[..., 0] if raw.ndim == 3 else raw
         small = plane[::downscale, ::downscale]
         u8 = normalize_to_uint8(small)
@@ -302,6 +406,7 @@ class SequenceFile:
                 with contextlib.suppress(Exception):
                     close()
         self._pos_cache.clear()
+        self._corrected_cache.clear()
         self._positions = None
 
     def __enter__(self) -> SequenceFile:
@@ -334,7 +439,12 @@ def _is_directory(text: str) -> bool:
 
 
 def open_sequence(
-    path, *, pixel_size=None, frame_interval=None, pattern=None
+    path,
+    *,
+    pixel_size=None,
+    frame_interval=None,
+    pattern=None,
+    acquisition_fixes=None,
 ) -> SequenceFile:
     """Open an acquisition by filename suffix (ND2/CZI/TIFF) or as a folder.
 
@@ -353,6 +463,11 @@ def open_sequence(
         pixel_size: physical pixel size overriding the file's own metadata.
         frame_interval: scalar time between frames, likewise overriding.
         pattern: frame-filename glob, folders only (``None`` -> ``.tif``/``.tiff``).
+        acquisition_fixes: raw slots ``(t, position)`` holding a repeated image
+            (a double shot), corrected in memory -- see
+            :mod:`acia.segm.acquisition_fixes`. ``None`` (default) uses the
+            ``<file>.acia-fixes.json`` sidecar if one exists; a list overrides it;
+            ``[]`` forces the file's raw order. ND2/CZI only.
 
     Raises:
         ValueError: If the suffix maps to no supported reader and the path is not
@@ -385,4 +500,5 @@ def open_sequence(
         pixel_size=pixel_size,
         frame_interval=frame_interval,
         pattern=pattern,
+        acquisition_fixes=acquisition_fixes,
     )

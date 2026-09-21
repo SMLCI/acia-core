@@ -224,10 +224,14 @@ def load_selection(manifest: SelectionManifest, source=None) -> list:
     Raises:
         ValueError: If a selection's ``position`` is out of range for the source.
     """
+    from acia.segm.acquisition_fixes import manifest_fixes, warn_on_fixes_mismatch
     from acia.segm.open import SequenceFile, open_sequence
 
     if source is None:
-        seqfile = open_sequence(manifest.source_path)
+        # reopen under the fixes the manifest's frame indices were recorded with
+        seqfile = open_sequence(
+            manifest.source_path, acquisition_fixes=manifest_fixes(manifest.source)
+        )
     elif isinstance(source, (str, os.PathLike)):
         seqfile = open_sequence(source)
     else:
@@ -235,6 +239,7 @@ def load_selection(manifest: SelectionManifest, source=None) -> list:
 
     if isinstance(seqfile, SequenceFile):
         _warn_on_fingerprint_mismatch(manifest, seqfile.path)
+        warn_on_fixes_mismatch(manifest.source, seqfile)
 
     crops = []
     for sel in manifest.selections:

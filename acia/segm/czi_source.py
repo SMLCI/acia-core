@@ -325,6 +325,39 @@ class CZISequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         plane = self._arrange_plane(np.asarray(data), shape)
         return LocalImage(plane, frame=frame)
 
+    def stage_xy(self, frame: int) -> tuple[float, float] | None:
+        """Recorded stage XY (µm) of the image at ``(scene=position, frame)``.
+
+        Read from the subblock metadata (``StageXPosition``/``StageYPosition``;
+        no pixels), so it reports where the stage actually was -- which is how a
+        double shot is recognised (see :mod:`acia.segm.acquisition_fixes`).
+        ``None`` if unavailable.
+        """
+        self._ensure_reader()
+        assert self._reader is not None
+        if not 0 <= frame < self.size_t:
+            raise IndexError(f"frame {frame} out of range for size_t={self.size_t}")
+        constraints = self._build_constraints(frame)
+        if "C" in self._dims:
+            constraints["C"] = 0  # one channel's subblock is enough
+        try:
+            import xml.etree.ElementTree as ET
+
+            blocks = self._reader.read_subblock_metadata(**constraints)
+            if not blocks:
+                return None
+            root = ET.fromstring(blocks[0][1])
+            x_el = root.find(".//StageXPosition")
+            y_el = root.find(".//StageYPosition")
+            if x_el is None or y_el is None or not x_el.text or not y_el.text:
+                return None
+            x, y = float(x_el.text), float(y_el.text)
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return None
+            return (x, y)
+        except Exception:  # noqa: BLE001 - metadata is best-effort
+            return None
+
     # --- axis-name mapping -----------------------------------------------------
 
     def _build_constraints(self, frame: int) -> dict[str, int]:

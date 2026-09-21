@@ -37,6 +37,7 @@ Reading image sequences
    acia.segm.folder_source
    acia.segm.nd2_source
    acia.segm.czi_source
+   acia.segm.acquisition_fixes
    acia.segm.tiff_metadata
    acia.segm.tiff_export
    acia.segm.formats

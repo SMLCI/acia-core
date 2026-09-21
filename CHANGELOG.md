@@ -16,6 +16,21 @@ as the work lands.
 
 ### Added
 
+**Correcting acquisition slips** (`acia.segm.acquisition_fixes`) — when the microscope
+images one position twice in a row, every later slot of a multi-position ND2/CZI holds the
+image of the slot before it. acia now undoes that in memory, without writing to the raw file:
+- `open_sequence(path, acquisition_fixes=[(t, position), ...])` names the raw slot(s) that
+  hold the repeated image. `SequenceFile.position(i)` then reads every frame from where it
+  actually landed; `SequenceFile.raw_position(i)` keeps the file's own order. Positions the
+  shift runs through end one frame early.
+- `save_fixes(path, slips)` writes `<file>.acia-fixes.json` next to the raw file, and
+  `open_sequence` picks it up automatically. `acquisition_fixes=[]` forces the raw order.
+- `detect_acquisition_slips(seqfile)` suggests slips from the per-image stage XY: two
+  consecutive images at the same place. ND2/CZI readers gain `stage_xy(frame)` and
+  `SequenceFile` gains `stage_positions()`.
+- The fixes are recorded in the manifest `source` block. `load_selection` /
+  `load_registration` reopen the file with them and warn when a passed source uses others.
+
 **Recording a stage as it happens** (`acia.analysis.StageContext`) — the record is now
 written while the stage runs, and is visible in the notebook that produced it:
 - `StageContext.for_image(..., stage='Segment')` names the stage up front, which is what

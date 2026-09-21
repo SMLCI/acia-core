@@ -67,6 +67,7 @@ class ND2SequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         self._sizes: dict[str, int] | None = None
         self._dask = None
         self._axes: list[str] = []
+        self._seq_lookup: dict[tuple[int, int], int] | None = None
 
     # --- lazy reader / metadata ------------------------------------------------
 
@@ -258,6 +259,42 @@ class ND2SequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         plane = np.asarray(self._dask[indexer])
         plane = self._to_hwc(plane)
         return LocalImage(plane, frame=frame)
+
+    def stage_xy(self, frame: int) -> tuple[float, float] | None:
+        """Recorded stage XY (µm) of the image at ``(position, frame)``, if known.
+
+        Read from the per-frame metadata (no pixels), so it reports where the
+        stage actually was -- which is how a double shot is recognised (see
+        :mod:`acia.segm.acquisition_fixes`). ``None`` if unavailable.
+        """
+        self._ensure_reader()
+        assert self._reader is not None
+        if not 0 <= frame < self.size_t:
+            raise IndexError(f"frame {frame} out of range for size_t={self.size_t}")
+        try:
+            seq = self._sequence_index(frame)
+            if seq is None:
+                return None
+            channel = self._reader.frame_metadata(seq).channels[0]
+            x, y = channel.position.stagePositionUm[:2]
+            x, y = float(x), float(y)
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return None
+            return (x, y)
+        except Exception:  # noqa: BLE001 - metadata is best-effort
+            return None
+
+    def _sequence_index(self, frame: int) -> int | None:
+        """The ND2 sequence (frame) index of ``(position, frame)``."""
+        assert self._reader is not None
+        if self._seq_lookup is None:
+            lookup: dict[tuple[int, int], int] = {}
+            for seq, loops in enumerate(self._reader.loop_indices):
+                if loops.get("Z", 0) != 0 or loops.get("C", 0) != 0:
+                    continue
+                lookup.setdefault((loops.get("T", 0), loops.get("P", 0)), seq)
+            self._seq_lookup = lookup
+        return self._seq_lookup.get((frame, self.position))
 
     # --- axis-name mapping -----------------------------------------------------
 

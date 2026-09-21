@@ -3017,7 +3017,14 @@ if _HAS_ANYWIDGET:
 
         def _frame_png(self, pos: int, t: int) -> bytes:
             """PNG bytes of one lazily-read frame (display channel, normalized)."""
-            raw = np.asarray(self._file.position(pos).get_frame(t).raw)
+            source = self._file.position(pos)
+            # a slip-corrected position may end a frame or two before the file
+            # does (see acia.segm.acquisition_fixes): show its last frame there,
+            # but let a genuinely out-of-range t fail as before
+            fixes = getattr(self._file, "acquisition_fixes", None)
+            if fixes and t < self._file.metadata.num_timepoints:
+                t = min(t, source.size_t - 1)
+            raw = np.asarray(source.get_frame(t).raw)
             plane = raw[..., 0] if raw.ndim == 3 else raw
             rgb = np.repeat(normalize_to_uint8(plane)[:, :, np.newaxis], 3, axis=-1)
             buffer = io.BytesIO()
