@@ -24,6 +24,7 @@ from acia.segm.acquisition_fixes import (
     SlotMap,
     detect_acquisition_slips,
     load_fixes,
+    preview_slip,
     save_fixes,
     sidecar_path,
 )
@@ -201,6 +202,17 @@ class TestCorrectedSequenceFile(_FakeND2Case):
         self.assertEqual(f.position(3).size_t, T - 1)
         with self.assertRaises(IndexError):
             f.position(3).get_frame(T - 1)
+
+    def test_preview_shows_the_slip_and_its_neighbours(self):
+        f = self.open(acquisition_fixes=[(1, 2)])
+        img = preview_slip(f, (1, 2), downscale=1)
+        # three 4px-wide tiles, two 8px gaps, plus the label band above them
+        self.assertEqual(img.size, (3 * 4 + 2 * 8, 3 + 14))
+
+    def test_preview_at_the_file_edge_drops_the_missing_neighbour(self):
+        f = self.open(acquisition_fixes=[])
+        img = preview_slip(f, (T - 1, P - 1), downscale=1)
+        self.assertEqual(img.size, (2 * 4 + 8, 3 + 14))
 
     def test_raw_position_stays_raw(self):
         f = self.open(acquisition_fixes=[(1, 2)])

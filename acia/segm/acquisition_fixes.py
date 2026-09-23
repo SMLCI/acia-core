@@ -209,6 +209,56 @@ class CorrectedPositionSource(ImageSequenceSource):
         return None if xy is None else (float(xy[0]), float(xy[1]))
 
 
+def preview_slip(seqfile, slip, *, downscale: int = 8, channel: int = 0):
+    """The raw slots before / at / after ``slip``, side by side and labelled.
+
+    A double shot is confirmed by eye: the middle tile should be identical to the
+    one on its left. Reads the file's **raw** slot order (three frames), so it
+    shows what is in the file rather than what a correction would make of it.
+
+    Args:
+        seqfile: the :class:`~acia.segm.open.SequenceFile` to read (any fixes it
+            carries are bypassed -- the raw slots are shown).
+        slip: the :class:`AcquisitionSlip` (or ``(t, position)``) to preview.
+        downscale: stride applied to each tile, as in
+            :meth:`~acia.segm.open.SequenceFile.thumbnail`.
+        channel: which channel to display.
+
+    Returns:
+        PIL.Image.Image: the labelled strip, ready to ``display()``.
+    """
+    from PIL import Image, ImageDraw
+
+    from acia.notebook import normalize_to_uint8
+
+    slip = AcquisitionSlip.coerce(slip)
+    num_p = seqfile.num_positions
+    num_slots = seqfile.metadata.num_timepoints * num_p
+    k = slip.t * num_p + slip.position
+
+    tiles, labels = [], []
+    for slot in (k - 1, k, k + 1):
+        if not 0 <= slot < num_slots:
+            continue
+        t, p = divmod(slot, num_p)
+        raw = np.asarray(seqfile.raw_position(p).get_frame(t).raw)
+        plane = raw[..., channel] if raw.ndim == 3 else raw
+        tiles.append(normalize_to_uint8(plane[::downscale, ::downscale]))
+        labels.append(f"t={t} pos={p}" + (" (repeat)" if slot == k else ""))
+
+    band, gap = 14, 8
+    height = max(t.shape[0] for t in tiles)
+    width = sum(t.shape[1] for t in tiles) + gap * (len(tiles) - 1)
+    strip = Image.new("L", (width, height + band), color=255)
+    draw = ImageDraw.Draw(strip)
+    x = 0
+    for tile, label in zip(tiles, labels, strict=True):
+        strip.paste(Image.fromarray(tile), (x, band))
+        draw.text((x + 2, 2), label, fill=0)
+        x += tile.shape[1] + gap
+    return strip
+
+
 # --------------------------------------------------------------------------- #
 # sidecar
 # --------------------------------------------------------------------------- #
