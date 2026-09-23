@@ -305,11 +305,28 @@ class TestDetection(_FakeND2Case):
         xy = np.array([[_POS_XY[p] for p in range(P)] for _ in range(T)])
         self.assertEqual(detect_acquisition_slips(xy), [])
 
+    def test_slip_in_the_first_timepoint_is_detected(self):
+        # the layout of timepoint 0 is itself shifted here, so a check that
+        # trusted it would flag the file as undetectable instead of finding this
+        xy = np.array([_POS_XY[p] for t, p in _raw_slots({2})]).reshape(T, P, 2)
+        self.assertEqual(detect_acquisition_slips(xy), [AcquisitionSlip(0, 2)])
+
     def test_positions_too_close_raise(self):
         xy = np.zeros((T, P, 2))
         xy[:, :, 0] = np.arange(P) * 0.5
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             detect_acquisition_slips(xy, tol_um=2.0)
+        self.assertIn("unit mismatch", str(ctx.exception))
+
+    def test_two_positions_at_one_place_raise(self):
+        # positions 0 and 2 sit at the same place. They are not neighbours, so no
+        # slot looks repeated, but the layout is still ambiguous: a repeat of
+        # position 0 could not be told apart from arriving at position 2
+        layout = [_POS_XY[0], _POS_XY[1], _POS_XY[0], _POS_XY[3]]
+        xy = np.array([layout for _ in range(T)])
+        with self.assertRaises(ValueError) as ctx:
+            detect_acquisition_slips(xy, tol_um=2.0)
+        self.assertIn("still lie", str(ctx.exception))
 
     def test_single_position_raises(self):
         with self.assertRaises(ValueError):

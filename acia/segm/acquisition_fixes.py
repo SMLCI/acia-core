@@ -382,9 +382,10 @@ def detect_acquisition_slips(
         The suggested slips in raw coordinates, sorted. Nothing is applied.
 
     Raises:
-        ValueError: if there is no stage metadata, only one position, or two
-            distinct positions lie within ``tol_um`` of each other (a double shot
-            would be indistinguishable from the normal sequence).
+        ValueError: if there is no stage metadata, only one position, so many
+            slots look repeated that the values can't be stage µm, or the
+            positions are still indistinguishable once the slips are taken out (a
+            double shot would then be indistinguishable from the normal sequence).
     """
     if hasattr(stage_positions, "stage_positions"):
         xy = stage_positions.stage_positions()
@@ -403,24 +404,43 @@ def detect_acquisition_slips(
             "the file carries no per-image stage XY metadata; declare slips by hand"
         )
 
-    # distinct positions must be farther apart than tol_um, else a repeat can't be
-    # told apart from the next position (compare the first timepoint's layout)
-    first = xy[0]
-    finite = ~np.isnan(first).any(axis=1)
-    pts = first[finite]
+    flat = xy.reshape(num_t * num_p, 2)
+    step = np.linalg.norm(flat[1:] - flat[:-1], axis=-1)  # NaN where unknown
+    ks = np.nonzero(step < tol_um)[0] + 1
+    slips = [AcquisitionSlip(*map(int, divmod(int(k), num_p))) for k in ks]
+
+    # A handful of repeats is a double shot; a large fraction of them means the
+    # values aren't stage µm (some formats report mm) or tol_um is far too large.
+    typical = float(np.nanmedian(step)) if np.any(np.isfinite(step)) else float("nan")
+    if len(slips) > max(3, 0.05 * num_t * num_p):
+        raise ValueError(
+            f"{len(slips)} of {num_t * num_p} slots look like repeats at "
+            f"tol_um={tol_um}, with a typical step of {typical:.3f} between "
+            "consecutive images; that reads like a unit mismatch (stage values in "
+            "mm rather than µm) or too large a tolerance, not a double shot"
+        )
+
+    # Once the repeats are taken out, each position must sit at its own place --
+    # otherwise a repeat cannot be told apart from moving on to the next position.
+    # Checked here, after the fact, because a slip in the very first timepoint
+    # would make the raw layout of that timepoint look ambiguous by itself.
+    slot_map = SlotMap(num_t, num_p, slips)
+    centers = np.full((num_p, 2), np.nan)
+    for p in range(num_p):
+        seen = [slot_map.raw_slot(t, p) for t in range(slot_map.size_t(p))]
+        if seen:
+            centers[p] = np.nanmedian(np.array([xy[s] for s in seen if s]), axis=0)
+    pts = centers[~np.isnan(centers).any(axis=1)]
     if len(pts) >= 2:
         d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
         d[np.diag_indices_from(d)] = np.inf
         if d.min() < tol_um:
             raise ValueError(
-                f"two positions lie {d.min():.2f} µm apart (< tol_um={tol_um}); "
-                "slips can't be detected from stage XY for this layout"
+                f"two positions still lie {d.min():.2f} µm apart (< tol_um="
+                f"{tol_um}) once the {len(slips)} detected repeat(s) are removed; "
+                "slips can't be told apart from the next position in this layout"
             )
-
-    flat = xy.reshape(num_t * num_p, 2)
-    step = np.linalg.norm(flat[1:] - flat[:-1], axis=-1)  # NaN where unknown
-    ks = np.nonzero(step < tol_um)[0] + 1
-    return [AcquisitionSlip(*map(int, divmod(int(k), num_p))) for k in ks]
+    return slips
 
 
 # --------------------------------------------------------------------------- #
