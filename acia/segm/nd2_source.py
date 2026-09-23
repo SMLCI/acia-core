@@ -13,6 +13,8 @@ optional dependency, imported lazily inside :meth:`ND2SequenceSource._ensure_rea
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from acia import Q_
@@ -62,10 +64,11 @@ class ND2SequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         self._user_frame_interval = frame_interval
         self._user_timepoints = timepoints
 
-        # lazy state, populated by _ensure_reader()
-        self._reader = None
+        # lazy state, populated by _ensure_reader() (untyped: the nd2 reader and
+        # its dask array are only present when the optional backend is installed)
+        self._reader: Any = None
         self._sizes: dict[str, int] | None = None
-        self._dask = None
+        self._dask: Any = None
         self._axes: list[str] = []
         self._seq_lookup: dict[tuple[int, int], int] | None = None
 

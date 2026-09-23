@@ -23,6 +23,7 @@ from acia.segm.acquisition_fixes import (
     AcquisitionSlip,
     SlotMap,
     detect_acquisition_slips,
+    detect_duplicate_positions,
     load_fixes,
     preview_slip,
     save_fixes,
@@ -318,15 +319,30 @@ class TestDetection(_FakeND2Case):
             detect_acquisition_slips(xy, tol_um=2.0)
         self.assertIn("unit mismatch", str(ctx.exception))
 
-    def test_two_positions_at_one_place_raise(self):
-        # positions 0 and 2 sit at the same place. They are not neighbours, so no
-        # slot looks repeated, but the layout is still ambiguous: a repeat of
-        # position 0 could not be told apart from arriving at position 2
-        layout = [_POS_XY[0], _POS_XY[1], _POS_XY[0], _POS_XY[3]]
+    def test_a_duplicated_point_is_not_a_slip(self):
+        # the point list holds one spot twice, so position 3 repeats position 2 in
+        # every cycle: nothing is shifted and no image is lost
+        layout = [_POS_XY[0], _POS_XY[1], _POS_XY[2], _POS_XY[2]]
         xy = np.array([layout for _ in range(T)])
-        with self.assertRaises(ValueError) as ctx:
-            detect_acquisition_slips(xy, tol_um=2.0)
-        self.assertIn("still lie", str(ctx.exception))
+        self.assertEqual(detect_duplicate_positions(xy), [(3, 2)])
+        with self.assertWarns(UserWarning):
+            self.assertEqual(detect_acquisition_slips(xy), [])
+
+    def test_a_duplicate_that_wraps_around_the_cycle(self):
+        # the last point repeats the first, so the repeat lands on position 0 of
+        # the *next* timepoint -- exactly what a real 74-position ND2 showed
+        layout = [_POS_XY[0], _POS_XY[1], _POS_XY[2], _POS_XY[0]]
+        xy = np.array([layout for _ in range(T)])
+        self.assertEqual(detect_duplicate_positions(xy), [(0, P - 1)])
+        with self.assertWarns(UserWarning):
+            self.assertEqual(detect_acquisition_slips(xy), [])
+
+    def test_a_real_slip_survives_a_duplicated_point(self):
+        layout = [_POS_XY[0], _POS_XY[1], _POS_XY[2], _POS_XY[2]]
+        xy = np.array([layout for _ in range(T)])
+        xy[2, 1] = _POS_XY[0]  # a one-off double shot of position 0 at t=2
+        with self.assertWarns(UserWarning):
+            self.assertEqual(detect_acquisition_slips(xy), [AcquisitionSlip(2, 1)])
 
     def test_single_position_raises(self):
         with self.assertRaises(ValueError):

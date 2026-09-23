@@ -367,51 +367,139 @@ def save_fixes(
 # --------------------------------------------------------------------------- #
 # detection
 # --------------------------------------------------------------------------- #
-def detect_acquisition_slips(
-    stage_positions, *, tol_um: float = 2.0
-) -> list[AcquisitionSlip]:
-    """Suggest slips from recorded stage XY: two consecutive raw slots at one place.
-
-    Args:
-        stage_positions: a :class:`~acia.segm.open.SequenceFile` (its
-            :meth:`~acia.segm.open.SequenceFile.stage_positions` is read), or a raw
-            ``(T, P, 2)`` array of stage XY in µm (NaN where unknown).
-        tol_um: two images closer than this are "the same position".
-
-    Returns:
-        The suggested slips in raw coordinates, sorted. Nothing is applied.
-
-    Raises:
-        ValueError: if there is no stage metadata, only one position, so many
-            slots look repeated that the values can't be stage µm, or the
-            positions are still indistinguishable once the slips are taken out (a
-            double shot would then be indistinguishable from the normal sequence).
-    """
+def _stage_array(stage_positions) -> np.ndarray:
+    """The ``(T, P, 2)`` stage array of a ``SequenceFile`` or a raw array."""
     if hasattr(stage_positions, "stage_positions"):
-        xy = stage_positions.stage_positions()
+        xy = np.asarray(stage_positions.stage_positions(), dtype=float)
     else:
         xy = np.asarray(stage_positions, dtype=float)
     if xy.ndim != 3 or xy.shape[-1] != 2:
         raise ValueError(f"expected a (T, P, 2) stage array, got shape {xy.shape}")
-    num_t, num_p, _ = xy.shape
-    if num_p < 2:
+    if xy.shape[1] < 2:
         raise ValueError(
-            "slip detection needs at least two positions: with one position every "
+            "this needs at least two positions: with one position every "
             "consecutive image is at the same place by design"
         )
     if np.all(np.isnan(xy)):
         raise ValueError(
             "the file carries no per-image stage XY metadata; declare slips by hand"
         )
+    return xy
 
+
+def _repeated_slots(xy: np.ndarray, tol_um: float) -> tuple[np.ndarray, np.ndarray]:
+    """Raw flat indices whose image sits within ``tol_um`` of the one before it."""
+    num_t, num_p, _ = xy.shape
     flat = xy.reshape(num_t * num_p, 2)
     step = np.linalg.norm(flat[1:] - flat[:-1], axis=-1)  # NaN where unknown
-    ks = np.nonzero(step < tol_um)[0] + 1
-    slips = [AcquisitionSlip(*map(int, divmod(int(k), num_p))) for k in ks]
+    return np.nonzero(step < tol_um)[0] + 1, step
+
+
+def detect_duplicate_positions(
+    stage_positions, *, tol_um: float = 2.0, min_fraction: float = 0.8
+) -> list[tuple[int, int]]:
+    """Positions that hold the same field as the position before them, every cycle.
+
+    A point list that contains the same spot twice makes the microscope image it
+    twice in *every* cycle. That is a duplicated entry in the acquisition, not an
+    :class:`AcquisitionSlip`: nothing is shifted and no image is lost, the two
+    position indices simply show the same field. Curate one of them and ignore
+    the other.
+
+    Args:
+        stage_positions: a :class:`~acia.segm.open.SequenceFile` or a raw
+            ``(T, P, 2)`` array of stage XY in µm.
+        tol_um: two images closer than this are "the same position".
+        min_fraction: how much of the timelapse a repeat must cover to count as
+            systematic rather than a one-off double shot.
+
+    Returns:
+        ``(position, same_as)`` pairs, sorted; ``same_as`` is the position imaged
+        just before it (``position - 1``, or the last position of the previous
+        timepoint for position 0).
+    """
+    xy = _stage_array(stage_positions)
+    num_t, num_p, _ = xy.shape
+    ks, step = _repeated_slots(xy, tol_um)
+
+    repeats = np.zeros(num_p, dtype=int)
+    for k in ks:
+        repeats[int(k) % num_p] += 1
+    # how many of that position's arrivals could be judged at all (finite step)
+    judged = np.zeros(num_p, dtype=int)
+    for k in range(1, num_t * num_p):
+        if np.isfinite(step[k - 1]):
+            judged[k % num_p] += 1
+
+    return [
+        (p, (p - 1) % num_p)
+        for p in range(num_p)
+        if judged[p] and repeats[p] >= min_fraction * judged[p]
+    ]
+
+
+def detect_acquisition_slips(
+    stage_positions, *, tol_um: float = 2.0, min_fraction: float = 0.8
+) -> list[AcquisitionSlip]:
+    """Suggest slips from recorded stage XY: two consecutive raw slots at one place.
+
+    A repeat that recurs at the same position in (nearly) every cycle is *not* a
+    slip but a duplicated entry in the acquisition's point list — see
+    :func:`detect_duplicate_positions`. Those are excluded here and reported as a
+    warning, so what is returned is the sporadic double shots that really do shift
+    the rest of the file.
+
+    Args:
+        stage_positions: a :class:`~acia.segm.open.SequenceFile` (its
+            :meth:`~acia.segm.open.SequenceFile.stage_positions` is read), or a raw
+            ``(T, P, 2)`` array of stage XY in µm (NaN where unknown).
+        tol_um: two images closer than this are "the same position".
+        min_fraction: passed to :func:`detect_duplicate_positions`.
+
+    Returns:
+        The suggested slips in raw coordinates, sorted. Nothing is applied.
+
+    Raises:
+        ValueError: if there is no stage metadata, there is only one position, or
+            so many slots look repeated that the values can't be stage µm.
+    """
+    import warnings
+
+    xy = _stage_array(stage_positions)
+    num_t, num_p, _ = xy.shape
+    ks, step = _repeated_slots(xy, tol_um)
+
+    duplicates = detect_duplicate_positions(
+        xy, tol_um=tol_um, min_fraction=min_fraction
+    )
+    typical = float(np.nanmedian(step)) if np.any(np.isfinite(step)) else float("nan")
+    if len(duplicates) >= max(2, num_p // 2):
+        # a point list does not repeat half its entries: the values are not in the
+        # unit we compare against, or the tolerance swallows the whole layout
+        raise ValueError(
+            f"{len(duplicates)} of {num_p} positions look like repeats of the one "
+            f"before them at tol_um={tol_um}, with a typical step of "
+            f"{typical:.3f} between consecutive images; that reads like a unit "
+            "mismatch (stage values in mm rather than µm) or too large a tolerance"
+        )
+    if duplicates:
+        listed = ", ".join(f"position {p} repeats position {q}" for p, q in duplicates)
+        warnings.warn(
+            f"{listed} in (nearly) every timepoint: the acquisition's point list "
+            "holds that spot twice, so those positions show the same field. That is "
+            "not a slip -- nothing is shifted -- so they are excluded here; curate "
+            "one of each pair.",
+            stacklevel=2,
+        )
+    systematic = {p for p, _ in duplicates}
+    slips = [
+        AcquisitionSlip(*map(int, divmod(int(k), num_p)))
+        for k in ks
+        if int(k) % num_p not in systematic
+    ]
 
     # A handful of repeats is a double shot; a large fraction of them means the
     # values aren't stage µm (some formats report mm) or tol_um is far too large.
-    typical = float(np.nanmedian(step)) if np.any(np.isfinite(step)) else float("nan")
     if len(slips) > max(3, 0.05 * num_t * num_p):
         raise ValueError(
             f"{len(slips)} of {num_t * num_p} slots look like repeats at "
@@ -419,27 +507,6 @@ def detect_acquisition_slips(
             "consecutive images; that reads like a unit mismatch (stage values in "
             "mm rather than µm) or too large a tolerance, not a double shot"
         )
-
-    # Once the repeats are taken out, each position must sit at its own place --
-    # otherwise a repeat cannot be told apart from moving on to the next position.
-    # Checked here, after the fact, because a slip in the very first timepoint
-    # would make the raw layout of that timepoint look ambiguous by itself.
-    slot_map = SlotMap(num_t, num_p, slips)
-    centers = np.full((num_p, 2), np.nan)
-    for p in range(num_p):
-        seen = [slot_map.raw_slot(t, p) for t in range(slot_map.size_t(p))]
-        if seen:
-            centers[p] = np.nanmedian(np.array([xy[s] for s in seen if s]), axis=0)
-    pts = centers[~np.isnan(centers).any(axis=1)]
-    if len(pts) >= 2:
-        d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
-        d[np.diag_indices_from(d)] = np.inf
-        if d.min() < tol_um:
-            raise ValueError(
-                f"two positions still lie {d.min():.2f} µm apart (< tol_um="
-                f"{tol_um}) once the {len(slips)} detected repeat(s) are removed; "
-                "slips can't be told apart from the next position in this layout"
-            )
     return slips
 
 
