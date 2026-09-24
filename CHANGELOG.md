@@ -16,6 +16,17 @@ as the work lands.
 
 ### Added
 
+**Exporting curated ROIs** (`acia.roi_export.export_rois`) — the writing half of the
+curation workflow, moved out of `SequencePreprocessing.ipynb` and now tested:
+- One TIFF per selection, named from a template (`position`, `roi_nb`, `label`, `id`), with
+  the positions that carry no ROI skipped.
+- Optional per-position drift correction first (`registration_method_name`), with the ROI
+  interiors kept out of the registration objective and each ROI's anchor frame carried onto
+  the corrected view. Anchors outside the exported range are rejected before any
+  registration work starts.
+- `max_frames` truncates each position before registering and cropping, so a quick test run
+  never mixes registered and unregistered frames; `progress=False` silences the bars.
+
 **Correcting acquisition slips** (`acia.segm.acquisition_fixes`) — when the microscope
 images one position twice in a row, every later slot of a multi-position ND2/CZI holds the
 image of the slot before it. acia now undoes that in memory, without writing to the raw file:

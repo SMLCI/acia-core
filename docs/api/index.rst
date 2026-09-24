@@ -121,6 +121,7 @@ Drift correction, ROI selection and the provenance helpers.
    acia.registration
    acia.registration_persistence
    acia.selection
+   acia.roi_export
    acia.crop_capture
    acia.attribute
 
