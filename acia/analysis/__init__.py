@@ -981,6 +981,29 @@ def _record_failure(failed_ids: list, job: dict) -> None:
     failed_ids.append(job["image_id"])
 
 
+def _has_stale_stage(execution_folder: Path) -> bool:
+    """Whether a stage recorded under ``execution_folder`` has changed inputs.
+
+    Looks at every ``stage_manifest.json`` in the folder (the notebooks write
+    theirs to an ``output/`` subfolder) and reports ``True`` as soon as one of
+    them lists an input -- including the source movie -- whose size or mtime
+    differs from what was recorded. A folder without a manifest is not stale.
+    """
+    from acia.analysis.stage import MANIFEST_NAME, check_stale
+
+    for manifest in Path(execution_folder).glob(f"**/{MANIFEST_NAME}"):
+        stale = check_stale(manifest.parent)
+        if stale:
+            logger.warning(
+                "%s: re-running stages, %s's input %r changed since it ran.",
+                execution_folder,
+                stale[0]["stage"],
+                stale[0]["path"],
+            )
+            return True
+    return False
+
+
 def _scale_execute_one(
     job,
     additional_parameters,
@@ -1026,12 +1049,21 @@ def _scale_execute_one(
     else:
         progress_queue = None
 
+    # `exist_skip` keys on the notebook file existing. That is not enough: a
+    # re-exported source (same name, other ROI / registration / frames) would
+    # leave the old results in place and the next stage would draw them over
+    # the new images. So a recorded input that changed since it ran -- or a
+    # stage before it in this chain that re-ran -- forces a re-run.
+    stale = exist_skip and _has_stale_stage(output_parent)
+    rerun_rest = False
+
     executions = []
     for src, dst in job["scripts"]:
         dst = Path(dst)
-        # the notebook already exists and we should skip it
-        if dst.exists() and exist_skip:
+        # the notebook already exists, its inputs are unchanged -> skip it
+        if dst.exists() and exist_skip and not (stale or rerun_rest):
             continue
+        rerun_rest = True
 
         if on_stage is not None:
             on_stage(dst.name)

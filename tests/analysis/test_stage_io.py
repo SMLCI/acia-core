@@ -608,3 +608,22 @@ def test_openlineage_export_is_not_needed_to_import_acia():
     import importlib
 
     assert importlib.import_module("acia.analysis") is not None
+
+
+def test_a_reexported_source_makes_the_execution_folder_stale(tmp_path):
+    # scale(exist_skip=True) must not keep a segmentation whose movie was
+    # re-exported under the same pos/roi name (other ROI, registration, frames)
+    from acia.analysis import _has_stale_stage
+
+    source = _source(tmp_path)
+    ctx = StageContext.for_image(source, tmp_path / "run" / "output")
+    ctx.path("segmentation.npz").write_text("x")
+    ctx.record("Segment")
+
+    assert not _has_stale_stage(tmp_path / "run")
+
+    time.sleep(0.01)
+    tifffile.imwrite(source, np.zeros((8, 8), np.uint8))
+
+    assert _has_stale_stage(tmp_path / "run")
+    assert not _has_stale_stage(tmp_path / "empty")

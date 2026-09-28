@@ -402,9 +402,24 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         """
         if self._images is None:
             opts = resolve_storage_options(self.filename, self.storage_options)
-            with fsspec.open(self.filename, mode="rb", **opts) as f:
-                self._images = tifffile.imread(f)
+            with (
+                fsspec.open(self.filename, mode="rb", **opts) as f,
+                tifffile.TiffFile(f) as tif,
+            ):
+                series = tif.series[0]
+                self._images = series.asarray()
+                axes = series.axes
+            # A multi-channel stack written with explicit axes (e.g. the
+            # ``TCYX`` of an ROI export) decodes channel-first per frame, but
+            # LocalImage expects trailing channels -- (C, H, W) would be read
+            # as an image of C rows with W channels. Remember to move it.
+            self._channels_first = self._images.ndim == 4 and axes.endswith("CYX")
         return self._images
+
+    def _to_channels_last(self, image: np.ndarray) -> np.ndarray:
+        if getattr(self, "_channels_first", False) and image.ndim == 3:
+            return np.moveaxis(image, 0, -1)
+        return image
 
     def close(self) -> None:
         """Release the cached decoded stack (the source stays usable)."""
@@ -437,7 +452,7 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
                             image.take(channel, axis=self.channel_index)
                         )
 
-            image = prepare_image(image, self.normalize_image)
+            image = prepare_image(self._to_channels_last(image), self.normalize_image)
 
             yield LocalImage(image)
 
@@ -445,7 +460,9 @@ class LocalSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         images = self._read_images()  # decoded once, then cached
         assert frame < len(images)
 
-        return LocalImage(prepare_image(images[frame], self.normalize_image))
+        return LocalImage(
+            prepare_image(self._to_channels_last(images[frame]), self.normalize_image)
+        )
 
     @property
     def size_t(self):

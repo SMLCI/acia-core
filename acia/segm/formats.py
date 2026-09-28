@@ -201,6 +201,72 @@ def save_segmentation(path: str | Path, overlay: Overlay) -> Path:
     return path
 
 
+def _check_fits_source(
+    overlay: Overlay,
+    source: ImageSequenceSource,
+    stored_num_frames: int | None,
+    path: Path,
+) -> None:
+    """Refuse a segmentation that cannot belong to ``source``.
+
+    A segmentation artifact is matched to its movie only by folder and file
+    name, so a stale one -- e.g. from an earlier export of the same
+    ``posNNN_roiNNN`` with other ROIs, registration or ``max_frames`` -- would
+    otherwise load silently and be drawn over images it was not computed on.
+    What can be checked cheaply is checked: detections past the last frame or
+    outside the image are an error; a stored extent shorter than the movie is
+    only a warning, since trailing frames may legitimately hold no cells.
+    """
+    hint = (
+        "Was it computed on a different image sequence (e.g. an earlier ROI "
+        "export)? Re-run the segmentation for this sequence."
+    )
+    frames = [int(c.frame) for c in overlay.contours]
+    if stored_num_frames is not None and stored_num_frames > source.size_t:
+        raise ValueError(
+            f"{path} spans {stored_num_frames} frames but the image sequence has "
+            f"only {source.size_t}. {hint}"
+        )
+    if frames and max(frames) >= source.size_t:
+        raise ValueError(
+            f"{path} has detections on frame {max(frames)} but the image "
+            f"sequence has only {source.size_t} frames. {hint}"
+        )
+
+    height: int | None
+    width: int | None
+    try:
+        height, width = source.size_h, source.size_w
+    except (AttributeError, NotImplementedError):
+        height = width = None
+    if height and width and overlay.contours:
+        coords = np.concatenate(
+            [
+                np.asarray(c.coordinates, dtype=np.float64).reshape(-1, 2)
+                for c in overlay.contours
+            ]
+        )
+        # one pixel of slack: polygon outlines may run along the far border
+        if (
+            coords.min() < -1
+            or coords[:, 0].max() > width + 1
+            or coords[:, 1].max() > height + 1
+        ):
+            raise ValueError(
+                f"{path} has detections outside the {width}x{height} px image "
+                f"(x up to {coords[:, 0].max():.0f}, y up to "
+                f"{coords[:, 1].max():.0f}). {hint}"
+            )
+
+    if stored_num_frames is not None and stored_num_frames < source.size_t:
+        warnings.warn(
+            f"{path} spans {stored_num_frames} frames but the image sequence has "
+            f"{source.size_t}. That is fine if the last frames hold no cells, "
+            f"otherwise the segmentation is stale. {hint}",
+            stacklevel=3,
+        )
+
+
 def _parse_segmentation_archive(path: Path) -> tuple[list[Contour], int]:
     """Contours and stored frame extent from an ``.npz`` segmentation archive."""
     with np.load(path, allow_pickle=False) as data:
@@ -277,9 +343,10 @@ def load_segmentation(
     with open(resolved, "rb") as raw_file:
         magic = raw_file.read(2)
 
+    stored_num_frames: int | None = None
     if magic == b"PK":  # zip container -> numpy .npz archive
-        contours, num_frames = _parse_segmentation_archive(resolved)
-        overlay = Overlay(contours, frames=list(range(num_frames)))
+        contours, stored_num_frames = _parse_segmentation_archive(resolved)
+        overlay = Overlay(contours, frames=list(range(stored_num_frames)))
     else:  # simple-segmentation JSON, gzipped (\x1f\x8b) or plain
         opener = gzip.open if magic == b"\x1f\x8b" else open
         with opener(resolved, "rt", encoding="utf-8") as input_file:  # type: ignore[operator]
@@ -287,6 +354,8 @@ def load_segmentation(
 
     if source is None:
         return overlay
+
+    _check_fits_source(overlay, source, stored_num_frames, resolved)
 
     # the source is the authority on both the frame extent and the time model
     overlay = Overlay(overlay.contours, frames=list(range(source.size_t)))

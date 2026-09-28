@@ -596,10 +596,15 @@ def apply_cell_filters(
     # iterate the overlay, not the table, so contour order is preserved
     kept = [cont for cont in overlay.contours if cont.id in kept_ids]
 
-    # preserve the overlay's time model (private attrs, since Overlay exposes
-    # only the resolved `timepoints` property, not `frame_interval`)
+    # preserve the overlay's frame set and time model (private attrs, since
+    # Overlay exposes only the resolved `timepoints` property, not
+    # `frame_interval`). Without `frames`, the result would only know the frames
+    # that still hold a cell: if every cell of the first k frames is filtered
+    # out, iterating it would start at frame k and a renderer pairing it with
+    # the image frames would draw every mask k frames too early.
     return Overlay(
         kept,
+        frames=list(overlay.frames()),
         timepoints=getattr(overlay, "_timepoints", None),
         frame_interval=getattr(overlay, "_frame_interval", None),
     )

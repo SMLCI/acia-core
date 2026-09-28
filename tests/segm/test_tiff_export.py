@@ -170,3 +170,36 @@ class TestSaveTiffStack(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMultichannelReopen(unittest.TestCase):
+    """An exported multi-channel ROI must reopen with trailing channels.
+
+    ``LocalSequenceSource`` used to hand ``(C, H, W)`` frames of a ``TCYX``
+    export to ``LocalImage``, which reads the last axis as channels.
+    """
+
+    def _roundtrip(self, **kwargs):
+        from acia.segm.local import LocalSequenceSource
+
+        stack = np.zeros((4, 30, 40, 2), dtype=np.uint16)
+        stack[:, :10, :, 0] = 1000  # channel 0: top band
+        stack[:, :, :10, 1] = 2000  # channel 1: left band
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "roi.tif"
+            save_tiff_stack(THWCSequenceSource(stack), path, **kwargs)
+            src = LocalSequenceSource(str(path), normalize_image=False)
+            frame = src.get_frame(1).raw
+            iterated = next(iter(src)).raw
+        return stack, frame, iterated
+
+    def test_imagej_export_reopens_hwc(self):
+        stack, frame, iterated = self._roundtrip()
+        self.assertEqual(frame.shape, (30, 40, 2))
+        np.testing.assert_array_equal(frame, stack[1])
+        np.testing.assert_array_equal(iterated, stack[0])
+
+    def test_ome_export_reopens_hwc(self):
+        stack, frame, _ = self._roundtrip(imagej=False, ome=True)
+        self.assertEqual(frame.shape, (30, 40, 2))
+        np.testing.assert_array_equal(frame, stack[1])

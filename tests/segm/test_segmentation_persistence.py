@@ -195,12 +195,24 @@ class TestSegmentationFrameExtent(unittest.TestCase):
 
         self.assertEqual(loaded.numFrames(), 6)
 
-    def test_source_overrides_the_stored_extent(self):
+    def test_stored_extent_longer_than_source_is_refused(self):
+        # a 6-frame segmentation cannot have been computed on a 4-frame movie:
+        # it is stale, so loading it must fail rather than be silently cut
         overlay = Overlay(list(_overlay(frames=(0, 1))), frames=list(range(6)))
 
         with TemporaryDirectory() as tmp:
             path = save_segmentation(Path(tmp) / "segmentation", overlay)
-            loaded = load_segmentation(path, _source(num_frames=4))
+            with self.assertRaisesRegex(ValueError, "spans 6 frames"):
+                load_segmentation(path, _source(num_frames=4))
+
+    def test_source_extends_a_shorter_stored_extent(self):
+        overlay = Overlay(list(_overlay(frames=(0, 1))), frames=list(range(3)))
+
+        with TemporaryDirectory() as tmp:
+            path = save_segmentation(Path(tmp) / "segmentation", overlay)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                loaded = load_segmentation(path, _source(num_frames=4))
 
         self.assertEqual(loaded.numFrames(), 4)
 
@@ -298,3 +310,31 @@ class TestFragmentedDetections(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLoadRefusesForeignSource(unittest.TestCase):
+    """A segmentation is matched to its movie only by file name, so a stale one
+    (earlier ROI export, other max_frames) must not load silently."""
+
+    def test_more_frames_than_source_raises(self):
+        with TemporaryDirectory() as tmp:
+            path = save_segmentation(Path(tmp) / "seg", _overlay((0, 1, 2, 3)))
+            with self.assertRaisesRegex(ValueError, "spans 4 frames"):
+                load_segmentation(path, _source(num_frames=3))
+
+    def test_detections_outside_image_raise(self):
+        far = Overlay(
+            [Contour(_square(40, 40), score=1.0, frame=0, id=1, label="cell")],
+            frames=[0],
+        )
+        with TemporaryDirectory() as tmp:
+            path = save_segmentation(Path(tmp) / "seg", far)
+            with self.assertRaisesRegex(ValueError, "outside the 16x16 px image"):
+                load_segmentation(path, _source(num_frames=1))
+
+    def test_shorter_extent_warns(self):
+        with TemporaryDirectory() as tmp:
+            path = save_segmentation(Path(tmp) / "seg", _overlay((0, 1)))
+            with self.assertWarnsRegex(UserWarning, "spans 2 frames"):
+                overlay = load_segmentation(path, _source(num_frames=4))
+        self.assertEqual(list(overlay.frames()), [0, 1, 2, 3])

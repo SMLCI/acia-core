@@ -124,9 +124,14 @@ def merge_cells_to_colonies(overlay: Overlay, expand=10) -> Overlay:
         # add merged contour to results
         merged_contours += contours
 
-    # return new overlay with merged contours, carrying the input's time model so
-    # the colony overlay stays calibrated on its own
-    return Overlay(merged_contours, timepoints=overlay.timepoints)
+    # return new overlay with merged contours, carrying the input's frame set and
+    # time model so the colony overlay stays frame-aligned (frames without a
+    # colony are kept) and calibrated on its own
+    return Overlay(
+        merged_contours,
+        frames=list(overlay.frames()),
+        timepoints=overlay.timepoints,
+    )
 
 
 def _bbox_from_mask(
