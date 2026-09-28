@@ -269,6 +269,86 @@ def population_id_of(path: str | Path) -> str:
     return path.name if path.is_dir() else path.stem
 
 
+def experiment_of(image_id: str | Path) -> str | None:
+    """The experiment an ROI movie belongs to, if its export folder says so.
+
+    An ROI export folder (see :func:`acia.roi_export.export_rois`) carries a
+    ``roi_export.json`` naming the experiment -- by default the raw
+    ``.nd2``/``.czi`` file's stem. ``None`` when the movie's folder has none, so
+    sources that are not ROI exports gain no ``experiment`` key.
+    """
+    from acia.roi_export import EXPORT_INFO_NAME, experiment_name
+
+    folder = Path(image_id).parent
+    if not (folder / EXPORT_INFO_NAME).is_file():
+        return None
+    return experiment_name(folder)
+
+
+def collect_roi_exports(
+    export_dirs,
+    roi_glob: str = "pos*_roi*",
+) -> list[dict[str, str]]:
+    """One ``scale()`` entry per ROI movie across one or several export folders.
+
+    Args:
+        export_dirs: an export folder, a list of them, or a ``{folder:
+            experiment_name}`` dict / list of ``(folder, experiment_name)``
+            pairs to name an experiment yourself. Unnamed folders are named by
+            :func:`acia.roi_export.experiment_name` (the raw file's stem).
+        roi_glob: which entries of a folder are ROI movies (files or
+            per-timepoint folders), sorted by name.
+
+    Returns:
+        ``[{"image_id": <path>, "experiment": <name>}, ...]`` -- pass it as
+        ``image_ids`` to :func:`acia.analysis.scale` together with
+        ``execution_naming=experiment_execution_naming``, so every ROI runs in
+        ``<experiment>/<pos001_roi001>`` and knows its experiment.
+
+    Raises:
+        ValueError: if two folders resolve to the same experiment name (their
+            ROIs would share output folders) or a folder holds no ROI.
+    """
+    from acia.roi_export import experiment_name
+
+    pairs: list[tuple[Any, Any]]
+    if isinstance(export_dirs, dict):
+        pairs = list(export_dirs.items())
+    elif isinstance(export_dirs, (str, Path)):
+        pairs = [(export_dirs, None)]
+    else:
+        pairs = [
+            (d[0], d[1]) if isinstance(d, (tuple, list)) else (d, None)
+            for d in export_dirs
+        ]
+
+    entries: list[dict[str, str]] = []
+    owner: dict[str, Path] = {}
+    for folder, name in pairs:
+        folder = Path(folder)
+        name = name or experiment_name(folder)
+        if name in owner and owner[name] != folder.resolve():
+            raise ValueError(
+                f"{folder} and {owner[name]} are both experiment {name!r}; give "
+                "one of them its own name ({folder: name})."
+            )
+        owner[name] = folder.resolve()
+        movies = sorted(p for p in folder.glob(roi_glob) if not p.name.startswith("."))
+        if not movies:
+            raise ValueError(f"No ROI matching {roi_glob!r} in {folder}.")
+        entries += [{"image_id": str(m), "experiment": name} for m in movies]
+    return entries
+
+
+def experiment_execution_naming(entry) -> str:
+    """``<experiment>/<population id>`` for a :func:`collect_roi_exports` entry."""
+    if isinstance(entry, dict):
+        experiment = entry.get("experiment")
+        population = population_id_of(entry["image_id"])
+        return f"{experiment}/{population}" if experiment else population
+    return population_id_of(entry)
+
+
 def _parse_keys(population_id: str, key_pattern: str | None) -> dict[str, Any]:
     """Named groups of ``key_pattern`` matched against ``population_id``.
 
@@ -502,6 +582,7 @@ class StageContext:
         create: bool = True,
         track_io: bool = True,
         track_roots: Iterable[str | Path] = (),
+        experiment: str | None = None,
     ) -> StageContext:
         """Resolve the run context for one source.
 
@@ -536,6 +617,10 @@ class StageContext:
                 otherwise limited to the working directory, the output folder and the
                 source, without which a notebook's thousands of ``site-packages``
                 opens would drown the record.
+            experiment: which experiment this population belongs to, added to
+                :attr:`keys` (so every keyed table gets an ``experiment``
+                column). ``None`` reads it from the source's ROI export folder
+                (:func:`experiment_of`) when there is one.
         """
         output_dir = Path(output_folder)
         if create:
@@ -543,12 +628,15 @@ class StageContext:
 
         image_id = _resolve_source(image_id, output_dir)
         population_id = population_id_of(image_id)
+        if not experiment:
+            experiment = experiment_of(image_id)
 
         ctx = cls(
             image_id=str(image_id),
             output_dir=output_dir,
             population_id=population_id,
             keys={
+                **({"experiment": experiment} if experiment else {}),
                 "population_id": population_id,
                 **_parse_keys(population_id, key_pattern),
             },

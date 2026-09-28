@@ -41,6 +41,11 @@ from acia.analysis.stage import MANIFEST_NAME as MANIFEST_NAME
 from acia.analysis.stage import STAGE_SCHEMA as STAGE_SCHEMA
 from acia.analysis.stage import StageContext as StageContext
 from acia.analysis.stage import check_stale as check_stale
+from acia.analysis.stage import collect_roi_exports as collect_roi_exports
+from acia.analysis.stage import (
+    experiment_execution_naming as experiment_execution_naming,
+)
+from acia.analysis.stage import experiment_of as experiment_of
 from acia.analysis.stage import population_id_of as population_id_of
 from acia.analysis.stage import read_manifest as read_manifest
 from acia.analysis.stage import stage_graph as stage_graph

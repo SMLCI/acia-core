@@ -108,7 +108,7 @@ class TestExportWithoutRegistration(_Case):
         )
         self.assertEqual(
             [os.path.basename(p) for p in written],
-            ["pos000_roi001.tiff", "pos000_roi002.tiff", "pos001_roi001.tiff"],
+            ["pos001_roi001.tiff", "pos001_roi002.tiff", "pos002_roi001.tiff"],
         )
         self.assertTrue(all(os.path.exists(p) for p in written))
 
@@ -122,7 +122,7 @@ class TestExportWithoutRegistration(_Case):
         )
         self.assertEqual(
             [os.path.basename(p) for p in written],
-            ["left_p0_r1.tiff", "right_p1_r1.tiff"],
+            ["left_p1_r1.tiff", "right_p2_r1.tiff"],
         )
 
     def test_crop_holds_that_position_s_pixels(self):
@@ -137,7 +137,7 @@ class TestExportWithoutRegistration(_Case):
     def test_position_without_rois_is_skipped(self):
         _, written = self._export([(1, (30.0, 30.0), (8, 8), "c", 0)])
         self.assertEqual(len(written), 1)
-        self.assertIn("pos001", os.path.basename(written[0]))
+        self.assertIn("pos002", os.path.basename(written[0]))
 
     def test_max_frames_truncates_the_stack(self):
         _, written = self._export([(0, (20.0, 20.0), (8, 8), "a", 0)], max_frames=2)
@@ -245,3 +245,49 @@ class TestExportWithRegistration(_Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExportInfo(_Case):
+    """roi_export.json describes the export for batch analysis."""
+
+    def test_written_with_experiment_and_1_based_positions(self):
+        import json
+
+        from acia.roi_export import experiment_name
+
+        manifest = _manifest(
+            self.seqfile,
+            [(0, (20.0, 20.0), (8, 8), "a", 0), (1, (30.0, 30.0), (8, 8), "b", 0)],
+        )
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        info = json.loads((Path(self.out) / "roi_export.json").read_text())
+
+        self.assertEqual(info["schema"], "acia.roi_export/v1")
+        self.assertEqual(
+            [(r["file"], r["position"], r["position_index"]) for r in info["rois"]],
+            [("pos001_roi001.tiff", 1, 0), ("pos002_roi001.tiff", 2, 1)],
+        )
+        self.assertEqual(experiment_name(self.out), info["experiment"])
+
+        # a later export into the same folder keeps the earlier ROIs
+        export_rois(
+            _manifest(self.seqfile, [(1, (30.0, 30.0), (8, 8), "b", 0)]),
+            self.out,
+            source=self.seqfile,
+            progress=False,
+            experiment="custom",
+        )
+        info = json.loads((Path(self.out) / "roi_export.json").read_text())
+        self.assertEqual(len(info["rois"]), 2)
+        self.assertEqual(experiment_name(self.out), "custom")
+
+    def test_default_export_dir_and_fallbacks(self):
+        from acia.roi_export import default_export_dir, experiment_name
+
+        self.assertEqual(
+            default_export_dir("/data/exp/JW_nd73-01.czi"),
+            Path("/data/exp/roi_exports/JW_nd73-01"),
+        )
+        empty = Path(self.out) / "some_folder"
+        empty.mkdir(parents=True)
+        self.assertEqual(experiment_name(empty), "some_folder")

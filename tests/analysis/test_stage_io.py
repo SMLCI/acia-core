@@ -627,3 +627,49 @@ def test_a_reexported_source_makes_the_execution_folder_stale(tmp_path):
 
     assert _has_stale_stage(tmp_path / "run")
     assert not _has_stale_stage(tmp_path / "empty")
+
+
+def _export_folder(root, experiment, rois=("pos001_roi001", "pos001_roi002")):
+    folder = root / experiment
+    folder.mkdir(parents=True)
+    for roi in rois:
+        tifffile.imwrite(folder / f"{roi}.tiff", np.zeros((4, 4), np.uint8))
+    (folder / "roi_export.json").write_text(
+        json.dumps({"schema": "acia.roi_export/v1", "experiment": experiment})
+    )
+    return folder
+
+
+def test_collect_roi_exports_names_runs_by_experiment(tmp_path):
+    from acia.analysis import collect_roi_exports, experiment_execution_naming
+
+    a = _export_folder(tmp_path, "JW_nd73-01")
+    b = _export_folder(tmp_path, "JW_nd73-02", rois=("pos003_roi001",))
+
+    entries = collect_roi_exports([a, (b, "second")])
+    assert [experiment_execution_naming(e) for e in entries] == [
+        "JW_nd73-01/pos001_roi001",
+        "JW_nd73-01/pos001_roi002",
+        "second/pos003_roi001",
+    ]
+    assert collect_roi_exports(a)[0]["experiment"] == "JW_nd73-01"
+
+    with pytest.raises(ValueError, match="both experiment"):
+        collect_roi_exports({a: "same", b: "same"})
+    with pytest.raises(ValueError, match="No ROI"):
+        collect_roi_exports(tmp_path / "JW_nd73-01", roi_glob="nothing*")
+
+
+def test_context_keys_carry_the_experiment(tmp_path):
+    folder = _export_folder(tmp_path, "JW_nd73-01")
+    ctx = StageContext.for_image(folder / "pos001_roi002.tiff", tmp_path / "out")
+    assert ctx.keys["experiment"] == "JW_nd73-01"
+    assert ctx.keys["position"] == 1 and ctx.keys["roi"] == 2
+
+    named = StageContext.for_image(
+        folder / "pos001_roi002.tiff", tmp_path / "out2", experiment="custom"
+    )
+    assert named.keys["experiment"] == "custom"
+
+    plain = StageContext.for_image(_source(tmp_path), tmp_path / "out3")
+    assert "experiment" not in plain.keys

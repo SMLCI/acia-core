@@ -28,11 +28,24 @@ registration is in play: a registered view puts every frame into the reference
 frame's coordinate system, so a box drawn on frame 148 is carried across with
 :func:`acia.registration.apply_correction_to_spec` -- otherwise the crop lands
 where frame 148 had drifted to, off by the whole accumulated drift.
+
+Positions are **1-based** wherever a person reads them -- file names
+(``pos001_roi001.tiff`` is the first position), log lines and
+``roi_export.json`` -- to match how Nikon NIS-Elements and Zeiss ZEN number
+them. The manifest (``selection.json``) keeps the 0-based position index.
+
+Next to the TIFFs, :func:`export_rois` writes ``roi_export.json``: where the
+export came from (the ``.nd2``/``.czi`` file, which names the *experiment*),
+how it was made, and which file holds which ROI. Batch analysis reads it to name
+its output folders after the experiment (see :func:`experiment_name`).
 """
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 
 from tqdm.auto import tqdm
 
@@ -46,6 +59,46 @@ _CONFIDENCE_GATE = {
 }
 
 DEFAULT_NAMING_TEMPLATE = "pos{position:03d}_roi{roi_nb:03d}.tiff"
+
+#: the export description written next to the TIFFs
+EXPORT_INFO_NAME = "roi_export.json"
+EXPORT_INFO_SCHEMA = "acia.roi_export/v1"
+
+#: default folder (next to the raw file) that exports go into
+DEFAULT_EXPORT_FOLDER = "roi_exports"
+
+
+def default_export_dir(source_path: str | os.PathLike) -> Path:
+    """``<folder of the raw file>/roi_exports/<raw file stem>``.
+
+    Keeps the exported ROIs next to the experiment they come from, one subfolder
+    per raw file, so several acquisitions in one folder never collide.
+    """
+    source = Path(source_path)
+    return source.parent / DEFAULT_EXPORT_FOLDER / source.stem
+
+
+def experiment_name(export_dir: str | os.PathLike) -> str:
+    """The experiment an export folder belongs to.
+
+    The ``experiment`` recorded in its ``roi_export.json``, else the raw file's
+    stem from ``selection.json``, else the folder's own name.
+    """
+    folder = Path(export_dir)
+    for name, pick in (
+        (EXPORT_INFO_NAME, lambda d: d.get("experiment")),
+        (
+            "selection.json",
+            lambda d: Path((d.get("source") or {}).get("path") or "").stem,
+        ),
+    ):
+        try:
+            value = pick(json.loads((folder / name).read_text()))
+        except (OSError, ValueError, AttributeError):
+            continue
+        if value:
+            return str(value)
+    return folder.name
 
 
 def export_rois(
@@ -65,6 +118,7 @@ def export_rois(
     ome: bool = True,
     compression: str | int | None = "zlib",
     progress: bool = True,
+    experiment: str | None = None,
 ) -> list[str]:
     """Crop every selection to its own TIFF, optionally registering each position.
 
@@ -72,9 +126,11 @@ def export_rois(
         manifest: the :class:`~acia.selection.SelectionManifest` to export.
         output_dir: where the TIFFs (and, when registering,
             ``registration_transforms.json``) are written; created if missing.
-        naming_template: filename pattern, formatted with ``position``,
-            ``roi_nb`` (1-based within the position, in manifest order),
-            ``label`` and ``id``.
+        naming_template: filename pattern, formatted with ``position``
+            (**1-based**, as the microscope software numbers positions),
+            ``position_index`` (0-based, as stored in the manifest), ``roi_nb``
+            (1-based within the position, in manifest order), ``label`` and
+            ``id``.
         registration_method_name: an :mod:`acia.registration` method name to
             drift-correct each position first, or ``None`` to crop as-is.
         source: reuse an already-open :class:`~acia.segm.open.SequenceFile` (e.g.
@@ -95,6 +151,9 @@ def export_rois(
         ome: write OME-TIFF rather than an ImageJ hyperstack.
         compression: passed to :func:`~acia.segm.tiff_export.save_tiff_stack`.
         progress: show progress bars and per-position reports.
+        experiment: name recorded in ``roi_export.json``, used by batch
+            analysis to name this export's output folder; defaults to the raw
+            file's stem.
 
     Returns:
         The written paths, in export order.
@@ -144,6 +203,7 @@ def export_rois(
 
     os.makedirs(output_dir, exist_ok=True)
     written: list[str] = []
+    exported: list[dict] = []
     try:
         for position in tqdm(
             positions, desc="positions", unit="pos", disable=not progress
@@ -183,7 +243,7 @@ def export_rois(
             frame_shape = (pos_source.size_h, pos_source.size_w)
             roi_bar = tqdm(
                 sels,
-                desc=f"ROIs (pos {position})",
+                desc=f"ROIs (pos {position + 1})",
                 unit="roi",
                 leave=False,
                 disable=not progress,
@@ -193,9 +253,13 @@ def export_rois(
                 if record is not None:
                     spec, note = _spec_for_registered(sel, record, frame_shape)
                     if note:
-                        say(f"  pos {position} roi {roi_nb}: {note}")
+                        say(f"  pos {position + 1} roi {roi_nb}: {note}")
                 filename = naming_template.format(
-                    position=position, roi_nb=roi_nb, label=sel.label, id=sel.id
+                    position=position + 1,
+                    position_index=position,
+                    roi_nb=roi_nb,
+                    label=sel.label,
+                    id=sel.id,
                 )
                 path = save_tiff_stack(
                     pos_source.crop_rotated(spec),
@@ -205,14 +269,81 @@ def export_rois(
                     channel_names=manifest.source.get("channels"),
                 )
                 written.append(path)
+                exported.append(
+                    {
+                        "file": os.path.basename(path),
+                        "position": position + 1,
+                        "position_index": position,
+                        "roi_nb": roi_nb,
+                        "label": sel.label,
+                        "id": sel.id,
+                        "anchor_frame": getattr(sel, "anchor_frame", 0),
+                    }
+                )
                 say(f"wrote {path}")
     finally:
         if reg_bar is not None:
             reg_bar.close()
 
+    _write_export_info(
+        output_dir,
+        manifest,
+        exported,
+        experiment=experiment,
+        naming_template=naming_template,
+        registration_method_name=registration_method_name,
+        max_frames=max_frames,
+    )
+
     note = f" (registered via {registration_method_name})" if reg_dash else ""
     say(f"{len(written)} TIFF(s) written to {output_dir!r}{note}")
     return written
+
+
+def _write_export_info(
+    output_dir,
+    manifest,
+    exported,
+    *,
+    experiment,
+    naming_template,
+    registration_method_name,
+    max_frames,
+) -> Path:
+    """Write ``roi_export.json``, merging with the ROIs of earlier exports.
+
+    Exporting in several runs into one folder (e.g. a position at a time) keeps
+    every file's entry; a file written again replaces its old entry.
+    """
+    path = Path(output_dir) / EXPORT_INFO_NAME
+    source = dict(manifest.source)
+    source_path = str(source.get("path", ""))
+    try:
+        previous = json.loads(path.read_text()).get("rois", [])
+    except (OSError, ValueError):
+        previous = []
+    files = {e["file"] for e in exported}
+    rois = [e for e in previous if e.get("file") not in files] + exported
+
+    info = {
+        "schema": EXPORT_INFO_SCHEMA,
+        "experiment": experiment or Path(source_path).stem or Path(output_dir).name,
+        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": {
+            "path": source_path,
+            "name": Path(source_path).name,
+            "format": source.get("format"),
+            "pixel_size_um": source.get("pixel_size_um"),
+            "frame_interval_s": source.get("frame_interval_s"),
+            "channels": source.get("channels"),
+        },
+        "naming_template": naming_template,
+        "registration": registration_method_name,
+        "max_frames": max_frames,
+        "rois": sorted(rois, key=lambda e: (e.get("position", 0), e.get("roi_nb", 0))),
+    }
+    path.write_text(json.dumps(info, indent=2, default=str))
+    return path
 
 
 def _make_registration(
@@ -245,7 +376,7 @@ def _make_registration(
             if shown_position[0] != msg["position"]:
                 bar.reset(total=msg["num_frames"])
                 bar.set_description(
-                    f"registering pos {msg['position']} "
+                    f"registering pos {msg['position'] + 1} "
                     f"({msg['position'] + 1}/{msg['num_positions']})"
                 )
                 shown_position[0] = msg["position"]
@@ -275,7 +406,7 @@ def _register_position(
         anchors = sorted({getattr(s, "anchor_frame", 0) for s in sels})
         if any(anchors):
             say(
-                f"pos {position}: exclusion rectangles use as-drawn coordinates "
+                f"pos {position + 1}: exclusion rectangles use as-drawn coordinates "
                 f"(anchor frames {anchors}); they are approximate by the drift at "
                 "those frames."
             )
@@ -335,7 +466,7 @@ def _check_anchor_frames(by_position, positions, size_t_of) -> None:
             anchor = getattr(sel, "anchor_frame", 0)
             if anchor >= size_t:
                 bad.append(
-                    f"  pos {position} {sel.label!r}: drawn on frame {anchor}, but "
+                    f"  pos {position + 1} {sel.label!r}: drawn on frame {anchor}, but "
                     f"only frames 0..{size_t - 1} will be registered"
                 )
     if bad:
@@ -413,4 +544,4 @@ def _report_registration(position, record, threshold=None, say=tqdm.write) -> No
         parts.append(f"{len(failed)} FAILED: {shown}{more}")
     if reanchors:
         parts.append(f"re-anchored at {reanchors}")
-    say(f"pos {position}: " + "; ".join(parts))
+    say(f"pos {position + 1}: " + "; ".join(parts))
