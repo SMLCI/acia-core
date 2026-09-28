@@ -1133,7 +1133,10 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
 .acia-sd .sd-frbar{display:flex;align-items:center;gap:8px;padding:7px 14px;flex:none;
   border-top:1px solid var(--border);background:var(--panel-2);
   font-family:var(--font-mono);font-size:11px;color:var(--text-dim);}
-.acia-sd .sd-frbar input[type=range]{vertical-align:middle;}
+.acia-sd .sd-frbar input[type=range]{flex:1;min-width:120px;vertical-align:middle;}
+.acia-sd .sd-frbar .sd-frbtn{padding:2px 7px;font-size:12px;line-height:1.2;}
+.acia-sd .sd-frbar .sd-frnum{width:64px;font-family:var(--font-mono);font-size:11px;}
+.acia-sd .sd-frbar .sd-frlbl,.acia-sd .sd-frbar .sd-frhint{flex:none;white-space:nowrap;}
 .acia-sd .sd-tools{display:flex;gap:8px;align-items:center;padding:9px 12px;border-top:1px solid var(--border);
   background:var(--panel-2);flex-wrap:wrap;}
 .acia-sd button{border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:7px;
@@ -1181,6 +1184,10 @@ function render({ model, el }) {
   // The frame the editor opens on -- the middle one by default, since frame 0
   // of a growing culture is usually empty (see SequenceDashboard.preview_frame).
   const FRAME0 = Math.max(0, Math.min(NT - 1, +model.get("preview_frame") || 0));
+  // Positions are shown 1-based, as Nikon NIS-Elements and Zeiss ZEN number
+  // them (and as the exported pos001_roi001 files are named); internally and in
+  // selection.json a position stays its 0-based index.
+  const posLabel = (p) => "pos " + String(p + 1).padStart(3, "0");
   const PX = md.pixel_size_um || null;
   const COLORS = ["--roi-1","--roi-2","--roi-3","--roi-4","--roi-5"];
   const cvar = (v) => getComputedStyle(root).getPropertyValue(v).trim();
@@ -1200,7 +1207,7 @@ function render({ model, el }) {
         "<span class='sd-galn'>" + NPOS + "</span></div><div class='sd-gal'></div></div>" +
       "<div class='sd-rz' data-side='l'></div>" +
       "<div class='sd-pane sd-editor'><div class='sd-head'>" +
-        "<span class='sd-epos'>pos 000</span>" +
+        "<span class='sd-epos'>" + posLabel(0) + "</span>" +
         "<span style='display:flex;gap:10px;align-items:center'>" +
         "<span class='sd-view'>size <input type='range' class='sd-vs' min='300' max='2400' value='" +
           model.get("view_size") + "'></span>" +
@@ -1212,8 +1219,14 @@ function render({ model, el }) {
         "<div class='sd-spec'>no ROI selected</div></div>" +
         "<div class='sd-card sd-crop-card' hidden><h3>Crop Preview</h3>" +
         "<canvas class='sd-crop'></canvas></div></div></div>" +
-        "<div class='sd-frbar'>frame <input type='range' class='sd-frame' min='0' max='" + (NT - 1) + "' value='" + FRAME0 + "'>" +
-        " <span class='sd-frlbl'>" + FRAME0 + " / " + NT + "</span>" +
+        "<div class='sd-frbar'>frame " +
+        "<button class='sd-frbtn' data-step='first' title='First frame'>⏮</button>" +
+        "<button class='sd-frbtn' data-step='-1' title='Previous frame (←, Shift+← = 10)'>◀</button>" +
+        "<input type='range' class='sd-frame' min='0' max='" + (NT - 1) + "' value='" + FRAME0 + "'>" +
+        "<button class='sd-frbtn' data-step='1' title='Next frame (→, Shift+→ = 10)'>▶</button>" +
+        "<button class='sd-frbtn' data-step='last' title='Last frame'>⏭</button>" +
+        "<input type='number' class='sd-frnum' min='0' max='" + (NT - 1) + "' value='" + FRAME0 + "' title='Type a frame number and press Enter'>" +
+        " <span class='sd-frlbl'>/ " + (NT - 1) + "</span>" +
         " <span class='sd-frhint' title='An ROI you draw or edit here is anchored to this frame. " +
         "The anchor is saved in selection.json and used to place the crop correctly after drift " +
         "correction. A dashed, greyed box was annotated on a different frame -- move it to re-anchor " +
@@ -1296,7 +1309,7 @@ function render({ model, el }) {
       }
       if (msg.kind === "frame" && msg.pos === currentPos) {
         clearTimeout(frameTimer);
-        showStatus("Error loading pos " + String(msg.pos).padStart(3, "0") + ": " + (msg.message || "failed to load"), true);
+        showStatus("Error loading " + posLabel(msg.pos) + ": " + (msg.message || "failed to load"), true);
         frameImgPos = -1; renderSpec();
         return;
       }
@@ -1363,7 +1376,7 @@ function render({ model, el }) {
       const d = document.createElement("div");
       d.className = "sd-thumb" + (i === currentPos ? " sel" : "");
       d.dataset.ix = i;
-      d.innerHTML = "<span class='ix'>pos " + String(i).padStart(3, "0") + "</span>" +
+      d.innerHTML = "<span class='ix'>" + posLabel(i) + "</span>" +
         (roisAt(i).length ? "<span class='dot'></span>" : "");
       d.onclick = () => selectPos(i);
       gal.appendChild(d); io.observe(d);
@@ -1378,13 +1391,20 @@ function render({ model, el }) {
   function setFrame(t) {
     frame = Math.max(0, Math.min(NT - 1, +t || 0));
     $(".sd-frame").value = frame;
-    $(".sd-frlbl").textContent = frame + " / " + NT;
+    $(".sd-frnum").value = frame;
+  }
+  // step the shown frame: a number of frames, or "first"/"last"
+  function goFrame(step) {
+    const t = step === "first" ? 0 : step === "last" ? NT - 1 : frame + (+step || 0);
+    const next = Math.max(0, Math.min(NT - 1, t));
+    if (next === frame) { setFrame(next); return; }
+    setFrame(next); requestFrame(); renderEditor();
   }
   let frameTimer = null;
   function requestFrame() {
     clearTimeout(frameTimer);
     hideStatus();
-    frameTimer = setTimeout(() => showStatus("Loading pos " + String(currentPos).padStart(3, "0") + "…", false), 150);
+    frameTimer = setTimeout(() => showStatus("Loading " + posLabel(currentPos) + "…", false), 150);
     model.send({ type: "frame", pos: currentPos, t: frame });
   }
   function renderEditor() {
@@ -1409,7 +1429,7 @@ function render({ model, el }) {
         "pointerdown", (ev) => startDrag(ev, sel, "resize", eln, h.dataset.c)));
       wrap.appendChild(eln);
     });
-    $(".sd-epos").textContent = "pos " + String(currentPos).padStart(3, "0");
+    $(".sd-epos").textContent = posLabel(currentPos);
     renderSpec(); renderLabel();
   }
   function renderSpec() {
@@ -1493,7 +1513,7 @@ function render({ model, el }) {
       const collapsed = collapsedPos.has(p);
       const hd = document.createElement("div");
       hd.className = "sd-poshd";
-      hd.textContent = (collapsed ? "▸" : "▾") + " pos " + String(p).padStart(3, "0") +
+      hd.textContent = (collapsed ? "▸" : "▾") + " " + posLabel(p) +
         " (" + byPos[p].length + ")";
       hd.onclick = () => {
         if (collapsedPos.has(p)) collapsedPos.delete(p); else collapsedPos.add(p);
@@ -1696,6 +1716,13 @@ function render({ model, el }) {
   document.addEventListener("fullscreenchange", onFsChange);
   $(".sd-frame").addEventListener("input", (e) => {
     setFrame(e.target.value); requestFrame(); renderEditor(); });
+  root.querySelectorAll(".sd-frbtn").forEach((b) => { b.onclick = () => goFrame(b.dataset.step); });
+  // jump on Enter or when the field loses focus (change); an empty or
+  // out-of-range entry is clamped by setFrame
+  $(".sd-frnum").addEventListener("change", (e) => {
+    const t = Math.round(+e.target.value);
+    goFrame(Number.isFinite(t) ? t - frame : 0); });
+  $(".sd-frnum").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
   $(".sd-draw").onclick = () => { if (picking) exitPick(); addRoi(); };
   $(".sd-point").onclick = () => { picking ? exitPick() : enterPick(); if (!picking) renderEditor(); };
   $(".sd-del").onclick = () => { if (activeId) removeSel(activeId); };
@@ -1727,6 +1754,12 @@ function render({ model, el }) {
     if (!hovering || picking) return;
     const t = ev.target;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    // frame stepping works without an active ROI
+    if ((ev.key === "ArrowLeft" || ev.key === "ArrowRight") && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+      ev.preventDefault();
+      goFrame((ev.key === "ArrowLeft" ? -1 : 1) * (ev.shiftKey ? 10 : 1));
+      return;
+    }
     if (!activeId) return;
     if (ev.key === "Delete" || ev.key === "Backspace") {
       ev.preventDefault(); removeSel(activeId);
