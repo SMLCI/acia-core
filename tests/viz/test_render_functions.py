@@ -183,13 +183,13 @@ class TestRenderSegmentation(unittest.TestCase):
             frame = result.get_frame(frame_idx)
             np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_none_overlay_raises_error(self):
-        """Render segmentation with None overlay raises AttributeError"""
+    def test_rendering_with_none_overlay_renders_plain_frames(self):
+        """Render segmentation with a None overlay renders the plain images"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
 
-        # None overlay is not supported - requires valid Overlay object
-        with self.assertRaises(AttributeError):
-            render_segmentation(image_source, None)
+        result = render_segmentation(image_source, None)
+
+        self.assertEqual(len(result), 3)
 
     def test_rendering_with_custom_cell_color(self):
         """Render segmentation with custom cell color"""
@@ -228,14 +228,15 @@ class TestRenderSegmentation(unittest.TestCase):
         frame = result.get_frame(0)
         np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_empty_overlay_raises_error(self):
-        """Render segmentation with empty overlay raises ValueError"""
+    def test_rendering_with_empty_overlay_renders_every_frame(self):
+        """Render segmentation with an empty overlay (e.g. every cell filtered out)
+        renders one frame per image, with nothing drawn on it"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
         overlay = Overlay([])
 
-        # Empty overlay is not supported - raises ValueError in numpy min operation
-        with self.assertRaises(ValueError):
-            render_segmentation(image_source, overlay)
+        result = render_segmentation(image_source, overlay)
+
+        self.assertEqual(len(result), 3)
 
     def test_output_dtype_is_uint8(self):
         """Verify output images are uint8 dtype"""
@@ -961,14 +962,15 @@ class TestRenderSegmentationMask(unittest.TestCase):
         frame = result.get_frame(0)
         np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_empty_overlay_raises_error(self):
-        """Render segmentation mask with empty overlay raises ValueError"""
+    def test_rendering_with_empty_overlay_renders_every_frame(self):
+        """Render segmentation mask with an empty overlay (e.g. every cell filtered out)
+        renders one frame per image, with nothing drawn on it"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
         overlay = Overlay([])
 
-        # Empty overlay is not supported - raises ValueError in numpy min operation
-        with self.assertRaises(ValueError):
-            render_segmentation_mask(image_source, overlay)
+        result = render_segmentation_mask(image_source, overlay)
+
+        self.assertEqual(len(result), 3)
 
     def test_output_dtype_is_uint8(self):
         """Verify output images are uint8 dtype"""
@@ -1212,14 +1214,15 @@ class TestRenderTrackingMask(unittest.TestCase):
         frame = result.get_frame(0)
         np.testing.assert_array_equal(frame.raw.shape, (100, 100, 3))
 
-    def test_rendering_with_empty_overlay_raises_error(self):
-        """Render tracking mask with empty overlay raises ValueError"""
+    def test_rendering_with_empty_overlay_renders_every_frame(self):
+        """Render tracking mask with an empty overlay (e.g. every cell filtered out)
+        renders one frame per image, with nothing drawn on it"""
         image_source = create_test_image_source(frames=3, height=100, width=100)
         overlay = Overlay([])
 
-        # Empty overlay is not supported - raises ValueError in numpy min operation
-        with self.assertRaises(ValueError):
-            render_tracking_mask(image_source, overlay)
+        result = render_tracking_mask(image_source, overlay)
+
+        self.assertEqual(len(result), 3)
 
     def test_output_dtype_is_uint8(self):
         """Verify output images are uint8 dtype"""

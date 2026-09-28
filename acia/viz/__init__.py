@@ -398,6 +398,44 @@ class VideoExporter2:
         self.close()
 
 
+def _iter_frames_with_overlay(image_source, overlay: Overlay | None, desc=None):
+    """Yield ``(image, frame_overlay)`` for every image, aligned by frame number.
+
+    The ``i``-th image is paired with the contours whose ``frame == i`` (an empty
+    :class:`Overlay` if there are none). Pairing by position -- zipping the images
+    with :meth:`Overlay.timeIterator` -- is not safe: that iterator starts at the
+    overlay's first *populated* frame, so an overlay with no cells in its first
+    ``k`` frames (e.g. after filtering) would be drawn ``k`` frames too early.
+
+    ``overlay=None`` yields ``None`` for every image. Contours on frames past the
+    last image are reported with a warning instead of being dropped silently.
+    """
+    by_frame: dict[int, list] = {}
+    if overlay is not None:
+        for cont in overlay.contours:
+            by_frame.setdefault(int(cont.frame), []).append(cont)
+
+    iterable = image_source if desc is None else tqdm(image_source, desc=desc)
+    num_images = 0
+    for i, image in enumerate(iterable):
+        num_images = i + 1
+        if overlay is None:
+            yield image, None
+        else:
+            yield image, Overlay(by_frame.get(i, []))
+
+    beyond = sorted(f for f in by_frame if f >= num_images)
+    if beyond:
+        logging.warning(
+            "The overlay has contours on %d frame(s) beyond the %d image(s) of "
+            "the source (first: frame %d); they were not rendered. Does the "
+            "segmentation belong to this image sequence?",
+            len(beyond),
+            num_images,
+            beyond[0],
+        )
+
+
 def render_segmentation(
     imageSource: ImageSequenceSource,
     overlay: Overlay,
@@ -411,19 +449,10 @@ def render_segmentation(
         cell_color: rgb color of the cell outlines
     """
 
-    if overlay is None:
-        # when we have no rois -> create iterator that always returns None
-        def always_none():
-            while True:
-                yield None
-
-        overlay = iter(always_none())
-
     images = []
 
-    for image, frame_overlay in tqdm(
-        zip(imageSource, overlay.timeIterator(), strict=False),
-        desc="Render cell segmentation...",
+    for image, frame_overlay in _iter_frames_with_overlay(
+        imageSource, overlay, desc="Render cell segmentation..."
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -477,19 +506,10 @@ def render_cell_centers(
         ImageSequenceSource: The rendered image sequence
     """
 
-    if overlay is None:
-        # when we have no rois -> create iterator that always returns None
-        def always_none():
-            while True:
-                yield None
-
-        overlay = iter(always_none())
-
     images = []
 
-    for image, frame_overlay in tqdm(
-        zip(image_source, overlay.timeIterator(), strict=False),
-        desc="Render cell centers...",
+    for image, frame_overlay in _iter_frames_with_overlay(
+        image_source, overlay, desc="Render cell centers..."
     ):
         # extract the numpy image
         if isinstance(image, BaseImage):
@@ -551,10 +571,8 @@ def render_tracking(
     division_color = (0, 0, 255)  # bgr: blue
     marker_color = (203, 192, 255)
 
-    for image, frame_overlay in zip(
-        tqdm(image_source, desc="Render cell tracking paths..."),
-        overlay.timeIterator(),
-        strict=False,
+    for image, frame_overlay in _iter_frames_with_overlay(
+        image_source, overlay, desc="Render cell tracking paths..."
     ):
         raw = image.raw
 
@@ -1022,6 +1040,42 @@ def _blend_overlay(
     return result
 
 
+def _draw_label_contours(
+    image: np.ndarray,
+    label_mask: np.ndarray,
+    color: tuple[int, int, int] | None,
+    thickness: int = 1,
+) -> np.ndarray:
+    """Draw each instance's outline onto ``image`` (in place, also returned).
+
+    Outline pixels are the foreground pixels whose 4-neighbour carries another
+    label -- the background or a *different* cell -- so two touching cells get a
+    separating line even when their fill colors are alike or dark. Outlines are
+    drawn inside the cells (``thickness`` > 1 grows them inwards), never into the
+    background. ``color=None`` draws nothing.
+    """
+    if color is None or thickness < 1:
+        return image
+
+    lm = label_mask
+    edge = np.zeros(lm.shape, dtype=bool)
+    edge[:-1] |= lm[:-1] != lm[1:]
+    edge[1:] |= lm[1:] != lm[:-1]
+    edge[:, :-1] |= lm[:, :-1] != lm[:, 1:]
+    edge[:, 1:] |= lm[:, 1:] != lm[:, :-1]
+    foreground = lm != 0
+    edge &= foreground
+
+    if thickness > 1:
+        edge = cv2.dilate(
+            edge.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=thickness - 1
+        ).astype(bool)
+        edge &= foreground
+
+    image[edge] = color
+    return image
+
+
 def get_mask(self, height, width, binary_mask=True) -> np.ndarray:
     """
     Turn the individual overlays into masks. For every time point we create a mask of all contours.
@@ -1040,7 +1094,13 @@ def get_mask(self, height, width, binary_mask=True) -> np.ndarray:
 
 
 def render_overlay_frame(
-    image: np.ndarray, overlay: Overlay, frame_idx: int, alpha: float = 0.8
+    image: np.ndarray,
+    overlay: Overlay,
+    frame_idx: int,
+    alpha: float = 0.8,
+    *,
+    contour_color: tuple[int, int, int] | None = None,
+    contour_thickness: int = 1,
 ) -> np.ndarray:
     """Render segmentation overlay on a single frame image with alpha blending.
 
@@ -1055,6 +1115,11 @@ def render_overlay_frame(
         frame_idx (int): Frame index for reference (not directly used, for compatibility).
         alpha (float, optional): Alpha blending weight for the original image.
             Default 0.8 means 80% original image, 20% overlay. Valid range: 0.0-1.0.
+        contour_color: ``(r, g, b)`` color of the cell outlines drawn on top of
+            the colored masks (e.g. ``(0, 0, 0)`` for black), which keeps
+            neighbouring cells apart when their fill colors are similar or dark.
+            ``None`` (default) draws no outlines.
+        contour_thickness: outline width in pixels (grows into the cell).
 
     Returns:
         np.ndarray: Blended image with overlay applied, dtype uint8, shape HxWx3 (RGB).
@@ -1076,7 +1141,8 @@ def render_overlay_frame(
 
     # Alpha blend the colored mask onto the image, foreground pixels only.
     # alpha controls the mix: higher alpha = more original image, lower = more overlay
-    return _blend_overlay(im, colored_mask, label_mask, alpha)
+    blended = _blend_overlay(im, colored_mask, label_mask, alpha)
+    return _draw_label_contours(blended, label_mask, contour_color, contour_thickness)
 
 
 def render_segmentation_mask(
@@ -1088,6 +1154,8 @@ def render_segmentation_mask(
     palette: dict | None = None,
     cmap: str = "viridis",
     default_color: tuple[int, int, int] = (120, 120, 120),
+    contour_color: tuple[int, int, int] | None = None,
+    contour_thickness: int = 1,
 ) -> THWCSequenceSource:
     """Render cell segmentation masks, colored randomly (default) or from a table.
 
@@ -1110,6 +1178,11 @@ def render_segmentation_mask(
             ``colors`` (its keys double as the color legend).
         cmap: matplotlib colormap name used for numeric ``colors``.
         default_color: color for cells absent from ``colors`` (or with ``NaN``).
+        contour_color: ``(r, g, b)`` color of the cell outlines drawn on top of
+            the colored masks (e.g. ``(0, 0, 0)`` for black), which keeps
+            neighbouring cells apart when their fill colors are similar or dark.
+            ``None`` (default) draws no outlines.
+        contour_thickness: outline width in pixels (grows into the cell).
 
     Returns:
         THWCSequenceSource: TxHxWx3 sequence
@@ -1122,10 +1195,8 @@ def render_segmentation_mask(
 
     return_images = []
 
-    for im, ov in zip(
-        tqdm(source, desc="Render segmentation masks..."),
-        overlay.time_iterator(),
-        strict=False,
+    for im, ov in _iter_frames_with_overlay(
+        source, overlay, desc="Render segmentation masks..."
     ):
         raw = im.raw
         height, width = raw.shape[:2]
@@ -1146,7 +1217,10 @@ def render_segmentation_mask(
                 lut[lbl] = id_to_rgb.get(cont.id, default_color)
             colored_mask = colorize_instance_mask(label_mask, color_lut=lut)
 
-        return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
+        blended = _blend_overlay(image, colored_mask, label_mask, alpha)
+        return_images.append(
+            _draw_label_contours(blended, label_mask, contour_color, contour_thickness)
+        )
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
@@ -1225,6 +1299,9 @@ def render_tracking_mask(
     alpha=0.8,
     show_label_numbers=False,
     seed=42,
+    *,
+    contour_color: tuple[int, int, int] | None = None,
+    contour_thickness: int = 1,
 ) -> THWCSequenceSource:
     """Render tracking and use the label colors for the masks
 
@@ -1232,6 +1309,11 @@ def render_tracking_mask(
         source (ImageSequenceSource): the time-lapse sequence source
         overlay (Overlay): the corresponding overlay. WARNING: all instances need to be based on masks!
         alpha (float, optional): The opacity of the masked image. Defaults to 0.8.
+        contour_color: ``(r, g, b)`` color of the cell outlines drawn on top of
+            the colored masks (e.g. ``(0, 0, 0)`` for black), which keeps
+            neighbouring cells apart when their fill colors are similar or dark.
+            ``None`` (default) draws no outlines.
+        contour_thickness: outline width in pixels (grows into the cell).
 
     Returns:
         THWCSequenceSource: TxHxWx3 sequence
@@ -1245,10 +1327,8 @@ def render_tracking_mask(
     color_lut = rng.integers(0, 256, size=(max_label + 1, 3), dtype=np.uint8)
     color_lut[0] = (0, 0, 0)
 
-    for im, ov in zip(
-        tqdm(source, desc="Render tracking mask..."),
-        overlay.time_iterator(),
-        strict=False,
+    for im, ov in _iter_frames_with_overlay(
+        source, overlay, desc="Render tracking mask..."
     ):
         raw = im.raw
         h, w = raw.shape[:2]
@@ -1276,7 +1356,10 @@ def render_tracking_mask(
         # render the masks based on the labels
         colored_mask = colorize_instance_mask(label_mask, color_lut=color_lut)
 
-        return_images.append(_blend_overlay(image, colored_mask, label_mask, alpha))
+        blended = _blend_overlay(image, colored_mask, label_mask, alpha)
+        return_images.append(
+            _draw_label_contours(blended, label_mask, contour_color, contour_thickness)
+        )
 
     # return the new time-lapse
     return THWCSequenceSource(np.stack(return_images, axis=0))
