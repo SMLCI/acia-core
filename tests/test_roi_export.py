@@ -286,8 +286,21 @@ class TestExportInfo(_Case):
 
         self.assertEqual(
             default_export_dir("/data/exp/JW_nd73-01.czi"),
-            Path("/data/exp/roi_exports/JW_nd73-01"),
+            Path("/data/exp/roi_exports"),
         )
         empty = Path(self.out) / "some_folder"
         empty.mkdir(parents=True)
         self.assertEqual(experiment_name(empty), "some_folder")
+
+    def test_refuses_to_mix_two_acquisitions_in_one_folder(self):
+        import json
+
+        manifest = _manifest(self.seqfile, [(0, (20.0, 20.0), (8, 8), "a", 0)])
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        info_path = Path(self.out) / "roi_export.json"
+        info = json.loads(info_path.read_text())
+        info["source"]["path"] = "/elsewhere/other_acquisition.nd2"
+        info_path.write_text(json.dumps(info))
+
+        with self.assertRaisesRegex(ValueError, "other_acquisition.nd2"):
+            export_rois(manifest, self.out, source=self.seqfile, progress=False)

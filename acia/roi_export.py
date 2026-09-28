@@ -69,13 +69,15 @@ DEFAULT_EXPORT_FOLDER = "roi_exports"
 
 
 def default_export_dir(source_path: str | os.PathLike) -> Path:
-    """``<folder of the raw file>/roi_exports/<raw file stem>``.
+    """``<folder of the raw file>/roi_exports``.
 
-    Keeps the exported ROIs next to the experiment they come from, one subfolder
-    per raw file, so several acquisitions in one folder never collide.
+    Keeps the exported ROIs next to the experiment they come from. The raw data
+    folder usually already names the experiment, so there is no per-file
+    subfolder; the raw file's name is recorded in ``roi_export.json`` instead.
+    A second acquisition in the same folder needs its own ``output_dir`` --
+    :func:`export_rois` refuses to mix two acquisitions in one folder.
     """
-    source = Path(source_path)
-    return source.parent / DEFAULT_EXPORT_FOLDER / source.stem
+    return Path(source_path).parent / DEFAULT_EXPORT_FOLDER
 
 
 def experiment_name(export_dir: str | os.PathLike) -> str:
@@ -201,6 +203,7 @@ def export_rois(
             progress,
         )
 
+    _refuse_foreign_export(output_dir, manifest.source_path)
     os.makedirs(output_dir, exist_ok=True)
     written: list[str] = []
     exported: list[dict] = []
@@ -298,6 +301,27 @@ def export_rois(
     note = f" (registered via {registration_method_name})" if reg_dash else ""
     say(f"{len(written)} TIFF(s) written to {output_dir!r}{note}")
     return written
+
+
+def _refuse_foreign_export(output_dir: str, source_path: str) -> None:
+    """Fail before writing if ``output_dir`` holds another acquisition's export.
+
+    ROI files are named by position and ROI number only, so exporting a second
+    raw file into the same folder would silently overwrite the first one's
+    ``pos001_roi001.tiff`` -- and mix both in one analysis.
+    """
+    try:
+        info = json.loads((Path(output_dir) / EXPORT_INFO_NAME).read_text())
+    except (OSError, ValueError):
+        return
+    previous = str((info.get("source") or {}).get("path") or "")
+    if previous and source_path and Path(previous).name != Path(source_path).name:
+        raise ValueError(
+            f"{output_dir} already holds the ROI export of {Path(previous).name}; "
+            f"exporting {Path(source_path).name} there would overwrite its files. "
+            "Choose another output_dir for this acquisition (e.g. a subfolder "
+            "named after it)."
+        )
 
 
 def _write_export_info(
