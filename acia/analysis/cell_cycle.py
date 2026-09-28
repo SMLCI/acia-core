@@ -145,6 +145,7 @@ def plot_cycle_bars(
     ax: Axes | None = None,
     value_label: str | None = None,
     show_rejected: bool = True,
+    spread: bool = True,
 ) -> Figure:
     """One horizontal bar per cell, from its birth to its division.
 
@@ -161,6 +162,11 @@ def plot_cycle_bars(
         value_label: y-axis label; defaults to ``"<value col> [<unit>]"``.
         show_rejected: draw cells with ``valid == False`` in grey (default) --
             ``False`` leaves them out.
+        spread: doubling times come in whole frame intervals, so many cells
+            share a value and their bars would lie exactly on top of each
+            other. With ``spread`` (default) bars of equal value are fanned out
+            vertically within +-40% of the value spacing, so a value held by
+            many cells shows as a thick band -- the distribution stays visible.
 
     Returns:
         The matplotlib figure (not shown).
@@ -170,6 +176,8 @@ def plot_cycle_bars(
     end, _ = _column(df, end_col, t_unit or None)
     v, v_unit = _column(df, value_col)
     valid = _valid_mask(df)
+    if spread:
+        v = _spread_ties(v, start)
 
     if show_rejected and (~valid).any():
         ax.hlines(
@@ -190,6 +198,30 @@ def plot_cycle_bars(
         ax.legend()
     fig.tight_layout()
     return fig
+
+
+def _spread_ties(values: np.ndarray, order_by: np.ndarray) -> np.ndarray:
+    """Fan out equal values within +-40% of the spacing between distinct values.
+
+    Within a group of equal values, bars are ordered by ``order_by`` (birth
+    time), so the fan keeps a stable, readable order.
+    """
+    finite = np.isfinite(values)
+    distinct = np.unique(values[finite])
+    if len(distinct) == len(values[finite]):
+        return values
+    gaps = np.diff(distinct)
+    spacing = (
+        float(gaps.min()) if len(gaps) else max(abs(float(distinct[0])) * 0.1, 1.0)
+    )
+    out = values.astype(float).copy()
+    for value in distinct:
+        (members,) = np.nonzero(finite & (values == value))
+        if len(members) < 2:
+            continue
+        members = members[np.argsort(order_by[members], kind="stable")]
+        out[members] = value + np.linspace(-0.4, 0.4, len(members)) * spacing
+    return out
 
 
 def plot_cycle_distribution(
@@ -319,3 +351,17 @@ def read_summaries(paths, keys=None) -> pd.DataFrame:
         row.update(pd.json_normalize(data, sep=".").iloc[0].to_dict() if data else {})
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def frame_interval_of(source) -> str | None:
+    """The source's (median) frame interval as text, e.g. ``"10.0 minute"``.
+
+    Recorded next to every summary: each duration and rate scales with it, so a
+    wrong interval is the first thing to rule out when numbers look off.
+    ``None`` for an uncalibrated or single-frame source.
+    """
+    timepoints = getattr(source, "timepoints", None)
+    if timepoints is None or len(timepoints) < 2:
+        return None
+    steps = np.diff(timepoints.magnitude)
+    return f"{float(np.median(steps)):g} {timepoints.units}"

@@ -73,6 +73,11 @@ def test_dots_and_bars_are_separate_figures_and_mark_rejected():
     segments = [s for c in bars.axes[0].collections for s in c.get_segments()]
     spans = sorted((s[0][0], s[1][0]) for s in segments)
     assert spans == [(0, 30), (30, 60), (30, 60)]
+    # all three cycles last 30 min: the tied bars are fanned out, not stacked
+    heights = sorted(s[0][1] for s in segments)
+    assert len(set(heights)) == 3 and heights[0] < 30 < heights[-1]
+    flat = plot_cycle_bars(df, spread=False)
+    assert {s[0][1] for c in flat.axes[0].collections for s in c.get_segments()} == {30}
     assert bars.axes[0].get_ylabel() == "doubling time [minute]"
     plt.close("all")
 
@@ -120,3 +125,13 @@ def test_update_summary_merges_sections_and_reads_back(tmp_path):
     assert table.loc[0, "experiment"] == "exp1"
     assert table.loc[0, "growth_rate_population.cc.mu"] == 0.5
     assert isinstance(table, pd.DataFrame)
+
+
+def test_frame_interval_of():
+    from acia.analysis.cell_cycle import frame_interval_of
+
+    src = THWCSequenceSource(np.zeros((3, 4, 4, 1), np.uint8), frame_interval="5 min")
+    assert frame_interval_of(src) == "5 minute"
+    assert (
+        frame_interval_of(THWCSequenceSource(np.zeros((3, 4, 4, 1), np.uint8))) is None
+    )
