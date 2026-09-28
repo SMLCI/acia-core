@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import pandas as pd
 
-from acia.analysis.units import UNIT_ATTR
+from acia.analysis.units import UNIT_ATTR, _is_pint_column
 
 if TYPE_CHECKING:
     import networkx as nx
@@ -64,8 +64,10 @@ def compute_doubling_times(
 
     Returns:
         A DataFrame indexed by the qualifying tracklet's label (index name
-        ``"tracklet"``), with columns ``start_time``, ``end_time`` and
-        ``doubling_time`` as ``pint[<unit>]`` columns (unit-safe, matching
+        ``"tracklet"``), with columns ``start_time`` (birth: first frame),
+        ``end_time`` (last frame the cell is seen), ``division_time`` (the
+        daughters' first frame) and ``doubling_time`` (``division_time -
+        start_time``, i.e. birth to birth) as ``pint[<unit>]`` columns (unit-safe, matching
         :func:`acia.analysis.attach_units`'s pint representation), where
         ``<unit>`` is ``source.timepoints``'s unit. The unit is also recorded
         in ``df.attrs["units"]`` for consistency with the rest of
@@ -89,6 +91,7 @@ def compute_doubling_times(
     labels: list[Any] = []
     start_times: list[float] = []
     end_times: list[float] = []
+    division_times: list[float] = []
     doubling_times: list[float] = []
 
     n_timepoints = len(timepoints)
@@ -118,9 +121,11 @@ def compute_doubling_times(
 
         start_time = timepoints[node_attrs["start_frame"]]
         end_time = timepoints[node_attrs["end_frame"]]
-        doubling_time = (
-            timepoints[tracklet_graph.nodes[child]["start_frame"]] - start_time
-        )
+        # the division is dated by the daughters' first frame: a cell seen on
+        # frames s..e lives e - s + 1 frames, so its cycle runs to the next
+        # birth, one interval past its own last frame (end_time)
+        division_time = timepoints[tracklet_graph.nodes[child]["start_frame"]]
+        doubling_time = division_time - start_time
 
         if doubling_time.magnitude < 0:
             raise ValueError(
@@ -132,6 +137,7 @@ def compute_doubling_times(
         labels.append(n)
         start_times.append(start_time.to(unit_str).magnitude)
         end_times.append(end_time.to(unit_str).magnitude)
+        division_times.append(division_time.to(unit_str).magnitude)
         doubling_times.append(doubling_time.to(unit_str).magnitude)
 
     pint_dtype = f"pint[{unit_str}]"
@@ -139,6 +145,7 @@ def compute_doubling_times(
         {
             "start_time": pd.array(start_times, dtype=pint_dtype),
             "end_time": pd.array(end_times, dtype=pint_dtype),
+            "division_time": pd.array(division_times, dtype=pint_dtype),
             "doubling_time": pd.array(doubling_times, dtype=pint_dtype),
         },
         index=pd.Index(labels, name="tracklet"),
@@ -146,9 +153,17 @@ def compute_doubling_times(
     df.attrs[UNIT_ATTR] = {
         "start_time": unit_str,
         "end_time": unit_str,
+        "division_time": unit_str,
         "doubling_time": unit_str,
     }
     return df
+
+
+def _unit_of(df: pd.DataFrame, col: str) -> str:
+    """Unit of a pint column, else the one recorded in ``df.attrs``, else ``""``."""
+    if _is_pint_column(df[col]):
+        return str(df[col].pint.units)
+    return str((df.attrs.get(UNIT_ATTR) or {}).get(col, ""))
 
 
 def _compute_hose_bands(
@@ -158,6 +173,7 @@ def _compute_hose_bands(
     min_n: int,
     n_bootstrap: int,
     random_state,
+    value_col: str = "doubling_time",
 ) -> tuple[np.ndarray, np.ndarray, dict[float, tuple[np.ndarray, np.ndarray]], str]:
     """Pure computation behind :func:`plot_doubling_time_hose` (no plotting).
 
@@ -173,6 +189,13 @@ def _compute_hose_bands(
         ``(lo, hi)`` plain-float arrays, aligned the same way. Grid points
         with fewer than ``min_n`` alive-and-qualifying cells are ``NaN`` in
         ``mean_arr`` and every band.
+
+    A cell is alive from its birth (``start_time``) until it divides
+    (``division_time``, exclusive), falling back to its last observed frame
+    (``end_time``, inclusive) for tables without a ``division_time`` column --
+    on the movie's own frame grid both give the same cross-sections.
+    ``value_col`` selects the per-cell value (in its own unit, e.g. a growth
+    rate); only the time columns are converted to the grid's unit.
     """
     if n_bootstrap < 1:
         raise ValueError(f"n_bootstrap must be >= 1, got {n_bootstrap}.")
@@ -191,12 +214,15 @@ def _compute_hose_bands(
     unit_str = str(time_grid.units)
     t_grid = time_grid.to(unit_str).magnitude
 
+    has_division = "division_time" in doubling_times_df.columns
     if len(doubling_times_df) > 0:
         start = doubling_times_df["start_time"].values.quantity.to(unit_str).magnitude
-        end = doubling_times_df["end_time"].values.quantity.to(unit_str).magnitude
-        values = (
-            doubling_times_df["doubling_time"].values.quantity.to(unit_str).magnitude
-        )
+        end_col = "division_time" if has_division else "end_time"
+        end = doubling_times_df[end_col].values.quantity.to(unit_str).magnitude
+        values = doubling_times_df[value_col].values.quantity
+        if value_col == "doubling_time":
+            values = values.to(unit_str)
+        values = np.asarray(values.magnitude, dtype=float)
     else:
         start = end = values = np.array([], dtype=float)
 
@@ -209,7 +235,8 @@ def _compute_hose_bands(
     rng = np.random.default_rng(random_state)
 
     for i, t in enumerate(t_grid):
-        alive = values[(start <= t) & (t <= end)]
+        until = (t < end) if has_division else (t <= end)
+        alive = values[(start <= t) & until & ~np.isnan(values)]
         if alive.size < min_n:
             continue
 
@@ -235,6 +262,8 @@ def plot_doubling_time_hose(
     n_bootstrap: int = 1000,
     random_state=0,
     ax: Axes | None = None,
+    value_col: str = "doubling_time",
+    value_label: str | None = None,
 ) -> Figure:
     """Plot mean doubling time evolving over the experiment as a "temporal hose".
 
@@ -282,6 +311,10 @@ def plot_doubling_time_hose(
             (``0``) so repeated calls are reproducible.
         ax: optional matplotlib :class:`~matplotlib.axes.Axes` to draw into.
             When ``None`` a new figure and axes are created.
+        value_col: the per-cell column to average -- ``"doubling_time"``
+            (default) or any other per-cycle value in the same table, e.g. a
+            per-cell growth rate (:func:`acia.analysis.growth_rate.compute_cell_growth_rates`).
+        value_label: y-axis label; defaults to ``"<value_col> [<unit>]"``.
 
     Returns:
         A matplotlib :class:`~matplotlib.figure.Figure` with the mean
@@ -306,7 +339,13 @@ def plot_doubling_time_hose(
         )
 
     t_grid, mean_arr, bands, unit_str = _compute_hose_bands(
-        doubling_times_df, time_grid, ci_levels, min_n, n_bootstrap, random_state
+        doubling_times_df,
+        time_grid,
+        ci_levels,
+        min_n,
+        n_bootstrap,
+        random_state,
+        value_col=value_col,
     )
 
     if ax is None:
@@ -328,7 +367,14 @@ def plot_doubling_time_hose(
     ax.plot(t_grid, mean_arr, color="tab:blue", lw=2, label="mean", zorder=5)
 
     ax.set_xlabel(f"time [{unit_str}]")
-    ax.set_ylabel(f"doubling time [{unit_str}]")
+    if value_label is None:
+        value_unit = (
+            unit_str
+            if value_col == "doubling_time"
+            else _unit_of(doubling_times_df, value_col)
+        )
+        value_label = f"{value_col.replace('_', ' ')} [{value_unit}]"
+    ax.set_ylabel(value_label)
     ax.legend()
     fig.tight_layout()
 

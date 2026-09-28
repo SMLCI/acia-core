@@ -251,3 +251,80 @@ class TestReviewRegressions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCellGrowthRates(unittest.TestCase):
+    """compute_cell_growth_rates on synthetic exponentially growing cells."""
+
+    def _setup(self, noisy_label=None):
+        import networkx as nx
+
+        from acia.analysis.doubling_time import compute_doubling_times
+        from acia.base import Contour, Overlay
+        from acia.segm.local import THWCSequenceSource
+
+        # 10 min frames; mother 1 (frames 0-5) divides at frame 6 into 2 and 3,
+        # which live frames 6-11 and divide at 12 into 4..7 (frames 12-13).
+        # A cell doubling every 60 min grows at mu = ln2 / h.
+        mu = np.log(2)  # per hour
+        g = nx.DiGraph()
+        spans = {0: (0, 0), 1: (0, 5), 2: (6, 11), 3: (6, 11)}
+        for k in (4, 5, 6, 7):
+            spans[k] = (12, 13)
+        for n, (a, b) in spans.items():
+            g.add_node(n, start_frame=a, end_frame=b)
+        g.add_edges_from(
+            [(0, 1), (0, 8), (1, 2), (1, 3), (2, 4), (2, 5), (3, 6), (3, 7)]
+        )
+        g.add_node(8, start_frame=1, end_frame=13)
+
+        contours = []
+        next_id = 0
+        for n in (1, 2, 3):
+            a, b = spans[n]
+            for f in range(a, b + 1):
+                side = np.sqrt(100 * np.exp(mu * (f - a) / 6))
+                if n == noisy_label and f % 2:
+                    side *= 1.6
+                sq = [[0, 0], [side, 0], [side, side], [0, side]]
+                contours.append(Contour(sq, -1, f, next_id, n))
+                next_id += 1
+        src = THWCSequenceSource(
+            np.zeros((14, 4, 4, 1), np.uint8), frame_interval="10 min"
+        )
+        cycles = compute_doubling_times(g, src)
+        return Overlay(contours, frames=list(range(14))), cycles, src
+
+    def test_fit_matches_doubling_time_for_clean_cells(self):
+        from acia.analysis.growth_rate import compute_cell_growth_rates
+
+        overlay, cycles, src = self._setup()
+        rates = compute_cell_growth_rates(overlay, cycles, src)
+
+        self.assertEqual(sorted(rates.index), [1, 2, 3])
+        mu_fit = rates["mu_fit"].values.quantity.to("1/hour").magnitude
+        np.testing.assert_allclose(mu_fit, np.log(2), rtol=1e-6)
+        np.testing.assert_allclose(
+            rates["mu_from_dt"].values.quantity.magnitude, np.log(2), rtol=1e-6
+        )
+        self.assertTrue((rates["r2"] > 0.999).all())
+        self.assertFalse(rates["fit_outlier"].any())
+        self.assertTrue((rates["n_points"] == 6).all())
+
+    def test_noisy_cell_is_flagged(self):
+        from acia.analysis.growth_rate import compute_cell_growth_rates
+
+        overlay, cycles, src = self._setup(noisy_label=2)
+        rates = compute_cell_growth_rates(overlay, cycles, src)
+
+        self.assertTrue(rates.loc[2, "fit_outlier"])
+        self.assertEqual(rates.loc[2, "fit_outlier_reason"], "poor fit")
+        self.assertFalse(rates.loc[1, "fit_outlier"])
+
+    def test_too_few_points(self):
+        from acia.analysis.growth_rate import compute_cell_growth_rates
+
+        overlay, cycles, src = self._setup()
+        rates = compute_cell_growth_rates(overlay, cycles, src, min_points=10)
+        self.assertTrue(rates["mu_fit"].isna().all())
+        self.assertEqual(set(rates["fit_outlier_reason"]), {"too few points"})

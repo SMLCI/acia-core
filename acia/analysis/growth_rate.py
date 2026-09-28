@@ -25,11 +25,13 @@ import pint
 import statsmodels.api as sm  # type: ignore[import-untyped]
 
 from acia import Q_
-from acia.analysis.units import UNIT_ATTR
+from acia.analysis.units import UNIT_ATTR, _is_pint_column
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
+
+    from acia.base import ImageSequenceSource
 
 #: aggregation modes accepted by :func:`estimate_growth_rate`
 AggMode = Literal["sum", "mean", "count"]
@@ -246,3 +248,140 @@ def estimate_growth_rate(
     fig.tight_layout()
 
     return result, fig
+
+
+def _cell_size(cont, measure: str) -> float:
+    if measure == "area":
+        return float(cont.area)
+    if measure == "length":
+        rect = cont.polygon.minimum_rotated_rectangle
+        xs, ys = rect.exterior.coords.xy
+        edges = np.hypot(np.diff(xs), np.diff(ys))
+        return float(edges.max()) if len(edges) else float("nan")
+    raise ValueError(f"measure must be 'area' or 'length', got {measure!r}")
+
+
+def compute_cell_growth_rates(
+    overlay,
+    cycles: pd.DataFrame,
+    source: ImageSequenceSource,
+    *,
+    measure: Literal["area", "length"] = "area",
+    rate_unit: str = "1/hour",
+    min_points: int = 4,
+    r2_min: float = 0.9,
+    rel_tol: float = 0.3,
+) -> pd.DataFrame:
+    """Per-cell exponential growth rate, fitted and derived from the doubling time.
+
+    For every cell cycle in ``cycles`` (one row per tracklet, as returned by
+    :func:`acia.analysis.doubling_time.compute_doubling_times`), the cell's size
+    over its life is fitted as ``size(t) = size_0 * exp(mu * t)`` -- an OLS of
+    ``log(size)`` on time. The pixel calibration cancels in the slope, so sizes
+    are taken in pixels.
+
+    Two growth rates are reported side by side:
+
+    * ``mu_fit`` -- from the size fit, with its standard error and ``r2``;
+    * ``mu_from_dt`` -- ``ln(2) / doubling_time``, i.e. what the cell's cycle
+      duration implies if it doubled exactly once.
+
+    A healthy cell has a good fit and the two agree. ``fit_outlier`` flags cells
+    where ``r2 < r2_min`` or ``|mu_fit - mu_from_dt| / mu_from_dt > rel_tol``
+    (reason in ``fit_outlier_reason``) -- typically a segmentation or tracking
+    error (a merged neighbour, a swapped identity, a missed division).
+
+    Args:
+        overlay: the tracked overlay; each contour's ``label`` is its tracklet
+            id (the index of ``cycles``).
+        cycles: per-cycle table with at least ``doubling_time``; its time
+            columns and any ``valid``/``rejected_by`` columns are carried over.
+        source: the time-calibrated image sequence (for ``timepoints``).
+        measure: ``"area"`` (default) or ``"length"`` (long side of the minimal
+            rotated rectangle) as the cell size.
+        rate_unit: unit of the growth rates (default ``"1/hour"``).
+        min_points: minimum number of observations for a fit; cells with fewer
+            get ``NaN`` fit values.
+        r2_min / rel_tol: thresholds of the ``fit_outlier`` flag.
+
+    Returns:
+        ``cycles`` (copied) plus ``mu_fit``, ``mu_fit_se``, ``mu_from_dt``
+        (``pint[rate_unit]``), ``r2``, ``n_points``, ``fit_outlier`` and
+        ``fit_outlier_reason``, indexed by tracklet.
+
+    Raises:
+        ValueError: if ``source`` has no time calibration.
+    """
+    timepoints = source.timepoints
+    if timepoints is None:
+        raise ValueError(
+            "per-cell growth rates require time calibration -- the source has "
+            "neither a frame_interval nor per-frame timepoints"
+        )
+    time_unit = str((1 / Q_(1.0, rate_unit)).units)
+    t_all = np.asarray(timepoints.to(time_unit).magnitude, dtype=float)
+
+    by_label: dict = {}
+    for cont in overlay.contours:
+        by_label.setdefault(cont.label, []).append(cont)
+
+    mu, se, r2, npts = [], [], [], []
+    for tracklet in cycles.index:
+        conts = sorted(by_label.get(tracklet, []), key=lambda c: c.frame)
+        t = np.array([t_all[int(c.frame)] for c in conts], dtype=float)
+        y = np.array([_cell_size(c, measure) for c in conts], dtype=float)
+        ok = np.isfinite(y) & (y > 0)
+        t, y = t[ok], y[ok]
+        npts.append(int(t.size))
+        if t.size < max(min_points, 2):
+            mu.append(np.nan)
+            se.append(np.nan)
+            r2.append(np.nan)
+            continue
+        design = sm.add_constant(t, has_constant="add")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = sm.OLS(np.log(y), design).fit()
+        mu.append(float(model.params[1]))
+        se.append(float(model.bse[1]) if t.size >= 3 else np.nan)
+        r2.append(float(model.rsquared))
+
+    out = cycles.copy()
+    out.attrs = dict(cycles.attrs)
+    dt_col = cycles["doubling_time"]
+    if _is_pint_column(dt_col):
+        doubling = np.asarray(dt_col.values.quantity.to(time_unit).magnitude, float)
+    else:
+        unit = (cycles.attrs.get(UNIT_ATTR) or {}).get("doubling_time") or time_unit
+        doubling = np.asarray(
+            Q_(np.asarray(dt_col, float), unit).to(time_unit).magnitude
+        )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        from_dt = np.where(doubling > 0, np.log(2) / doubling, np.nan)
+
+    mu_arr, from_dt = np.asarray(mu, float), np.asarray(from_dt, float)
+    r2_arr = np.asarray(r2, float)
+    pint_dtype = f"pint[{rate_unit}]"
+    out["mu_fit"] = pd.array(mu_arr, dtype=pint_dtype)
+    out["mu_fit_se"] = pd.array(np.asarray(se, float), dtype=pint_dtype)
+    out["mu_from_dt"] = pd.array(from_dt, dtype=pint_dtype)
+    out["r2"] = r2_arr
+    out["n_points"] = npts
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel_diff = np.abs(mu_arr - from_dt) / from_dt
+    reasons = np.full(len(out), None, dtype=object)
+    reasons[np.isnan(mu_arr)] = "too few points"
+    reasons[(reasons == None) & (r2_arr < r2_min)] = "poor fit"  # noqa: E711
+    reasons[(reasons == None) & (rel_diff > rel_tol)] = "disagrees with doubling time"  # noqa: E711
+    out["fit_outlier"] = reasons != None  # noqa: E711
+    out["fit_outlier_reason"] = reasons
+
+    out.attrs.setdefault(UNIT_ATTR, {})
+    out.attrs[UNIT_ATTR] = {
+        **out.attrs[UNIT_ATTR],
+        "mu_fit": rate_unit,
+        "mu_fit_se": rate_unit,
+        "mu_from_dt": rate_unit,
+    }
+    return out
