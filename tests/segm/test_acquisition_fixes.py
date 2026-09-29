@@ -52,13 +52,15 @@ def _raw_slots(slips_flat):
     return raw
 
 
-def _make_fake_nd2(slips_flat=(), *, with_stage=True):
+def _make_fake_nd2(slips_flat=(), *, with_stage=True, stale_flat=()):
     raw = _raw_slots(set(slips_flat))
     base = np.zeros((P, T, 3, 4), dtype=np.uint16)  # ND2 order P, T, Y, X
     stage = {}
     for k, (tt, pp) in enumerate(raw):
         t_raw, p_raw = divmod(k, P)
-        base[p_raw, t_raw] = _encode(tt, pp)
+        # a stale slot re-delivers the previous slot's pixels; its stage is its own
+        shown = raw[k - 1] if k in stale_flat else (tt, pp)
+        base[p_raw, t_raw] = _encode(*shown)
         stage[(t_raw, p_raw)] = _POS_XY[pp]
     sizes = {"P": P, "T": T, "Y": 3, "X": 4}
     # sequence index order of a T-outer, P-inner ND2 experiment
@@ -105,11 +107,14 @@ def _make_fake_nd2(slips_flat=(), *, with_stage=True):
 
 class _FakeND2Case(unittest.TestCase):
     slips_flat: tuple = ()
+    stale_flat: tuple = ()
     with_stage = True
 
     def setUp(self):
         self._saved = sys.modules.get("nd2")
-        sys.modules["nd2"] = _make_fake_nd2(self.slips_flat, with_stage=self.with_stage)
+        sys.modules["nd2"] = _make_fake_nd2(
+            self.slips_flat, with_stage=self.with_stage, stale_flat=self.stale_flat
+        )
         self._tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self._tmp.name, "exp.nd2")
         open(self.path, "wb").close()
@@ -361,3 +366,86 @@ class TestDetectionWithoutStage(_FakeND2Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# stale frames (camera buffer read twice) + the combined check
+# --------------------------------------------------------------------------- #
+class TestStaleFrames(_FakeND2Case):
+    """Raw slot (2, 1) = flat 9 is a copy of (2, 0); a double shot sits at (1, 2)."""
+
+    slips_flat = (6,)
+    stale_flat = (9,)
+
+    def _value(self, src, t):
+        return int(np.asarray(src.get_frame(t).raw)[0, 0, 0])
+
+    def test_check_finds_both_kinds_and_labels_them(self):
+        from acia.segm.acquisition_fixes import StaleFrame, check_acquisition
+
+        found = check_acquisition(self.open(acquisition_fixes=[]), progress=False)
+        self.assertEqual(found.slips, [AcquisitionSlip(1, 2)])
+        self.assertEqual(found.stale_frames, [StaleFrame(2, 1)])
+        self.assertEqual(found.fixes, [AcquisitionSlip(1, 2), StaleFrame(2, 1)])
+
+    def test_stale_frame_is_dropped_without_shifting_and_keeps_true_times(self):
+        from acia.segm.acquisition_fixes import StaleFrame
+
+        f = self.open(
+            acquisition_fixes=[(1, 2), StaleFrame(2, 1)], frame_interval="10 min"
+        )
+        # raw (2, 1) re-delivered the pixels of the slot before it: the image it
+        # should hold is lost, and only that position loses a frame
+        sizes = [f.position(p).size_t for p in range(P)]
+        without_stale = self.open(acquisition_fixes=[(1, 2)])
+        expected = [without_stale.position(p).size_t for p in range(P)]
+        self.assertEqual(sum(expected) - sum(sizes), 1)
+        for p in range(P):
+            s_p = f.position(p)
+            values = [self._value(s_p, i) for i in range(s_p.size_t)]
+            self.assertTrue(all(v % 100 == p for v in values), (p, values))
+            times = s_p.timepoints.to("minute").magnitude
+            # each frame is stamped with the timepoint its image belongs to
+            self.assertEqual(
+                [int(v // 100) * 10 for v in values], [int(x) for x in times]
+            )
+            self.assertEqual(len(values), len(set(values)))  # no image twice
+
+    def test_sidecar_round_trip_keeps_both_kinds(self):
+        from acia.segm.acquisition_fixes import StaleFrame
+
+        save_fixes(self.path, [(1, 2), StaleFrame(2, 1)], num_t=T, num_p=P)
+        self.assertEqual(
+            load_fixes(self.path, num_t=T, num_p=P),
+            [AcquisitionSlip(1, 2), StaleFrame(2, 1)],
+        )
+        self.assertEqual(
+            self.open().acquisition_fixes, [AcquisitionSlip(1, 2), StaleFrame(2, 1)]
+        )
+        meta = self.open().metadata.to_dict()["acquisition_fixes"]
+        self.assertIn({"t": 2, "position": 1, "kind": "stale"}, meta)
+
+    def test_manifest_fixes_restore_stale_frames(self):
+        from acia.segm.acquisition_fixes import StaleFrame, manifest_fixes
+
+        block = {
+            "acquisition_fixes": [
+                {"t": 1, "position": 2},
+                {"t": 2, "position": 1, "kind": "stale"},
+            ]
+        }
+        self.assertEqual(
+            manifest_fixes(block), [AcquisitionSlip(1, 2), StaleFrame(2, 1)]
+        )
+
+
+class TestCheckWithoutStage(_FakeND2Case):
+    stale_flat = (5,)
+    with_stage = False
+
+    def test_pixels_still_checked_and_note_explains_the_rest(self):
+        from acia.segm.acquisition_fixes import StaleFrame, check_acquisition
+
+        found = check_acquisition(self.open(acquisition_fixes=[]), progress=False)
+        self.assertEqual(found.fixes, [StaleFrame(1, 1)])
+        self.assertTrue(any("double shots not checked" in n for n in found.notes))

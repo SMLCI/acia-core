@@ -230,7 +230,7 @@ class SequenceFile:
         """Resolve (once) the :class:`SlotMap` in effect, or ``None`` for raw order."""
         if self._fixes_resolved:
             return self._slot_map
-        from acia.segm.acquisition_fixes import SlotMap, coerce_slips, load_fixes
+        from acia.segm.acquisition_fixes import SlotMap, coerce_fixes, load_fixes
 
         multi = self.format in ("nd2", "czi")
         if self._fixes_arg is None:
@@ -243,7 +243,7 @@ class SequenceFile:
                     num_p=self._raw_num_positions(),
                 )
         else:
-            slips = coerce_slips(self._fixes_arg)
+            slips = coerce_fixes(self._fixes_arg)
             if slips and not multi:
                 raise ValueError(
                     f"acquisition_fixes only apply to multi-position ND2/CZI files, "
@@ -264,9 +264,10 @@ class SequenceFile:
 
     @property
     def acquisition_fixes(self) -> list:
-        """The :class:`~acia.segm.acquisition_fixes.AcquisitionSlip` s in effect."""
+        """The fixes in effect: slips, then stale frames (see
+        :mod:`acia.segm.acquisition_fixes`)."""
         slot_map = self._resolve_fixes()
-        return [] if slot_map is None else list(slot_map.slips)
+        return [] if slot_map is None else [*slot_map.slips, *slot_map.stale]
 
     def stage_positions(self) -> np.ndarray:
         """Recorded stage XY (µm) of every **raw** slot, shape ``(T, P, 2)``.

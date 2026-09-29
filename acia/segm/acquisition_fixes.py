@@ -18,6 +18,13 @@ Fixes are declared once in a JSON sidecar next to the raw file
 every stage reads the corrected order. :func:`detect_acquisition_slips` suggests
 fixes from the per-image stage XY metadata: a double shot is two consecutive raw
 slots at the same stage position.
+
+A second, different failure is a **stale frame** (:class:`StaleFrame`): the camera
+driver hands out its previous buffer again, so a raw slot holds a bit-identical
+copy of the image acquired just before it. Nothing is shifted -- only that one
+image is lost, and the position simply has no image at that timepoint (the
+remaining frames keep their true times). :func:`check_acquisition` finds both
+kinds in one pass: double shots from the stage XY, stale frames from the pixels.
 """
 
 from __future__ import annotations
@@ -26,7 +33,8 @@ import bisect
 import json
 import os
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import ClassVar
 
 import numpy as np
 
@@ -63,6 +71,47 @@ class AcquisitionSlip:
         return cls(int(t), int(position))
 
 
+@dataclass(frozen=True, order=True)
+class StaleFrame:
+    """A raw slot ``(t, position)`` holding a stale, bit-identical copy of the
+    image acquired just before it (the camera buffer was read twice).
+
+    Coordinates are raw, like :class:`AcquisitionSlip`; "just before" is the
+    previous slot in acquisition order -- ``(t, position - 1)``, or
+    ``(t - 1, P - 1)`` for ``position == 0`` (for a single-position file simply
+    the previous frame). Unlike a slip nothing shifts: the image of this slot is
+    lost, so the position has no frame at that timepoint.
+    """
+
+    t: int
+    position: int
+    kind: ClassVar[str] = "stale"
+
+    def to_dict(self) -> dict:
+        return {"t": int(self.t), "position": int(self.position), "kind": self.kind}
+
+
+def coerce_fix(value) -> AcquisitionSlip | StaleFrame:
+    """One fix from an instance, a ``(t, position)`` pair (a slip), or a dict.
+
+    A dict with ``"kind": "stale"`` is a :class:`StaleFrame`; anything else is an
+    :class:`AcquisitionSlip`, as it always was.
+    """
+    if isinstance(value, (AcquisitionSlip, StaleFrame)):
+        return value
+    if isinstance(value, dict) and value.get("kind") == StaleFrame.kind:
+        return StaleFrame(int(value["t"]), int(value["position"]))
+    return AcquisitionSlip.coerce(value)
+
+
+def coerce_fixes(values: Iterable) -> list:
+    """Normalize user input into sorted slips followed by sorted stale frames."""
+    fixes = [coerce_fix(v) for v in values]
+    slips = sorted(f for f in fixes if isinstance(f, AcquisitionSlip))
+    stale = sorted(f for f in fixes if isinstance(f, StaleFrame))
+    return [*slips, *stale]
+
+
 def coerce_slips(values: Iterable) -> list[AcquisitionSlip]:
     """Normalize user input into a sorted list of :class:`AcquisitionSlip`."""
     return sorted(AcquisitionSlip.coerce(v) for v in values)
@@ -74,17 +123,34 @@ class SlotMap:
     Args:
         num_t: raw number of timepoints ``T``.
         num_p: number of positions ``P``.
-        slips: the raw slots holding a repeated image.
+        slips: the fixes -- :class:`AcquisitionSlip` s (double shots, which shift
+            every later slot) and/or :class:`StaleFrame` s (single lost images).
 
     Raises:
-        ValueError: on a slip out of range, a duplicate, or a slip at ``(0, 0)``
+        ValueError: on a fix out of range, a duplicate, or one at ``(0, 0)``
             (the very first image has nothing to repeat).
     """
 
     def __init__(self, num_t: int, num_p: int, slips: Iterable) -> None:
         self.num_t = int(num_t)
         self.num_p = int(num_p)
-        self.slips = coerce_slips(slips)
+        fixes = coerce_fixes(slips)
+        self.slips = [f for f in fixes if isinstance(f, AcquisitionSlip)]
+        self.stale = [f for f in fixes if isinstance(f, StaleFrame)]
+        for f in self.stale:
+            if not (0 <= f.t < self.num_t and 0 <= f.position < self.num_p):
+                raise ValueError(
+                    f"stale frame {f} out of range for T={self.num_t}, P={self.num_p}"
+                )
+            if f.t == 0 and f.position == 0:
+                raise ValueError(
+                    "stale frame at (t=0, position=0) is impossible: the first "
+                    "image has no previous image to be a copy of"
+                )
+        if len(set(self.stale)) != len(self.stale):
+            raise ValueError(f"duplicate stale frames in {self.stale}")
+        self._stale_raw = {(f.t, f.position) for f in self.stale}
+        self._frames: dict[int, list[int]] = {}
         if len(set(self.slips)) != len(self.slips):
             raise ValueError(f"duplicate acquisition slips in {self.slips}")
         flat = []
@@ -119,10 +185,45 @@ class SlotMap:
                 break
         return divmod(k, self.num_p)
 
-    def size_t(self, p: int) -> int:
-        """Number of true timepoints of position ``p`` that have an image."""
+    def _nominal_size_t(self, p: int) -> int:
         # true flat indices t*P + p < n_true -> t < (n_true - p) / P
         return max(0, min(self.num_t, -(-(self._n_true - p) // self.num_p)))
+
+    def frames(self, p: int) -> list[int]:
+        """The true timepoints of position ``p`` that have an image, in order.
+
+        Without stale frames this is ``0 .. size_t - 1``; a stale frame's
+        timepoint is left out (its image is lost), so frame index and timepoint
+        differ after it.
+        """
+        if p not in self._frames:
+            self._frames[p] = [
+                t
+                for t in range(self._nominal_size_t(p))
+                if self.raw_slot(t, p) not in self._stale_raw
+            ]
+        return self._frames[p]
+
+    def size_t(self, p: int) -> int:
+        """Number of frames (true timepoints with an image) of position ``p``."""
+        if not self._stale_raw:
+            return self._nominal_size_t(p)
+        return len(self.frames(p))
+
+    def frame_raw_slot(self, frame: int, p: int) -> tuple[int, int] | None:
+        """The raw slot of frame index ``frame`` of position ``p`` (or ``None``)."""
+        if not self._stale_raw:
+            return self.raw_slot(frame, p)
+        frames = self.frames(p)
+        if not 0 <= frame < len(frames):
+            return None
+        return self.raw_slot(frames[frame], p)
+
+    def has_stale(self, p: int) -> bool:
+        """Whether position ``p`` lost an image to a stale frame."""
+        return (
+            len(self.frames(p)) < self._nominal_size_t(p) if self._stale_raw else False
+        )
 
     def shift_at(self, t: int, p: int) -> int:
         """How many slots the raw file is shifted at raw ``(t, p)`` (diagnostics)."""
@@ -142,7 +243,18 @@ class CorrectedPositionSource(ImageSequenceSource):
         self.position = int(position)
         self.slot_map = slot_map
         self.path = seqfile.path
-        self._init_calibration(frame_interval=seqfile._frame_interval)
+        interval = seqfile._frame_interval
+        if interval is not None and slot_map.has_stale(self.position):
+            # a lost (stale) image leaves a gap: every later frame keeps the time
+            # of the timepoint it was acquired at, not its shifted index
+            from acia.timing import to_quantity
+
+            self._init_calibration(
+                timepoints=to_quantity(interval)
+                * np.asarray(slot_map.frames(self.position), float)
+            )
+        else:
+            self._init_calibration(frame_interval=interval)
 
     def _raw(self):
         return self._file.raw_position(self.position)
@@ -192,7 +304,7 @@ class CorrectedPositionSource(ImageSequenceSource):
 
     def raw_slot(self, frame: int) -> tuple[int, int]:
         """The raw ``(t, position)`` that true ``frame`` is read from."""
-        slot = self.slot_map.raw_slot(frame, self.position)
+        slot = self.slot_map.frame_raw_slot(frame, self.position)
         if slot is None or frame < 0:
             raise IndexError(f"frame {frame} out of range for size_t={self.size_t}")
         return slot
@@ -242,7 +354,8 @@ def preview_slip(seqfile, slip, *, downscale: int = 8, channel: int = 0):
 
     from acia.notebook import normalize_to_uint8
 
-    slip = AcquisitionSlip.coerce(slip)
+    slip = coerce_fix(slip)
+    repeat_label = " (stale copy)" if isinstance(slip, StaleFrame) else " (repeat)"
     num_p = seqfile.num_positions
     num_slots = seqfile.metadata.num_timepoints * num_p
     k = slip.t * num_p + slip.position
@@ -255,7 +368,7 @@ def preview_slip(seqfile, slip, *, downscale: int = 8, channel: int = 0):
         raw = np.asarray(seqfile.raw_position(p).get_frame(t).raw)
         plane = raw[..., channel] if raw.ndim == 3 else raw
         tiles.append(normalize_to_uint8(plane[::downscale, ::downscale]))
-        labels.append(f"t={t} pos={p}" + (" (repeat)" if slot == k else ""))
+        labels.append(f"t={t} pos={p}" + (repeat_label if slot == k else ""))
 
     band, gap = 14, 8
     height = max(t.shape[0] for t in tiles)
@@ -309,8 +422,10 @@ def has_fixes(path: str | os.PathLike) -> bool:
 
 def load_fixes(
     path: str | os.PathLike, *, num_t: int | None = None, num_p: int | None = None
-) -> list[AcquisitionSlip]:
-    """Read the slips from the sidecar next to ``path`` (``[]`` if there is none).
+) -> list:
+    """Read the fixes (slips, then stale frames) from the sidecar next to ``path``.
+
+    ``[]`` if there is none.
 
     Args:
         path: the raw acquisition (not the sidecar itself).
@@ -336,7 +451,12 @@ def load_fixes(
                 f"{side!r} was written for {key}={expected}, but the file has "
                 f"{key}={actual}; it does not belong to this acquisition"
             )
-    return coerce_slips(data.get("slips", []))
+    return coerce_fixes(
+        [
+            *data.get("slips", []),
+            *(dict(f, kind=StaleFrame.kind) for f in data.get("stale_frames", [])),
+        ]
+    )
 
 
 def save_fixes(
@@ -361,13 +481,16 @@ def save_fixes(
 
         with open_sequence(path, acquisition_fixes=[]) as seqfile:
             num_t, num_p = seqfile.metadata.num_timepoints, seqfile.num_positions
-    slip_list = SlotMap(num_t, num_p, slips).slips  # validates
+    slot_map = SlotMap(num_t, num_p, slips)  # validates
     side = sidecar_path(path)
     payload = {
         "version": _SCHEMA_VERSION,
         "source": os.path.basename(path),
         "sizes": {"T": int(num_t), "P": int(num_p)},
-        "slips": [s.to_dict() for s in slip_list],
+        "slips": [s.to_dict() for s in slot_map.slips],
+        "stale_frames": [
+            {"t": int(f.t), "position": int(f.position)} for f in slot_map.stale
+        ],
         "note": note,
     }
     with _open(side, "w") as fh:
@@ -522,9 +645,143 @@ def detect_acquisition_slips(
 
 
 # --------------------------------------------------------------------------- #
+# the combined check: double shots (stage XY) + stale frames (pixels)
+# --------------------------------------------------------------------------- #
+@dataclass
+class AcquisitionCheck:
+    """What :func:`check_acquisition` found. Nothing is applied.
+
+    Attributes:
+        fixes: the suggested fixes -- :class:`AcquisitionSlip` s (double shots)
+            then :class:`StaleFrame` s -- ready for ``acquisition_fixes`` or
+            :func:`save_fixes`.
+        duplicates: ``(position, same_as)`` pairs of a point list holding one
+            spot twice (see :func:`detect_duplicate_positions`); not fixes.
+        notes: why a part of the check could not run (e.g. no stage metadata).
+    """
+
+    fixes: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+    @property
+    def slips(self) -> list[AcquisitionSlip]:
+        return [f for f in self.fixes if isinstance(f, AcquisitionSlip)]
+
+    @property
+    def stale_frames(self) -> list[StaleFrame]:
+        return [f for f in self.fixes if isinstance(f, StaleFrame)]
+
+
+def _same_pixels(a: np.ndarray, b: np.ndarray) -> bool:
+    """Bit-identical? A strided sample first, so different images exit early."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    step = max(1, a.shape[0] // 16)
+    if not np.array_equal(a[::step, ::step], b[::step, ::step]):
+        return False
+    return bool(np.array_equal(a, b))
+
+
+def _identical_consecutive_frames(
+    seqfile, *, progress: bool = True
+) -> list[StaleFrame]:
+    """Raw slots whose image is a bit-identical copy of the slot before them.
+
+    Reads every image once, in acquisition order (time outer, position inner),
+    keeping only the previous image in memory. Two real exposures always differ
+    by sensor noise, so exact equality means a re-delivered camera buffer.
+    """
+    from tqdm.auto import tqdm
+
+    num_p = seqfile.num_positions
+    num_t = int(seqfile.metadata.num_timepoints)
+    found = []
+    previous = None
+    with tqdm(
+        total=num_t * num_p,
+        desc="comparing consecutive images",
+        unit="image",
+        disable=not progress,
+    ) as bar:
+        for t in range(num_t):
+            for p in range(num_p):
+                current = np.asarray(seqfile.raw_position(p).get_frame(t).raw)
+                if previous is not None and _same_pixels(previous, current):
+                    found.append(StaleFrame(t, p))
+                previous = current
+                bar.update(1)
+    return found
+
+
+def check_acquisition(
+    seqfile,
+    *,
+    tol_um: float = 2.0,
+    min_fraction: float = 0.8,
+    pixels: bool = True,
+    progress: bool = True,
+) -> AcquisitionCheck:
+    """Look for double shots (stage XY) and stale frames (pixels) in one pass.
+
+    * **Double shot** (:class:`AcquisitionSlip`): two consecutive raw slots at the
+      same stage position -- the rest of the file is shifted by one slot. Needs
+      per-image stage XY and at least two positions; otherwise that part is
+      skipped with a note.
+    * **Stale frame** (:class:`StaleFrame`): a raw slot bit-identical to the one
+      before it -- the camera buffer was read twice; only that image is lost.
+      Reads every image once (with a progress bar), so it takes a while on a
+      large file.
+
+    A slot flagged by both is reported as a double shot (the stage evidence is
+    the stronger one), since a re-delivered buffer would show the *next*
+    position's stage.
+
+    Args:
+        seqfile: the :class:`~acia.segm.open.SequenceFile`, opened in raw order
+            (``acquisition_fixes=[]``) so the file's own slots are checked.
+        tol_um, min_fraction: see :func:`detect_acquisition_slips`.
+        pixels: also run the pixel comparison (the slow part).
+        progress: show a progress bar for the pixel comparison.
+
+    Returns:
+        An :class:`AcquisitionCheck`; nothing is applied.
+    """
+    import warnings
+
+    result = AcquisitionCheck()
+    try:
+        result.duplicates = detect_duplicate_positions(
+            seqfile, tol_um=tol_um, min_fraction=min_fraction
+        )
+        with warnings.catch_warnings():
+            # the duplicates are returned above; no need to warn about them too
+            warnings.simplefilter("ignore", UserWarning)
+            slips = detect_acquisition_slips(
+                seqfile, tol_um=tol_um, min_fraction=min_fraction
+            )
+    except ValueError as exc:
+        slips = []
+        result.notes.append(f"double shots not checked: {exc}")
+
+    stale: list[StaleFrame] = []
+    if pixels:
+        slip_slots = {(s.t, s.position) for s in slips}
+        stale = [
+            f
+            for f in _identical_consecutive_frames(seqfile, progress=progress)
+            if (f.t, f.position) not in slip_slots
+        ]
+    else:
+        result.notes.append("stale frames not checked (pixels=False)")
+    result.fixes = coerce_fixes([*slips, *stale])
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # manifests
 # --------------------------------------------------------------------------- #
-def manifest_fixes(source_block: dict) -> list[AcquisitionSlip] | None:
+def manifest_fixes(source_block: dict) -> list | None:
     """The fixes a manifest's ``source`` block was recorded under.
 
     ``None`` for a manifest written before fixes existed, so reopening it falls
@@ -532,7 +789,7 @@ def manifest_fixes(source_block: dict) -> list[AcquisitionSlip] | None:
     """
     if "acquisition_fixes" not in source_block:
         return None
-    return coerce_slips(source_block["acquisition_fixes"] or [])
+    return coerce_fixes(source_block["acquisition_fixes"] or [])
 
 
 def warn_on_fixes_mismatch(source_block: dict, seqfile) -> None:
