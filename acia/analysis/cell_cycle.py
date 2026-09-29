@@ -259,6 +259,98 @@ def plot_cycle_distribution(
     return fig
 
 
+def _as_floats(values, unit: str | None = None) -> tuple[np.ndarray, str]:
+    """Float magnitudes (NaNs dropped) and unit of a pint/plain series or array."""
+    if isinstance(values, pd.Series) and _is_pint_column(values):
+        values = values.values.quantity
+    if hasattr(values, "magnitude") and hasattr(values, "units"):
+        if unit:
+            values = values.to(unit)
+        unit = str(values.units)
+        values = values.magnitude
+    arr = np.asarray(values, dtype=float)
+    return arr[~np.isnan(arr)], unit or ""
+
+
+def plot_cycle_violins(
+    groups: dict,
+    *,
+    unit: str | None = None,
+    ax: Axes | None = None,
+    value_label: str | None = None,
+    jitter: float = 0.08,
+    random_state=0,
+) -> Figure:
+    """Several distributions side by side: a violin plus every value as a point.
+
+    Args:
+        groups: ``{label: values}`` -- pint Series/Quantity (converted to
+            ``unit``), plain Series or arrays. NaNs are dropped; the label shows
+            the number of values.
+        unit: common unit of the pint values (e.g. ``"1/hour"``).
+        ax: axes to draw into; a new figure is created when ``None``.
+        value_label: y-axis label; defaults to the unit.
+
+    Returns:
+        The matplotlib figure (not shown).
+    """
+    fig, ax = _axes(ax, figsize=(1.6 + 1.4 * len(groups), 3.5))
+    rng = np.random.default_rng(random_state)
+    labels, seen_unit = [], unit or ""
+    for i, (label, values) in enumerate(groups.items(), start=1):
+        v, u = _as_floats(values, unit)
+        seen_unit = seen_unit or u
+        if len(v) > 1:
+            parts = ax.violinplot(v, positions=[i], showmeans=True, showextrema=False)
+            for body in list(parts["bodies"]):  # type: ignore[call-overload]
+                body.set_alpha(0.35)
+        ax.scatter(
+            i + rng.uniform(-jitter, jitter, size=len(v)),
+            v,
+            s=10,
+            color=VALID_COLOR,
+            alpha=0.6,
+            zorder=3,
+        )
+        labels.append(f"{label}\n(n = {len(v)})")
+    ax.set_xticks(range(1, len(labels) + 1), labels)
+    ax.set_ylabel(value_label or (f"[{seen_unit}]" if seen_unit else ""))
+    fig.tight_layout()
+    return fig
+
+
+def pick_percentile_cells(
+    df: pd.DataFrame,
+    value_col: str = "mu_fit",
+    percentiles=(0, 50, 100),
+    *,
+    exclude_flagged: bool = True,
+) -> pd.DataFrame:
+    """The cells whose value lies closest to each percentile of the population.
+
+    Only valid cells (``valid`` column, if present) with a value are
+    considered; with ``exclude_flagged`` also cells whose growth fit was
+    flagged (``fit_outlier``) are left out, so the examples show real cells,
+    not artifacts. P0 and P100 are the smallest and largest value.
+
+    Returns:
+        One row per percentile: ``percentile``, ``tracklet`` (the df index)
+        and ``value`` -- empty when no cell qualifies.
+    """
+    values, _ = _column(df, value_col)
+    ok = _valid_mask(df) & ~np.isnan(values)
+    if exclude_flagged and "fit_outlier" in df.columns:
+        ok &= ~np.asarray(df["fit_outlier"], dtype=bool)
+    idx, v = df.index[ok], values[ok]
+    rows = []
+    if len(v):
+        for pct in percentiles:
+            target = np.percentile(v, pct)
+            i = int(np.argmin(np.abs(v - target)))
+            rows.append({"percentile": pct, "tracklet": idx[i], "value": float(v[i])})
+    return pd.DataFrame(rows, columns=["percentile", "tracklet", "value"])
+
+
 def summarize(values, unit: str | None = None) -> dict[str, Any]:
     """``n``, mean, sample std (ddof=1), median and SEM of a set of values.
 
