@@ -358,6 +358,36 @@ class CZISequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         except Exception:  # noqa: BLE001 - metadata is best-effort
             return None
 
+    def stage_xyz(self, frame: int) -> tuple[float, float, float | None] | None:
+        """Recorded stage X, Y (µm) and focus Z (µm) of ``(scene, frame)``.
+
+        Like :meth:`stage_xy`, from the subblock metadata only; Z is the
+        subblock's ``FocusPosition`` (or ``StageZPosition``) and ``None`` if the
+        file records neither. ``None`` if XY is unknown.
+        """
+        xy = self.stage_xy(frame)
+        if xy is None:
+            return None
+        z: float | None = None
+        try:
+            import xml.etree.ElementTree as ET
+
+            assert self._reader is not None
+            constraints = self._build_constraints(frame)
+            if "C" in self._dims:
+                constraints["C"] = 0
+            blocks = self._reader.read_subblock_metadata(**constraints)
+            if blocks:
+                root = ET.fromstring(blocks[0][1])
+                for tag in ("FocusPosition", "StageZPosition"):
+                    el = root.find(f".//{tag}")
+                    if el is not None and el.text and np.isfinite(float(el.text)):
+                        z = float(el.text)
+                        break
+        except Exception:  # noqa: BLE001 - metadata is best-effort
+            z = None
+        return (xy[0], xy[1], z)
+
     # --- axis-name mapping -----------------------------------------------------
 
     def _build_constraints(self, frame: int) -> dict[str, int]:

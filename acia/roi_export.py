@@ -34,6 +34,22 @@ Positions are **1-based** wherever a person reads them -- file names
 ``roi_export.json`` -- to match how Nikon NIS-Elements and Zeiss ZEN number
 them. The manifest (``selection.json``) keeps the 0-based position index.
 
+Which index starts where:
+
+==============  ==========  ===================================================
+index           first       where
+==============  ==========  ===================================================
+position        1           dashboard (``pos 001``), file names, log lines,
+                            ``roi_export.json`` (``position``)
+position index  0           ``selection.json``, ``acquisition_fixes``,
+                            ``roi_export.json`` (``position_index``), Python API
+ROI number      1           file names (``roi001``), ``roi_export.json``
+frame / t       0           everywhere: dashboard frame bar, ``anchor_frame``,
+                            ``max_frames``, ``acquisition_fixes`` ``(t, ...)``,
+                            the ``frame`` column of every table
+time            0 min       the first frame is at t = 0
+==============  ==========  ===================================================
+
 Next to the TIFFs, :func:`export_rois` writes ``roi_export.json``: where the
 export came from (the ``.nd2``/``.czi`` file, which names the *experiment*),
 how it was made, and which file holds which ROI. Batch analysis reads it to name
@@ -44,6 +60,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -121,6 +138,7 @@ def export_rois(
     compression: str | int | None = "zlib",
     progress: bool = True,
     experiment: str | None = None,
+    verbose: bool = False,
 ) -> list[str]:
     """Crop every selection to its own TIFF, optionally registering each position.
 
@@ -152,7 +170,11 @@ def export_rois(
             ``'warn'`` or ``'error'``.
         ome: write OME-TIFF rather than an ImageJ hyperstack.
         compression: passed to :func:`~acia.segm.tiff_export.save_tiff_stack`.
-        progress: show progress bars and per-position reports.
+        progress: show progress bars and one report line per position (plus
+            a final summary). Per-frame registration warnings are folded into
+            that line instead of being printed one by one.
+        verbose: also print the per-ROI details (how far each ROI was moved
+            onto the corrected view, the exclusion-rectangle note).
         experiment: name recorded in ``roi_export.json``, used by batch
             analysis to name this export's output folder; defaults to the raw
             file's stem.
@@ -178,6 +200,7 @@ def export_rois(
     )
     output_dir = os.fspath(output_dir)
     say = tqdm.write if progress else lambda *a, **k: None
+    detail = say if verbose else lambda *a, **k: None
 
     by_position: dict[int, list] = {}
     for sel in manifest.selections:
@@ -234,6 +257,7 @@ def export_rois(
                     registration_method_name,
                     method_kwargs,
                     say,
+                    detail,
                 )
                 pos_source = pos_source.register(
                     record.transforms, on_missing=on_missing
@@ -256,7 +280,7 @@ def export_rois(
                 if record is not None:
                     spec, note = _spec_for_registered(sel, record, frame_shape)
                     if note:
-                        say(f"  pos {position + 1} roi {roi_nb}: {note}")
+                        detail(f"  pos {position + 1} roi {roi_nb}: {note}")
                 filename = naming_template.format(
                     position=position + 1,
                     position_index=position,
@@ -264,13 +288,20 @@ def export_rois(
                     label=sel.label,
                     id=sel.id,
                 )
-                path = save_tiff_stack(
-                    pos_source.crop_rotated(spec),
-                    os.path.join(output_dir, filename),
-                    ome=ome,
-                    compression=compression,
-                    channel_names=manifest.source.get("channels"),
-                )
+                with warnings.catch_warnings():
+                    # one warning per frame without its own transform -- they
+                    # are counted once per position below instead
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="RegisteredSequenceSource: no stored correction",
+                    )
+                    path = save_tiff_stack(
+                        pos_source.crop_rotated(spec),
+                        os.path.join(output_dir, filename),
+                        ome=ome,
+                        compression=compression,
+                        channel_names=manifest.source.get("channels"),
+                    )
                 written.append(path)
                 exported.append(
                     {
@@ -283,7 +314,19 @@ def export_rois(
                         "anchor_frame": getattr(sel, "anchor_frame", 0),
                     }
                 )
-                say(f"wrote {path}")
+            missing = sorted(getattr(pos_source, "_missing", ()) or ())
+            if missing:
+                shown = ", ".join(str(t) for t in missing[:5])
+                more = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+                action = (
+                    "corrected with the nearest frame's transform"
+                    if on_missing == "nearest"
+                    else "exported uncorrected"
+                )
+                say(
+                    f"pos {position + 1}: {len(missing)} frame(s) had no transform "
+                    f"of their own and were {action}: {shown}{more}"
+                )
     finally:
         if reg_bar is not None:
             reg_bar.close()
@@ -423,13 +466,22 @@ def _register_position(
     method_name,
     method_kwargs,
     say,
+    detail=None,
 ):
-    """Register one position and return its record, reporting how it went."""
+    """Register one position and return its record, reporting how it went.
+
+    Per-frame low-confidence warnings are silenced here: the one report line
+    per position (:func:`_report_registration`) already counts them and names
+    the worst frame.
+    """
+    from acia.registration import LowConfidenceWarning
+
+    detail = detail or (lambda *a, **k: None)
     pos_kwargs = None
     if exclude_rois:
         anchors = sorted({getattr(s, "anchor_frame", 0) for s in sels})
         if any(anchors):
-            say(
+            detail(
                 f"pos {position + 1}: exclusion rectangles use as-drawn coordinates "
                 f"(anchor frames {anchors}); they are approximate by the drift at "
                 "those frames."
@@ -439,12 +491,14 @@ def _register_position(
             "exclude_shrink_px": exclude_shrink_px,
         }
 
-    reg_dash.batch_apply(
-        directory=output_dir,
-        positions=[position],
-        sources={position: pos_source},
-        method_kwargs=pos_kwargs,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", LowConfidenceWarning)
+        reg_dash.batch_apply(
+            directory=output_dir,
+            positions=[position],
+            sources={position: pos_source},
+            method_kwargs=pos_kwargs,
+        )
     record = next(r for r in reg_dash.manifest.records if r.position == position)
     _report_registration(
         position,

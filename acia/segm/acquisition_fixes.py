@@ -208,6 +208,17 @@ class CorrectedPositionSource(ImageSequenceSource):
         xy = self._file.raw_position(p_raw).stage_xy(t_raw)
         return None if xy is None else (float(xy[0]), float(xy[1]))
 
+    def stage_xyz(self, frame: int) -> tuple[float, float, float | None] | None:
+        """Recorded stage X, Y, Z of the image behind true ``frame`` (µm), if known."""
+        t_raw, p_raw = self.raw_slot(frame)
+        raw = self._file.raw_position(p_raw)
+        getter = getattr(raw, "stage_xyz", None)
+        if getter is not None:
+            xyz = getter(t_raw)
+            return None if xyz is None else (float(xyz[0]), float(xyz[1]), xyz[2])
+        xy = raw.stage_xy(t_raw)
+        return None if xy is None else (float(xy[0]), float(xy[1]), None)
+
 
 def preview_slip(seqfile, slip, *, downscale: int = 8, channel: int = 0):
     """The raw slots before / at / after ``slip``, side by side and labelled.

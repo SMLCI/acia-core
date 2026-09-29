@@ -8,6 +8,7 @@ import inspect
 import io
 import logging
 import os
+import shutil
 import time
 from typing import TYPE_CHECKING
 
@@ -1130,13 +1131,15 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
 .acia-sd .sd-hint{font-size:12px;letter-spacing:normal;text-transform:none;cursor:help;
   color:var(--text-dim);}
 .acia-sd .sd-crop{width:100%;height:auto;display:block;border-radius:6px;background:var(--panel-3);}
+.acia-sd .sd-loupe{width:100%;max-width:280px;aspect-ratio:1/1;display:block;border-radius:6px;
+  background:var(--panel-3);image-rendering:pixelated;cursor:zoom-in;}
 .acia-sd .sd-frbar{display:flex;align-items:center;gap:8px;padding:7px 14px;flex:none;
   border-top:1px solid var(--border);background:var(--panel-2);
   font-family:var(--font-mono);font-size:11px;color:var(--text-dim);}
 .acia-sd .sd-frbar input[type=range]{flex:1;min-width:120px;vertical-align:middle;}
 .acia-sd .sd-frbar .sd-frbtn{padding:2px 7px;font-size:12px;line-height:1.2;}
 .acia-sd .sd-frbar .sd-frnum{width:64px;font-family:var(--font-mono);font-size:11px;}
-.acia-sd .sd-frbar .sd-frlbl,.acia-sd .sd-frbar .sd-frhint{flex:none;white-space:nowrap;}
+.acia-sd .sd-frbar .sd-frlbl,.acia-sd .sd-frbar .sd-frhint,.acia-sd .sd-frbar .sd-frstage{flex:none;white-space:nowrap;}
 .acia-sd .sd-tools{display:flex;gap:8px;align-items:center;padding:9px 12px;border-top:1px solid var(--border);
   background:var(--panel-2);flex-wrap:wrap;}
 .acia-sd button{border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:7px;
@@ -1218,7 +1221,10 @@ function render({ model, el }) {
         "<span class='sd-hint' title='Delete/Backspace removes the active ROI; Ctrl/Cmd+C duplicates it (multi mode) -- hover the widget for shortcuts to apply'>⌨</span></h3>" +
         "<div class='sd-spec'>no ROI selected</div></div>" +
         "<div class='sd-card sd-crop-card' hidden><h3>Crop Preview</h3>" +
-        "<canvas class='sd-crop'></canvas></div></div></div>" +
+        "<canvas class='sd-crop'></canvas></div>" +
+        "<div class='sd-card sd-loupe-card' hidden><h3>Loupe <span class='sd-loupe-z'></span>" +
+        "<span class='sd-hint' title='Magnified view around the pointer while fitting points. +/- or the mouse wheel over the loupe change the zoom.'>&#9432;</span></h3>" +
+        "<canvas class='sd-loupe' width='280' height='280'></canvas></div></div></div>" +
         "<div class='sd-frbar'>frame " +
         "<button class='sd-frbtn' data-step='first' title='First frame'>⏮</button>" +
         "<button class='sd-frbtn' data-step='-1' title='Previous frame (←, Shift+← = 10)'>◀</button>" +
@@ -1227,7 +1233,10 @@ function render({ model, el }) {
         "<button class='sd-frbtn' data-step='last' title='Last frame'>⏭</button>" +
         "<input type='number' class='sd-frnum' min='0' max='" + (NT - 1) + "' value='" + FRAME0 + "' title='Type a frame number and press Enter'>" +
         " <span class='sd-frlbl'>/ " + (NT - 1) + "</span>" +
-        " <span class='sd-frhint' title='An ROI you draw or edit here is anchored to this frame. " +
+        " <span class='sd-frstage' title='Stage position recorded for this image (from the file metadata). A jump against the neighbouring frames hints at a double shot.'></span>" +
+        " <span class='sd-frhint' title='Frames are numbered from 0 (as in the Python API and every table); " +
+        "positions from 1 (pos 001 = the file&#39;s first position, as in NIS-Elements/ZEN; its index in selection.json is 0). " +
+        "An ROI you draw or edit here is anchored to this frame. " +
         "The anchor is saved in selection.json and used to place the crop correctly after drift " +
         "correction. A dashed, greyed box was annotated on a different frame -- move it to re-anchor " +
         "it here.'>· ROI anchor &#9432;</span></div>" +
@@ -1299,20 +1308,28 @@ function render({ model, el }) {
       if (cb && buffers && buffers[0]) cb(blobUrl(buffers[0]));
       thumbInFlight--; pumpThumbQueue();
     } else if (msg.type === "frame") {
-      clearTimeout(frameTimer);
-      if (buffers && buffers[0]) { frameImgPos = msg.pos; frameImg.src = blobUrl(buffers[0]); }
+      frameInFlight = false;
+      if (buffers && buffers[0]) {
+        const entry = { url: blobUrl(buffers[0]), stage: msg.stage || null };
+        cachePut(frameKey(msg.pos, msg.t), entry);
+        // a reply for a frame the user has already moved past is only cached
+        if (msg.pos === currentPos && msg.t === frame) { clearTimeout(frameTimer); showFrame(msg.pos, entry); }
+      }
+      pumpFrame();
     } else if (msg.type === "error") {
       if (msg.kind === "thumb") {
         delete pending["t" + msg.pos];
         thumbInFlight--; pumpThumbQueue();
         return;
       }
-      if (msg.kind === "frame" && msg.pos === currentPos) {
+      if (msg.kind === "frame") frameInFlight = false;
+      if (msg.kind === "frame" && msg.pos === currentPos && (msg.t === undefined || msg.t === frame)) {
         clearTimeout(frameTimer);
         showStatus("Error loading " + posLabel(msg.pos) + ": " + (msg.message || "failed to load"), true);
-        frameImgPos = -1; renderSpec();
+        frameImgPos = -1; renderSpec(); pumpFrame();
         return;
       }
+      if (msg.kind === "frame") { pumpFrame(); return; }
       if (msg.kind === "fit" && picking) {
         // surfaced persistently in the readout (not a fleeting toast) and
         // reset for a fresh 4-point attempt, instead of leaving the counter
@@ -1400,12 +1417,52 @@ function render({ model, el }) {
     if (next === frame) { setFrame(next); return; }
     setFrame(next); requestFrame(); renderEditor();
   }
-  let frameTimer = null;
-  function requestFrame() {
-    clearTimeout(frameTimer);
-    hideStatus();
-    frameTimer = setTimeout(() => showStatus("Loading " + posLabel(currentPos) + "…", false), 150);
-    model.send({ type: "frame", pos: currentPos, t: frame });
+  // ---- frame loading: one request in flight, latest wins, small cache ----
+  // Every slider step used to send its own request and every reply was shown
+  // in turn, so a drag replayed all intermediate frames through the kernel.
+  // Now: a short debounce for the slider, at most one request on the wire,
+  // only the newest wanted frame queued behind it, and the last
+  // FRAME_CACHE_MAX frames kept so jumping back and forth needs no reload.
+  const FRAME_CACHE_MAX = 20, FRAME_DEBOUNCE_MS = 100;
+  const frameCache = new Map();   // "pos:t" -> {url, stage}, oldest first
+  let frameTimer = null, frameDebounce = null, frameInFlight = false, frameWanted = null;
+  const frameKey = (p, t) => p + ":" + t;
+  function cachePut(key, entry) {
+    const old = frameCache.get(key);
+    if (old && old.url !== entry.url && old.url !== frameImg.src) URL.revokeObjectURL(old.url);
+    frameCache.delete(key); frameCache.set(key, entry);
+    for (const [k, e] of frameCache) {
+      if (frameCache.size <= FRAME_CACHE_MAX) break;
+      if (e.url === frameImg.src) continue;  // never revoke what is on screen
+      frameCache.delete(k); URL.revokeObjectURL(e.url);
+    }
+  }
+  function showFrame(pos, entry) {
+    frameImgPos = pos; frameImg.src = entry.url; showStage(entry.stage);
+  }
+  function showStage(st) {
+    const el = $(".sd-frstage"); if (!el) return;
+    const f = (v) => (v === null || v === undefined) ? null : (+v).toFixed(1);
+    el.textContent = st ? ("x " + f(st.x) + " · y " + f(st.y) + (f(st.z) !== null ? " · z " + f(st.z) : "") + " µm") : "";
+  }
+  function pumpFrame() {
+    if (frameInFlight || !frameWanted) return;
+    const { pos, t } = frameWanted; frameWanted = null;
+    const hit = frameCache.get(frameKey(pos, t));
+    if (hit) { cachePut(frameKey(pos, t), hit); if (pos === currentPos && t === frame) showFrame(pos, hit); return pumpFrame(); }
+    frameInFlight = true;
+    clearTimeout(frameTimer); hideStatus();
+    frameTimer = setTimeout(() => showStatus("Loading " + posLabel(pos) + "…", false), 150);
+    model.send({ type: "frame", pos: pos, t: t });
+  }
+  function requestFrame(debounce) {
+    clearTimeout(frameDebounce);
+    const go = () => {
+      const hit = frameCache.get(frameKey(currentPos, frame));
+      if (hit) { clearTimeout(frameTimer); hideStatus(); cachePut(frameKey(currentPos, frame), hit); showFrame(currentPos, hit); return; }
+      frameWanted = { pos: currentPos, t: frame }; pumpFrame();
+    };
+    if (debounce) frameDebounce = setTimeout(go, FRAME_DEBOUNCE_MS); else go();
   }
   function renderEditor() {
     wrap.querySelectorAll(".roi:not(.preview)").forEach((n) => n.remove());
@@ -1432,8 +1489,61 @@ function render({ model, el }) {
     $(".sd-epos").textContent = posLabel(currentPos);
     renderSpec(); renderLabel();
   }
+  // ---- loupe (point fitting): magnified view around the pointer ----
+  // Sits in the side panel, in place of the crop preview (irrelevant while
+  // picking), so it never covers the spot about to be clicked.
+  const LOUPE_PX = 280, LOUPE_ZOOMS = [2, 3, 4, 6, 8];
+  let loupeZoom = 4, loupePt = null;
+  function setLoupeZoom(z) {
+    loupeZoom = Math.max(LOUPE_ZOOMS[0], Math.min(LOUPE_ZOOMS[LOUPE_ZOOMS.length - 1], z));
+    drawLoupe();
+  }
+  function stepLoupeZoom(dir) {
+    const i = LOUPE_ZOOMS.indexOf(loupeZoom);
+    setLoupeZoom(LOUPE_ZOOMS[Math.max(0, Math.min(LOUPE_ZOOMS.length - 1, (i < 0 ? 2 : i) + dir))]);
+  }
+  function drawLoupe() {
+    const card = $(".sd-loupe-card");
+    if (!picking || !frameImg.complete || !frameImg.naturalWidth || frameImgPos !== currentPos) { card.hidden = true; return; }
+    card.hidden = false;
+    $(".sd-loupe-z").textContent = "×" + loupeZoom;
+    const cv = $(".sd-loupe"), ctx = cv.getContext("2d"), c = LOUPE_PX / 2;
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = "#9aa0a4"; ctx.fillRect(0, 0, LOUPE_PX, LOUPE_PX);
+    if (!loupePt) {
+      ctx.fillStyle = "#333"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("move the pointer over the image", c, c); return;
+    }
+    const [ix, iy] = loupePt, half = c / loupeZoom;
+    // draw only the part of the source rectangle that lies inside the image,
+    // at the matching place in the loupe (drawImage does not clip for us everywhere)
+    const sx0 = Math.max(0, ix - half), sy0 = Math.max(0, iy - half);
+    const sx1 = Math.min(frameImg.naturalWidth, ix + half), sy1 = Math.min(frameImg.naturalHeight, iy + half);
+    if (sx1 > sx0 && sy1 > sy0)
+      ctx.drawImage(frameImg, sx0, sy0, sx1 - sx0, sy1 - sy0,
+        c + (sx0 - ix) * loupeZoom, c + (sy0 - iy) * loupeZoom, (sx1 - sx0) * loupeZoom, (sy1 - sy0) * loupeZoom);
+    // points already placed
+    ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 2;
+    points.forEach((p) => { ctx.beginPath();
+      ctx.arc(c + (p[0] - ix) * loupeZoom, c + (p[1] - iy) * loupeZoom, 6, 0, 2 * Math.PI); ctx.stroke(); });
+    // crosshair: the pixel a click would place
+    ctx.strokeStyle = "rgba(255,255,0,0.9)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(c, 0); ctx.lineTo(c, c - 6); ctx.moveTo(c, c + 6); ctx.lineTo(c, LOUPE_PX);
+    ctx.moveTo(0, c); ctx.lineTo(c - 6, c); ctx.moveTo(c + 6, c); ctx.lineTo(LOUPE_PX, c); ctx.stroke();
+  }
+  wrap.addEventListener("pointermove", (ev) => {
+    if (!picking) return;
+    const r = wrap.getBoundingClientRect();
+    loupePt = [I(ev.clientX - r.left), I(ev.clientY - r.top)]; drawLoupe();
+  });
+  wrap.addEventListener("pointerleave", () => { if (picking) { loupePt = null; drawLoupe(); } });
+  $(".sd-loupe").addEventListener("wheel", (e) => {
+    e.preventDefault(); stepLoupeZoom(e.deltaY < 0 ? 1 : -1);
+  }, { passive: false });
+
   function renderSpec() {
     const box = $(".sd-spec");
+    drawLoupe();
     if (picking) { box.textContent = pickHint(); renderCropPreview(null); return; }
     const sel = selections.find((x) => x.id === activeId);
     if (!sel || sel.position !== currentPos) { box.textContent = "no ROI selected"; renderCropPreview(null); return; }
@@ -1655,7 +1765,7 @@ function render({ model, el }) {
   }
   function enterPick() { picking = true; points = []; fitting = false; pickError = null; activeId = null;
     wrap.classList.add("pick"); renderEditor(); drawPick(); $(".sd-point").classList.add("on"); }
-  function exitPick() { picking = false; points = []; fitting = false;
+  function exitPick() { picking = false; points = []; fitting = false; loupePt = null;
     wrap.classList.remove("pick"); wrap.querySelectorAll(".ptmark").forEach((n) => n.remove());
     $(".sd-point").classList.remove("on"); }
   wrap.addEventListener("click", (ev) => {
@@ -1715,7 +1825,7 @@ function render({ model, el }) {
   }
   document.addEventListener("fullscreenchange", onFsChange);
   $(".sd-frame").addEventListener("input", (e) => {
-    setFrame(e.target.value); requestFrame(); renderEditor(); });
+    setFrame(e.target.value); requestFrame(true); renderEditor(); });
   root.querySelectorAll(".sd-frbtn").forEach((b) => { b.onclick = () => goFrame(b.dataset.step); });
   // jump on Enter or when the field loses focus (change); an empty or
   // out-of-range entry is clamped by setFrame
@@ -1751,7 +1861,13 @@ function render({ model, el }) {
   root.addEventListener("pointerenter", () => { hovering = true; });
   root.addEventListener("pointerleave", () => { hovering = false; });
   function onKeyDown(ev) {
-    if (!hovering || picking) return;
+    if (!hovering) return;
+    if (picking) {
+      // while fitting points only the loupe zoom is bound (+ / -)
+      if (ev.key === "+" || ev.key === "=") { ev.preventDefault(); stepLoupeZoom(1); }
+      else if (ev.key === "-") { ev.preventDefault(); stepLoupeZoom(-1); }
+      return;
+    }
     const t = ev.target;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
     // frame stepping works without an active ROI
@@ -2850,6 +2966,24 @@ if _HAS_ANYWIDGET:
                 "</p></div>"
             )
 
+    def _same_source(source_block: dict, seqfile) -> bool:
+        """Whether a manifest's ``source`` block describes ``seqfile``'s raw file.
+
+        Matched by file name and, when both are known, by size -- the path itself
+        may legitimately differ (a share mounted elsewhere, a moved folder).
+        """
+        path = str(getattr(seqfile, "path", "") or "")
+        recorded = str(source_block.get("path") or "")
+        if not recorded or not path:
+            return True
+        if os.path.basename(recorded) != os.path.basename(path):
+            return False
+        size = (source_block.get("fingerprint") or {}).get("size")
+        try:
+            return size is None or int(size) == os.path.getsize(path)
+        except OSError:
+            return True
+
     class SequenceDashboard(anywidget.AnyWidget):  # type: ignore[no-redef]
         """Curate positions + ROIs across a multi-position acquisition (anywidget).
 
@@ -2882,6 +3016,7 @@ if _HAS_ANYWIDGET:
             roi_mode: str = "single",
             save_dir=None,
             preview_frame: int | None = None,
+            resume: bool = True,
             **kwargs,
         ) -> None:
             """Build the dashboard from a source (no pixel reads at construction).
@@ -2901,11 +3036,19 @@ if _HAS_ANYWIDGET:
                     Note this indexes the *source's* timepoints -- if a later
                     export step truncates the sequence, pick a frame inside
                     that range (see :attr:`~acia.selection.RoiSelection.anchor_frame`).
+                resume: If the save directory already holds a ``selection.json``
+                    of *this* file, continue from it (default) -- re-running the
+                    dashboard cell picks up where the curation left off. ``False``
+                    starts empty; the previous file is then kept as
+                    ``selection.json.bak`` on the first save.
                 **kwargs: Forwarded to ``anywidget.AnyWidget`` (e.g. ``auto_save``
                     to start with auto-save switched off).
 
             Raises:
                 traitlets.TraitError: If ``preview_frame`` is negative.
+                ValueError: If the save directory holds the ``selection.json`` of
+                    a *different* raw file -- auto-save would overwrite that
+                    curation, so choose another ``save_dir``.
             """
             from acia.segm.open import open_sequence
 
@@ -2947,6 +3090,65 @@ if _HAS_ANYWIDGET:
             )
             self.on_msg(self._on_custom_msg)
 
+            # Never let auto-save overwrite a curation this session did not load.
+            self._loaded_from: str | None = None
+            existing = self._existing_manifest()
+            if existing is not None and resume:
+                self._restore(existing)
+                self._loaded_from = self._selection_path()
+
+        def _selection_path(self) -> str:
+            directory = self._save_dir if self._save_dir is not None else os.getcwd()
+            return os.path.join(directory, "selection.json")
+
+        def _existing_manifest(self):
+            """The save dir's ``selection.json``, if any -- refused if foreign.
+
+            Raises:
+                ValueError: If it belongs to a different raw file.
+            """
+            from acia.selection import SelectionManifest
+
+            path = self._selection_path()
+            if not os.path.isfile(path):
+                return None
+            manifest = SelectionManifest.load(path)
+            if not _same_source(manifest.source, self._file):
+                raise ValueError(
+                    f"{path} holds the ROI selection of "
+                    f"{os.path.basename(manifest.source_path)!r}, but this dashboard "
+                    f"opened {os.path.basename(str(getattr(self._file, 'path', '')))!r}. "
+                    "Saving here would overwrite that curation -- pass another "
+                    "save_dir for this file."
+                )
+            return manifest
+
+        def _restore(self, manifest) -> None:
+            """Load a manifest's selections and ROI mode into the widget."""
+            num_positions = self.metadata.get("num_positions", 0)
+            next_ci: dict[int, int] = {}
+            restored = []
+            for i, sel in enumerate(manifest.selections):
+                if not 0 <= sel.position < num_positions:
+                    raise ValueError(
+                        f"selection position {sel.position} out of range "
+                        f"for source with {num_positions} positions"
+                    )
+                ci = next_ci.get(sel.position, 0)
+                next_ci[sel.position] = ci + 1
+                restored.append(
+                    {
+                        "id": i + 1,
+                        "position": sel.position,
+                        "label": sel.label,
+                        "ci": ci,
+                        "anchor_frame": sel.anchor_frame,
+                        "roi": sel.roi.to_dict(),
+                    }
+                )
+            self.roi_mode = manifest.roi_mode
+            self.selections = restored
+
         @traitlets.validate("preview_frame")
         def _validate_preview_frame(self, proposal):
             """Reject a negative frame index.
@@ -2971,14 +3173,11 @@ if _HAS_ANYWIDGET:
             custom message (frame/thumb/fit/save) for this widget.
             """
             kind = content.get("type") if isinstance(content, dict) else None
-            # Diagnostic timing (temporary): a "fit" request appearing to hang
-            # has been reported repeatedly against real SMB data; these lines
-            # print to the kernel's terminal so it's visible whether a given
-            # message is received promptly and how long its handler took --
-            # the two things needed to tell "queued behind a slow read" apart
-            # from "stuck inside the handler itself".
+            # Diagnostic timing, at DEBUG level: tells "queued behind a slow
+            # (SMB) read" apart from "stuck inside the handler". Enable with
+            # logging.getLogger().setLevel(logging.DEBUG) when chasing a hang.
             t0 = time.time()
-            logging.warning(
+            logging.debug(
                 "SequenceDashboard: received %r at %.3f (content=%s)",
                 kind,
                 t0,
@@ -3005,7 +3204,7 @@ if _HAS_ANYWIDGET:
                     )
                     return
                 self.send({"type": "thumb", "pos": pos}, buffers=[png])
-                logging.warning(
+                logging.debug(
                     "SequenceDashboard: thumb %d done in %.3fs", pos, time.time() - t0
                 )
             elif kind == "frame":
@@ -3014,11 +3213,25 @@ if _HAS_ANYWIDGET:
                     png = self._frame_png(pos, t)
                 except Exception as exc:  # noqa: BLE001 - report to the frontend
                     self.send(
-                        {"type": "error", "kind": kind, "pos": pos, "message": str(exc)}
+                        {
+                            "type": "error",
+                            "kind": kind,
+                            "pos": pos,
+                            "t": t,
+                            "message": str(exc),
+                        }
                     )
                     return
-                self.send({"type": "frame", "pos": pos, "t": t}, buffers=[png])
-                logging.warning(
+                self.send(
+                    {
+                        "type": "frame",
+                        "pos": pos,
+                        "t": t,
+                        "stage": self._frame_stage(pos, t),
+                    },
+                    buffers=[png],
+                )
+                logging.debug(
                     "SequenceDashboard: frame %d/%d done in %.3fs",
                     pos,
                     t,
@@ -3034,9 +3247,7 @@ if _HAS_ANYWIDGET:
                     self.send({"type": "error", "kind": "fit", "message": str(exc)})
                     return
                 self.send({"type": "fit", "roi": spec.to_dict()})
-                logging.warning(
-                    "SequenceDashboard: fit done in %.3fs", time.time() - t0
-                )
+                logging.debug("SequenceDashboard: fit done in %.3fs", time.time() - t0)
             elif kind == "save":
                 try:
                     path = self.save()
@@ -3044,9 +3255,27 @@ if _HAS_ANYWIDGET:
                     self.send({"type": "error", "kind": "save", "message": str(exc)})
                     return
                 self.send({"type": "saved", "path": path})
-                logging.warning(
-                    "SequenceDashboard: save done in %.3fs", time.time() - t0
-                )
+                logging.debug("SequenceDashboard: save done in %.3fs", time.time() - t0)
+
+        def _frame_stage(self, pos: int, t: int) -> dict | None:
+            """Where the stage was for this image: ``{x, y, z}`` in µm, if recorded.
+
+            Metadata only (no pixels); ``None`` for formats without stage
+            positions (e.g. a plain TIFF). ``z`` may be ``None``.
+            """
+            try:
+                source = self._file.position(pos)
+                getter = getattr(source, "stage_xyz", None)
+                if getter is not None:
+                    xyz = getter(t)
+                else:
+                    xy = getattr(source, "stage_xy", lambda _t: None)(t)
+                    xyz = None if xy is None else (xy[0], xy[1], None)
+            except Exception:  # noqa: BLE001 - metadata is best-effort
+                return None
+            if xyz is None:
+                return None
+            return {"x": xyz[0], "y": xyz[1], "z": xyz[2]}
 
         def _frame_png(self, pos: int, t: int) -> bytes:
             """PNG bytes of one lazily-read frame (display channel, normalized)."""
@@ -3116,7 +3345,25 @@ if _HAS_ANYWIDGET:
                 directory = (
                     self._save_dir if self._save_dir is not None else os.getcwd()
                 )
-            return save_selection(self.manifest, directory)
+            target = os.path.join(os.fspath(directory), "selection.json")
+            if os.path.isfile(target) and os.path.abspath(target) != os.path.abspath(
+                self._loaded_from or ""
+            ):
+                # A curation this session did not start from: keep one backup
+                # rather than silently replacing it (and refuse another file's).
+                from acia.selection import SelectionManifest
+
+                previous = SelectionManifest.load(target)
+                if not _same_source(previous.source, self._file):
+                    raise ValueError(
+                        f"{target} holds the ROI selection of "
+                        f"{os.path.basename(previous.source_path)!r}; refusing to "
+                        "overwrite it with another file's curation."
+                    )
+                shutil.copyfile(target, target + ".bak")
+            path = save_selection(self.manifest, directory)
+            self._loaded_from = path
+            return path
 
         @classmethod
         def resume(cls, manifest_or_path, source=None, **kwargs) -> SequenceDashboard:
@@ -3143,6 +3390,7 @@ if _HAS_ANYWIDGET:
                 ValueError: If a selection's position is out of range for
                     ``source``.
             """
+            from acia.segm.acquisition_fixes import manifest_fixes
             from acia.segm.open import open_sequence
             from acia.selection import SelectionManifest
 
@@ -3158,35 +3406,22 @@ if _HAS_ANYWIDGET:
                 )
 
             if source is None:
-                source = open_sequence(manifest.source_path)
+                # the anchor frames were drawn under the manifest's acquisition
+                # fixes, so reopen with the same slot order the export uses
+                source = open_sequence(
+                    manifest.source_path,
+                    acquisition_fixes=manifest_fixes(manifest.source),
+                )
             elif isinstance(source, (str, os.PathLike)):
                 source = open_sequence(source)
 
-            kwargs.setdefault("roi_mode", manifest.roi_mode)
-            dash = cls(source, **kwargs)
-
-            num_positions = dash.metadata.get("num_positions", 0)
-            next_ci: dict[int, int] = {}
-            restored = []
-            for i, sel in enumerate(manifest.selections):
-                if not 0 <= sel.position < num_positions:
-                    raise ValueError(
-                        f"selection position {sel.position} out of range "
-                        f"for source with {num_positions} positions"
-                    )
-                ci = next_ci.get(sel.position, 0)
-                next_ci[sel.position] = ci + 1
-                restored.append(
-                    {
-                        "id": i + 1,
-                        "position": sel.position,
-                        "label": sel.label,
-                        "ci": ci,
-                        "anchor_frame": sel.anchor_frame,
-                        "roi": sel.roi.to_dict(),
-                    }
-                )
-            dash.selections = restored
+            roi_mode = kwargs.pop("roi_mode", None)
+            dash = cls(source, resume=False, **kwargs)
+            dash._restore(manifest)
+            if roi_mode is not None:
+                dash.roi_mode = roi_mode
+            if not isinstance(manifest_or_path, SelectionManifest):
+                dash._loaded_from = dash._selection_path()
             return dash
 
         def _repr_html_(self) -> str:

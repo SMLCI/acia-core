@@ -161,6 +161,24 @@ class TestMessages(unittest.TestCase):
             self.assertEqual(content["type"], "frame")
             self.assertEqual(content["t"], 1)
             self.assertTrue(buffers[0].startswith(b"\x89PNG"))
+            self.assertIsNone(content["stage"])  # a plain TIFF records no stage
+
+    def test_frame_stage_reads_xyz_and_falls_back_to_xy(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            dash, _ = self._dash(d)
+            xyz = SimpleNamespace(stage_xyz=lambda t: (1.0, 2.0, 3.5))
+            with mock.patch.object(dash._file, "position", return_value=xyz):
+                self.assertEqual(
+                    dash._frame_stage(0, 1), {"x": 1.0, "y": 2.0, "z": 3.5}
+                )
+            xy = SimpleNamespace(stage_xy=lambda t: (4.0, 5.0))
+            with mock.patch.object(dash._file, "position", return_value=xy):
+                self.assertEqual(
+                    dash._frame_stage(0, 1), {"x": 4.0, "y": 5.0, "z": None}
+                )
 
     def test_fit_returns_spec(self):
         with tempfile.TemporaryDirectory() as d:
@@ -410,3 +428,60 @@ class TestAnchorFrameRoundTrip(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _selected(dash):
+    dash.selections = [
+        {
+            "id": 1,
+            "position": 0,
+            "label": "roi_01",
+            "ci": 0,
+            "anchor_frame": 1,
+            "roi": {"center": [5.0, 4.0], "size": [6.0, 4.0], "angle": 0.0},
+        }
+    ]
+    return dash
+
+
+class TestResumeByDefault(unittest.TestCase):
+    """A new dashboard continues the save dir's curation of the same file and
+    never overwrites another file's curation."""
+
+    def test_same_file_is_resumed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif(d)
+            first = _selected(SequenceDashboard(path, save_dir=d, roi_mode="multi"))
+            first.save()
+
+            again = SequenceDashboard(path, save_dir=d)
+            self.assertEqual(len(again.selections), 1)
+            self.assertEqual(again.selections[0]["anchor_frame"], 1)
+            self.assertEqual(again.roi_mode, "multi")
+
+    def test_different_file_in_save_dir_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            _selected(SequenceDashboard(_tif(d), save_dir=d)).save()
+            other = Path(d) / "other.tif"
+            tifffile.imwrite(other, np.zeros((3, 8, 10), np.uint16))
+
+            for resume in (True, False):
+                with self.assertRaisesRegex(ValueError, "stack.tif"):
+                    SequenceDashboard(other, save_dir=d, resume=resume)
+
+    def test_fresh_start_keeps_a_backup(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = _tif(d)
+            _selected(SequenceDashboard(path, save_dir=d)).save()
+
+            fresh = SequenceDashboard(path, save_dir=d, resume=False)
+            self.assertEqual(fresh.selections, [])
+            fresh.save()
+
+            backup = SelectionManifest.load(str(Path(d) / "selection.json.bak"))
+            self.assertEqual(len(backup.selections), 1)
+            self.assertEqual(SelectionManifest.load(d).selections, [])
+            # the second save overwrites its own file without another backup
+            (Path(d) / "selection.json.bak").unlink()
+            fresh.save()
+            self.assertFalse((Path(d) / "selection.json.bak").exists())

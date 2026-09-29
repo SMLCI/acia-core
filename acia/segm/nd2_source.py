@@ -287,6 +287,31 @@ class ND2SequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         except Exception:  # noqa: BLE001 - metadata is best-effort
             return None
 
+    def stage_xyz(self, frame: int) -> tuple[float, float, float | None] | None:
+        """Recorded stage X, Y and Z/focus (µm) of ``(position, frame)``, if known.
+
+        Like :meth:`stage_xy`, from the per-frame metadata only. ``z`` is
+        ``None`` when the file records no finite Z. ``None`` if XY is unknown.
+        """
+        xy = self.stage_xy(frame)
+        if xy is None:
+            return None
+        z: float | None = None
+        try:
+            assert self._reader is not None
+            seq = self._sequence_index(frame)
+            if seq is not None:
+                pos = (
+                    self._reader.frame_metadata(seq)
+                    .channels[0]
+                    .position.stagePositionUm
+                )
+                if len(pos) > 2 and np.isfinite(float(pos[2])):
+                    z = float(pos[2])
+        except Exception:  # noqa: BLE001 - metadata is best-effort
+            z = None
+        return (xy[0], xy[1], z)
+
     def _sequence_index(self, frame: int) -> int | None:
         """The ND2 sequence (frame) index of ``(position, frame)``."""
         assert self._reader is not None

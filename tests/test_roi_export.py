@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -211,6 +212,35 @@ class TestExportWithRegistration(_Case):
         # the reference frame's own transform is *estimated*, not a stored
         # identity -- which is why a frame-0 ROI is passed through untouched
         self.assertAlmostEqual(record.transforms[0].dx, 0.0, places=6)
+
+    def test_per_frame_warnings_are_folded_into_the_position_report(self):
+        import warnings
+
+        import pytest
+
+        pytest.importorskip("anywidget")
+        from acia.registration import LowConfidenceWarning
+
+        manifest = _manifest(self.seqfile, [(0, (32.0, 32.0), (12, 12), "a", 0)])
+        lines = []
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with unittest.mock.patch("acia.roi_export.tqdm.write", lines.append):
+                export_rois(
+                    manifest,
+                    self.out,
+                    registration_method_name="GradientECC",
+                    # an unreachable gate: every frame is "low confidence"
+                    method_kwargs={"min_confidence": 0.999999},
+                    source=self.seqfile,
+                )
+        self.assertFalse(
+            [w for w in caught if issubclass(w.category, LowConfidenceWarning)]
+        )
+        report = [line for line in lines if line.startswith("pos 1:")]
+        self.assertEqual(len(report), 1)
+        self.assertIn("below 0.999999", report[0])
+        self.assertFalse([line for line in lines if line.startswith("wrote ")])
 
     def test_a_late_anchor_is_carried_onto_the_corrected_view(self):
         import pytest
