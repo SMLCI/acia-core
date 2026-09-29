@@ -623,3 +623,111 @@ def _report_registration(position, record, threshold=None, say=tqdm.write) -> No
     if reanchors:
         parts.append(f"re-anchored at {reanchors}")
     say(f"pos {position + 1}: " + "; ".join(parts))
+
+
+# --------------------------------------------------------------------------- #
+# reviewing an export: one ROI -> a small preview video
+# --------------------------------------------------------------------------- #
+PREVIEW_FOLDER = ".previews"
+
+
+def export_entries(export_dir: str | os.PathLike) -> list[dict]:
+    """The exported ROIs of a folder, from ``roi_export.json`` (glob as fallback).
+
+    Each entry has at least ``file``; entries from ``roi_export.json`` also
+    carry ``position`` (1-based), ``roi_nb`` and ``label``.
+    """
+    folder = Path(export_dir)
+    try:
+        rois = json.loads((folder / EXPORT_INFO_NAME).read_text()).get("rois") or []
+        rois = [r for r in rois if (folder / r.get("file", "")).is_file()]
+    except (OSError, ValueError):
+        rois = []
+    if rois:
+        return rois
+    return [{"file": p.name} for p in sorted(folder.glob("pos*_roi*.tif*"))]
+
+
+def render_roi_preview(
+    tiff: str | os.PathLike,
+    video: str | os.PathLike,
+    *,
+    fps: int = 10,
+    max_size: int = 512,
+    channel: int = 0,
+) -> dict:
+    """Render an exported ROI stack to a small mp4 for review.
+
+    The contrast is fixed over the whole movie (1st-99.5th percentile of a
+    sample of frames), so brightness changes stay visible instead of being
+    normalized away frame by frame. Frames larger than ``max_size`` are scaled
+    down (keeping the aspect ratio). Rendering a typical ROI takes well under a
+    second.
+
+    Returns:
+        ``{"frames", "height", "width", "channels", "frame_interval", "seconds"}``
+        describing the stack and how long the render took.
+    """
+    import time
+
+    import cv2
+    import imageio.v2 as iio
+    import numpy as np
+
+    from acia.segm.open import open_sequence
+
+    t0 = time.perf_counter()
+    source = open_sequence(os.fspath(tiff)).position(0)
+    n = int(source.size_t)
+
+    def plane(i):
+        raw = np.asarray(source.get_frame(i).raw)
+        return raw[..., channel] if raw.ndim == 3 else raw
+
+    sample = np.stack([plane(int(i)) for i in np.linspace(0, n - 1, min(n, 20))])
+    lo, hi = np.percentile(sample, [1, 99.5])
+    hi = hi if hi > lo else lo + 1
+    first = plane(0)
+    height, width = first.shape[:2]
+    scale = min(1.0, max_size / max(height, width))
+    size = (
+        max(2, int(round(width * scale)) // 2 * 2),
+        max(2, int(round(height * scale)) // 2 * 2),
+    )
+
+    Path(video).parent.mkdir(parents=True, exist_ok=True)
+    with iio.get_writer(
+        os.fspath(video),
+        fps=fps,
+        codec="libx264",
+        pixelformat="yuv420p",
+        macro_block_size=2,
+        output_params=["-movflags", "+faststart"],
+        ffmpeg_params=["-preset", "veryfast"],
+    ) as writer:
+        for i in range(n):
+            img = np.clip((plane(i).astype(np.float32) - lo) / (hi - lo) * 255, 0, 255)
+            img = cv2.resize(img.astype(np.uint8), size, interpolation=cv2.INTER_AREA)
+            writer.append_data(np.repeat(img[:, :, None], 3, axis=-1))  # type: ignore[attr-defined]
+
+    timepoints = source.timepoints
+    interval = None
+    if timepoints is not None and len(timepoints) > 1:
+        step = (timepoints[1] - timepoints[0]).to_compact()
+        interval = f"{step.magnitude:g} {step.units:~P}"
+    return {
+        "frames": n,
+        "height": int(height),
+        "width": int(width),
+        "channels": int(getattr(source, "num_channels", 1) or 1),
+        "frame_interval": interval,
+        "seconds": time.perf_counter() - t0,
+    }
+
+
+def preview_path(
+    export_dir: str | os.PathLike, file: str, *, fps: int, max_size: int
+) -> Path:
+    """Where the cached preview of ``file`` lives (``<export_dir>/.previews/``)."""
+    stem = Path(file).name.split(".")[0]
+    return Path(export_dir) / PREVIEW_FOLDER / f"{stem}_{fps}fps_{max_size}px.mp4"

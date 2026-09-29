@@ -334,3 +334,37 @@ class TestExportInfo(_Case):
 
         with self.assertRaisesRegex(ValueError, "other_acquisition.nd2"):
             export_rois(manifest, self.out, source=self.seqfile, progress=False)
+
+
+class TestExportReview(_Case):
+    """Rendering exported ROIs to preview videos for review."""
+
+    def test_preview_is_rendered_cached_and_listed(self):
+        from acia.notebook import roi_export_viewer
+        from acia.roi_export import export_entries, preview_path, render_roi_preview
+
+        manifest = _manifest(
+            self.seqfile,
+            [(0, (20.0, 20.0), (10, 8), "a", 0), (1, (30.0, 30.0), (12, 12), "b", 0)],
+        )
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+
+        entries = export_entries(self.out)
+        self.assertEqual(
+            [e["file"] for e in entries], ["pos001_roi001.tiff", "pos002_roi001.tiff"]
+        )
+
+        target = preview_path(self.out, entries[0]["file"], fps=5, max_size=64)
+        info = render_roi_preview(
+            os.path.join(self.out, entries[0]["file"]), target, fps=5, max_size=64
+        )
+        self.assertTrue(target.is_file() and target.stat().st_size > 0)
+        self.assertEqual(info["frames"], self.num_t)
+
+        panel = roi_export_viewer(self.out, fps=5, max_size=64)
+        picker, caption, video = panel.children
+        self.assertEqual(picker.options[1][0], "pos 002 · roi 001 · b")
+        self.assertIn("cached preview", caption.value)  # rendered above already
+        self.assertGreater(len(video.value), 0)
+        picker.value = "pos002_roi001.tiff"
+        self.assertIn("rendered in", caption.value)

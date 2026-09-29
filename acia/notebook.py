@@ -4314,3 +4314,82 @@ else:
         raise ImportError(
             "RegistrationDashboard requires the optional dependency: pip install acia[widget]"
         )
+
+
+def roi_export_viewer(export_dir, *, fps: int = 10, max_size: int = 512):
+    """Review an ROI export: pick an exported ROI, watch it as a video.
+
+    Each ROI is rendered on demand to a small mp4 (:func:`acia.roi_export.
+    render_roi_preview`, well under a second for a typical ROI) and cached in
+    ``<export_dir>/.previews/`` -- re-selecting it, or re-running the cell,
+    replays it without rendering again (the cache is refreshed when the TIFF
+    is newer). The video is shown through an ipywidgets ``Video`` rather than
+    embedded, so the saved notebook stays small.
+
+    Args:
+        export_dir: the folder :func:`acia.roi_export.export_rois` wrote.
+        fps: playback speed of the previews.
+        max_size: longest side of the previews in pixels.
+
+    Returns:
+        The ipywidgets panel (display it, or leave it as the cell's last line).
+    """
+    import ipywidgets as widgets
+
+    from acia.roi_export import export_entries, preview_path, render_roi_preview
+
+    folder = os.fspath(export_dir)
+    entries = export_entries(folder)
+    if not entries:
+        return widgets.HTML(f"<i>No exported ROIs found in {folder}</i>")
+
+    def label(e):
+        if "position" in e and "roi_nb" in e:
+            text = f"pos {int(e['position']):03d} · roi {int(e['roi_nb']):03d}"
+            return text + (f" · {e['label']}" if e.get("label") else "")
+        return e["file"]
+
+    picker = widgets.Dropdown(
+        options=[(label(e), e["file"]) for e in entries],
+        description="ROI",
+        layout=widgets.Layout(width="420px"),
+    )
+    video = widgets.Video(
+        format="mp4",
+        autoplay=True,
+        loop=True,
+        controls=True,
+        layout=widgets.Layout(max_width="100%"),
+    )
+    caption = widgets.HTML()
+
+    def show(file):
+        tiff = os.path.join(folder, file)
+        target = preview_path(folder, file, fps=fps, max_size=max_size)
+        fresh = target.is_file() and target.stat().st_mtime >= os.path.getmtime(tiff)
+        caption.value = f"<i>{'loading' if fresh else 'rendering'} {file} …</i>"
+        try:
+            if fresh:
+                info_text = "cached preview"
+            else:
+                info = render_roi_preview(tiff, target, fps=fps, max_size=max_size)
+                info_text = (
+                    f"{info['frames']} frames · {info['width']}×{info['height']} px · "
+                    f"{info['channels']} channel(s)"
+                    + (
+                        f" · Δt {info['frame_interval']}"
+                        if info["frame_interval"]
+                        else ""
+                    )
+                    + f" · rendered in {info['seconds']:.1f} s"
+                )
+            video.value = target.read_bytes()
+            caption.value = f"<b>{file}</b> — {info_text} · {fps} fps"
+        except Exception as exc:  # noqa: BLE001 - show, don't break the panel
+            caption.value = (
+                f"<span style='color:#c00'>could not render {file}: {exc}</span>"
+            )
+
+    picker.observe(lambda change: show(change["new"]), names="value")
+    show(picker.value)
+    return widgets.VBox([picker, caption, video])
