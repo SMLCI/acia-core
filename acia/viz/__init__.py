@@ -568,7 +568,7 @@ def render_tracking(
 
     # marker colors
     line_color = (255, 0, 0)  # rgb: red
-    division_color = (0, 0, 255)  # bgr: blue
+    division_color = (0, 0, 255)  # rgb: blue (frames are RGB here)
     marker_color = (203, 192, 255)
 
     for image, frame_overlay in _iter_frames_with_overlay(

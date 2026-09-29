@@ -673,3 +673,50 @@ def test_context_keys_carry_the_experiment(tmp_path):
 
     plain = StageContext.for_image(_source(tmp_path), tmp_path / "out3")
     assert "experiment" not in plain.keys
+
+
+def test_execution_naming_for_flat_by_default_and_refuses_collisions(tmp_path):
+    from acia.analysis import collect_roi_exports, execution_naming_for
+
+    a = _export_folder(tmp_path, "JW_nd73-01")
+    b = _export_folder(tmp_path, "JW_nd73-02", rois=("pos003_roi001",))
+    entries = collect_roi_exports([a, b])
+
+    flat = execution_naming_for(entries)
+    assert [flat(e) for e in entries] == [
+        "pos001_roi001",
+        "pos001_roi002",
+        "pos003_roi001",
+    ]
+    nested = execution_naming_for(entries, experiment_subfolder=True)
+    assert nested(entries[0]) == "JW_nd73-01/pos001_roi001"
+
+    c = _export_folder(tmp_path, "JW_nd73-03", rois=("pos001_roi001",))
+    with pytest.raises(ValueError, match="experiment_subfolder=True"):
+        execution_naming_for(collect_roi_exports([a, c]))
+
+
+def test_scale_writes_html_only_when_asked(tmp_path):
+    import nbformat
+
+    from acia.analysis import scale
+
+    nb = nbformat.v4.new_notebook()
+    nb.cells = [
+        nbformat.v4.new_code_cell("image_id = None", metadata={"tags": ["parameters"]}),
+        nbformat.v4.new_code_cell("x = 1"),
+    ]
+    script = tmp_path / "stage.ipynb"
+    nbformat.write(nb, script)
+
+    for export_html, folder in ((False, "off"), (True, "on")):
+        scale(
+            tmp_path / folder,
+            analysis_script=[script],
+            image_ids=["a.tif"],
+            kernel_name="python3",
+            storage_parameter_name=None,
+            stage_progress="off",
+            export_html=export_html,
+        )
+        assert (tmp_path / folder / "a" / "stage.html").exists() is export_html

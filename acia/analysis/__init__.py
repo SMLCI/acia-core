@@ -43,6 +43,9 @@ from acia.analysis.stage import StageContext as StageContext
 from acia.analysis.stage import check_stale as check_stale
 from acia.analysis.stage import collect_roi_exports as collect_roi_exports
 from acia.analysis.stage import (
+    execution_naming_for as execution_naming_for,
+)
+from acia.analysis.stage import (
     experiment_execution_naming as experiment_execution_naming,
 )
 from acia.analysis.stage import experiment_of as experiment_of
@@ -1146,7 +1149,8 @@ def _scale_execute_one(
             # papermill writes the executed notebook back into `dst` only after it
             # returns, so this cannot be done from inside the notebook -- the last
             # cell never sees the finished document
-            _export_notebook_html(dst)
+            if job.get("export_html"):
+                _export_notebook_html(dst)
             if progress_queue is not None:
                 # papermill closes the reporter itself, but not when it fails
                 # before the notebook manager exists -- make sure the parent's
@@ -1189,6 +1193,7 @@ def scale(
     max_workers: int = 1,
     storage_parameter_name: str | None = "storage_folder",
     stage_progress: str = "keep",
+    export_html: bool = False,
 ):
     """Scale an analysis notebook to several image sources.
 
@@ -1239,6 +1244,10 @@ def scale(
             dies only fails its own image. On a **single GPU** keep this small
             (2-3): every concurrent run loads its own model, so throughput is
             bounded by GPU memory, not CPU cores.
+        export_html (bool): also write an HTML rendering of every executed
+            notebook next to it (``<stage>.html``), readable without Jupyter.
+            Off by default: it costs time and disk per ROI and stage, and the
+            executed ``.ipynb`` holds the same content.
         stage_progress (str): how the per-notebook cell progress is shown --
             ``"keep"`` (default) leaves the finished bars on screen as a per-stage
             timing log, ``"collapse"`` removes each bar once its stage is done, and
@@ -1331,6 +1340,7 @@ def scale(
                 "image_id": image_id,
                 "label": _source_label(image_id, name),
                 "output_parent": str(output_parent),
+                "export_html": export_html,
                 "source_parameters": source_parameters,
                 "scripts": [
                     (str(s), str(output_parent / s.name)) for s in analysis_script

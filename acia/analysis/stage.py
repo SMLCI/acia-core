@@ -349,6 +349,43 @@ def experiment_execution_naming(entry) -> str:
     return population_id_of(entry)
 
 
+def _flat_execution_naming(entry) -> str:
+    """``<population id>`` -- the run folder without an experiment level."""
+    return population_id_of(entry["image_id"] if isinstance(entry, dict) else entry)
+
+
+def execution_naming_for(entries, experiment_subfolder: bool = False):
+    """The ``execution_naming`` for :func:`acia.analysis.scale`.
+
+    Args:
+        entries: the :func:`collect_roi_exports` entries about to be scaled.
+        experiment_subfolder: ``False`` (default) runs every ROI directly in
+            ``<output>/<posNNN_roiNNN>/`` -- the experiment is usually already
+            in the output folder's own name, so repeating it is noise. ``True``
+            adds a level, ``<output>/<experiment>/<posNNN_roiNNN>/``, needed
+            when several experiments share one output folder. Either way the
+            experiment is injected into every stage and keys every table.
+
+    Raises:
+        ValueError: if ``experiment_subfolder`` is ``False`` but two entries
+            (from different experiments) would share a run folder.
+    """
+    if experiment_subfolder:
+        return experiment_execution_naming
+    seen: dict[str, str] = {}
+    for entry in entries:
+        name = _flat_execution_naming(entry)
+        experiment = entry.get("experiment", "") if isinstance(entry, dict) else ""
+        if name in seen and seen[name] != experiment:
+            raise ValueError(
+                f"{name} exists in experiments {seen[name]!r} and {experiment!r}; "
+                "without experiment_subfolder=True their results would share one "
+                "run folder."
+            )
+        seen[name] = experiment
+    return _flat_execution_naming
+
+
 def _parse_keys(population_id: str, key_pattern: str | None) -> dict[str, Any]:
     """Named groups of ``key_pattern`` matched against ``population_id``.
 
