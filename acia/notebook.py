@@ -1285,7 +1285,16 @@ function render({ model, el }) {
     renderEditor();
   }
 
-  let selections = (model.get("selections") || []).map((x) => Object.assign({}, x));
+  // The trait holds each ROI in its saved form, {roi: {center, size, angle}};
+  // the editor works on flat x/y/w/h. Convert on the way in (pushSelections
+  // converts back) -- without this a resumed ROI has no size (NaN x NaN).
+  const fromTrait = (x) => {
+    const r = x.roi || {}, c = r.center || [x.x, x.y], sz = r.size || [x.w, x.h];
+    return { id: x.id, position: x.position, label: x.label || "", ci: x.ci || 0,
+      anchor_frame: x.anchor_frame || 0,
+      x: +c[0], y: +c[1], w: +sz[0], h: +sz[1], angle: +(r.angle !== undefined ? r.angle : x.angle) || 0 };
+  };
+  let selections = (model.get("selections") || []).map(fromTrait);
   let currentPos = 0, activeId = null, mode = model.get("roi_mode") || "single";
   const collapsedPos = new Set(); // position headers collapsed in the selections list
   // start past the highest id already present (e.g. resumed from a saved
