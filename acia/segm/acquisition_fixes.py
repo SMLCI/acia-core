@@ -719,10 +719,10 @@ def check_acquisition(
     *,
     tol_um: float = 2.0,
     min_fraction: float = 0.8,
-    pixels: bool = True,
+    pixels: bool = False,
     progress: bool = True,
 ) -> AcquisitionCheck:
-    """Look for double shots (stage XY) and stale frames (pixels) in one pass.
+    """Look for double shots (stage XY) and, optionally, stale frames (pixels).
 
     * **Double shot** (:class:`AcquisitionSlip`): two consecutive raw slots at the
       same stage position -- the rest of the file is shifted by one slot. Needs
@@ -741,7 +741,9 @@ def check_acquisition(
         seqfile: the :class:`~acia.segm.open.SequenceFile`, opened in raw order
             (``acquisition_fixes=[]``) so the file's own slots are checked.
         tol_um, min_fraction: see :func:`detect_acquisition_slips`.
-        pixels: also run the pixel comparison (the slow part).
+        pixels: also run the pixel comparison. Off by default: it reads
+            every image of the file once, which takes long on a large
+            acquisition and makes the process's memory grow while it runs.
         progress: show a progress bar for the pixel comparison.
 
     Returns:

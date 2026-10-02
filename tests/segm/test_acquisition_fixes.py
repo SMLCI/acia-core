@@ -383,10 +383,19 @@ class TestStaleFrames(_FakeND2Case):
     def test_check_finds_both_kinds_and_labels_them(self):
         from acia.segm.acquisition_fixes import StaleFrame, check_acquisition
 
-        found = check_acquisition(self.open(acquisition_fixes=[]), progress=False)
+        found = check_acquisition(
+            self.open(acquisition_fixes=[]), pixels=True, progress=False
+        )
         self.assertEqual(found.slips, [AcquisitionSlip(1, 2)])
         self.assertEqual(found.stale_frames, [StaleFrame(2, 1)])
         self.assertEqual(found.fixes, [AcquisitionSlip(1, 2), StaleFrame(2, 1)])
+
+    def test_pixel_comparison_is_off_by_default(self):
+        from acia.segm.acquisition_fixes import check_acquisition
+
+        found = check_acquisition(self.open(acquisition_fixes=[]))
+        self.assertEqual(found.fixes, [AcquisitionSlip(1, 2)])
+        self.assertTrue(any("stale frames not checked" in n for n in found.notes))
 
     def test_stale_frame_is_dropped_without_shifting_and_keeps_true_times(self):
         from acia.segm.acquisition_fixes import StaleFrame
@@ -446,6 +455,8 @@ class TestCheckWithoutStage(_FakeND2Case):
     def test_pixels_still_checked_and_note_explains_the_rest(self):
         from acia.segm.acquisition_fixes import StaleFrame, check_acquisition
 
-        found = check_acquisition(self.open(acquisition_fixes=[]), progress=False)
+        found = check_acquisition(
+            self.open(acquisition_fixes=[]), pixels=True, progress=False
+        )
         self.assertEqual(found.fixes, [StaleFrame(1, 1)])
         self.assertTrue(any("double shots not checked" in n for n in found.notes))
