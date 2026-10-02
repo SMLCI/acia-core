@@ -211,3 +211,24 @@ def test_fit_monod_recovers_parameters():
     assert fit.r2 > 0.98
     with pytest.raises(ValueError, match="three"):
         fit_monod(pd.DataFrame(rows[:80]))
+
+
+def test_condition_of_a_position_covers_all_its_rois(tmp_path):
+    """Conditions are mapped per position; every ROI of that position gets it."""
+    root = tmp_path / "batch"
+    _run(root / "pos001_roi001", "e1", 1, 1, 0.5, seed=1)
+    _run(root / "pos001_roi002", "e1", 1, 2, 0.5, seed=2)
+    _run(root / "pos002_roi001", "e1", 2, 1, 0.8, seed=3)
+
+    rs = ResultSet.open(root).with_conditions({"low": "pos001", "high": "pos002"})
+    runs = rs.runs_with_conditions().sort_values(["position", "roi"])
+    assert list(runs["condition"]) == ["low", "low", "high"]
+
+    dt = rs.table("doubling_times")
+    low = dt[dt["condition"] == "low"]
+    assert set(low["roi"]) == {1, 2}  # both ROIs of position 1 are in the group
+    stats, _ = distribution(dt, "doubling_time", by="condition")
+    assert stats.loc["low", "n"] == 2 * 5 and stats.loc["high", "n"] == 5
+    by_roi, _ = distribution(dt, "doubling_time", by=["position", "roi"])
+    assert len(by_roi) == 3
+    plt.close("all")
