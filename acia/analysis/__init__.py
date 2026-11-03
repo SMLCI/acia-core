@@ -1012,11 +1012,79 @@ def _has_stale_stage(execution_folder: Path) -> bool:
     return False
 
 
+#: what :func:`scale` does with a stage that already ran in an execution folder
+ON_EXISTING = ("skip", "overwrite", "error")
+
+
+def _resolve_on_existing(on_existing, exist_ok, exist_skip) -> str:
+    """Map ``on_existing`` and the deprecated ``exist_ok``/``exist_skip`` to one mode."""
+    legacy = exist_ok is not None or exist_skip is not None
+    if on_existing is not None:
+        if legacy:
+            raise TypeError(
+                "pass either on_existing or the deprecated exist_ok/exist_skip, "
+                "not both"
+            )
+        if on_existing not in ON_EXISTING:
+            raise ValueError(
+                f"on_existing must be one of {ON_EXISTING}; got {on_existing!r}"
+            )
+        return str(on_existing)
+    if not legacy:
+        return "error"
+    warnings.warn(
+        "scale(exist_ok=..., exist_skip=...) is deprecated; use "
+        "on_existing='skip' | 'overwrite' | 'error'.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    if exist_skip:
+        return "skip"
+    return "overwrite" if exist_ok else "error"
+
+
+def _stages_run_by(
+    execution_folder: Path, notebook_name: str
+) -> list[tuple[Path, str]]:
+    """``(output_dir, stage)`` of every stage that ``notebook_name`` recorded.
+
+    A stage names itself (``stage='DoublingTime'``), not after its notebook; the
+    link is the notebook :func:`scale` ran, which the entry records under
+    ``code.notebook``.
+    """
+    from acia.analysis.stage import MANIFEST_NAME, read_manifest
+
+    found = []
+    for manifest in Path(execution_folder).glob(f"**/{MANIFEST_NAME}"):
+        stages = read_manifest(manifest.parent).get("stages") or {}
+        for stage, entry in stages.items():
+            if (entry.get("code") or {}).get("notebook") == notebook_name:
+                found.append((manifest.parent, stage))
+    return found
+
+
+def _overwrite_stage(execution_folder: Path, dst: Path) -> None:
+    """Remove everything one stage notebook left in ``execution_folder``.
+
+    The stage's recorded outputs and ``summary.json`` sections (via
+    :func:`~acia.analysis.stage.clear_stage`), then the executed copy of the
+    notebook and its HTML rendering. Nothing another stage recorded is touched.
+    """
+    from acia.analysis.stage import clear_stage
+
+    for output_dir, stage in _stages_run_by(execution_folder, dst.name):
+        removed = clear_stage(output_dir, stage)
+        logger.info(
+            "%s: cleared stage %r (%d paths)", execution_folder, stage, len(removed)
+        )
+    dst.unlink(missing_ok=True)
+    dst.with_suffix(".html").unlink(missing_ok=True)
+
+
 def _scale_execute_one(
     job,
     additional_parameters,
-    exist_ok,
-    exist_skip,
+    on_existing,
     kernel_name,
     storage_parameter_name,
     on_stage=None,
@@ -1047,7 +1115,7 @@ def _scale_execute_one(
     ``stage_progress`` is :func:`scale`'s parameter of the same name.
     """
     output_parent = Path(job["output_parent"])
-    os.makedirs(output_parent, exist_ok=exist_ok)
+    os.makedirs(output_parent, exist_ok=True)
 
     engine_name = None
     progress_key = None
@@ -1057,19 +1125,34 @@ def _scale_execute_one(
     else:
         progress_queue = None
 
-    # `exist_skip` keys on the notebook file existing. That is not enough: a
+    if on_existing == "error":
+        existing = [Path(dst).name for _, dst in job["scripts"] if Path(dst).exists()]
+        if existing:
+            raise FileExistsError(
+                f"{output_parent}: {', '.join(existing)} already ran here; pass "
+                "on_existing='skip' to keep it or 'overwrite' to redo it"
+            )
+    elif on_existing == "overwrite":
+        # clear every listed stage up front, not one by one as it runs: a stage
+        # that fails would otherwise leave a later stage's old results in place,
+        # computed from inputs that no longer exist
+        for _, dst in job["scripts"]:
+            _overwrite_stage(output_parent, Path(dst))
+
+    # 'skip' keys on the notebook file existing. That is not enough: a
     # re-exported source (same name, other ROI / registration / frames) would
     # leave the old results in place and the next stage would draw them over
     # the new images. So a recorded input that changed since it ran -- or a
     # stage before it in this chain that re-ran -- forces a re-run.
-    stale = exist_skip and _has_stale_stage(output_parent)
+    skip = on_existing == "skip"
+    stale = skip and _has_stale_stage(output_parent)
     rerun_rest = False
 
     executions = []
     for src, dst in job["scripts"]:
         dst = Path(dst)
         # the notebook already exists, its inputs are unchanged -> skip it
-        if dst.exists() and exist_skip and not (stale or rerun_rest):
+        if dst.exists() and skip and not (stale or rerun_rest):
             continue
         rerun_rest = True
 
@@ -1185,15 +1268,16 @@ def scale(
     analysis_script: Path | list[Path],
     image_ids: list[int | str | dict],
     additional_parameters=None,
-    exist_ok=False,
+    exist_ok=None,
     execution_naming=None,
-    exist_skip=False,
+    exist_skip=None,
     kernel_name=None,
     parameter_name: str = "image_id",
     max_workers: int = 1,
     storage_parameter_name: str | None = "storage_folder",
     stage_progress: str = "keep",
     export_html: bool = False,
+    on_existing: str | None = None,
 ):
     """Scale an analysis notebook to several image sources.
 
@@ -1219,11 +1303,13 @@ def scale(
         image_ids (list[int | str | dict]): image sources to scale over (ids,
             paths/URLs, or parameter dicts).
         additional_parameters (dict): Parameters to be inserted into the jupyter script
-        exist_ok (Bool): True when it is okay that the directory exists, False will throw an error when the directory exists.
+        exist_ok (Bool): deprecated, use ``on_existing``. ``exist_ok=True`` without
+            ``exist_skip`` maps to ``"overwrite"``, ``False`` to ``"error"``.
         execution_naming (Callable): maps an entry to its output folder name. By
             default :func:`default_execution_naming` is used, which dispatches on
             the entry type (id -> ``execution_<id>``, path -> file stem).
-        exist_skip (Bool): If true existing executions are skipped.
+        exist_skip (Bool): deprecated, use ``on_existing``; ``True`` maps to
+            ``"skip"``.
         kernel_name (str): specifies the notebook kernel to be used. None is the default kernel.
         parameter_name (str): name of the notebook parameter the identifier is
             injected as (ignored for ``dict`` entries, which are merged as-is).
@@ -1248,6 +1334,23 @@ def scale(
             notebook next to it (``<stage>.html``), readable without Jupyter.
             Off by default: it costs time and disk per ROI and stage, and the
             executed ``.ipynb`` holds the same content.
+        on_existing (str): what to do with a stage notebook that already ran in
+            an execution folder, decided per stage (the copied notebook is the
+            marker) and per execution folder:
+
+            * ``"skip"`` -- keep it, unless an input it recorded (the source
+              movie included) changed since it ran; once one stage of a chain
+              re-runs, every later stage in ``analysis_script`` re-runs too.
+              Resumable and incremental: append a stage and only it runs.
+            * ``"overwrite"`` -- clear and redo every stage in
+              ``analysis_script``. Clearing removes, per execution folder, what
+              that stage recorded in ``stage_manifest.json`` (its outputs, its
+              manifest entry, its ``summary.json`` sections -- see
+              :func:`acia.analysis.stage.clear_stage`) and the executed notebook
+              (and ``.html``). Stages not in ``analysis_script``, the source
+              data, and anything a different stage also recorded are kept.
+            * ``"error"`` (default) -- refuse to run in a folder where one of the
+              stages already ran (that source fails; the others still run).
         stage_progress (str): how the per-notebook cell progress is shown --
             ``"keep"`` (default) leaves the finished bars on screen as a per-stage
             timing log, ``"collapse"`` removes each bar once its stage is done, and
@@ -1273,6 +1376,8 @@ def scale(
     over a queue -- children never write bars themselves, because they share one
     stderr with no shared cursor and would overwrite each other.
     """
+
+    on_existing = _resolve_on_existing(on_existing, exist_ok, exist_skip)
 
     if execution_naming is None:
         execution_naming = default_execution_naming
@@ -1359,8 +1464,7 @@ def scale(
                         _scale_execute_one(
                             job,
                             additional_parameters,
-                            exist_ok,
-                            exist_skip,
+                            on_existing,
                             kernel_name,
                             storage_parameter_name,
                             on_stage=lambda stage, label=job["label"]: (
@@ -1406,8 +1510,7 @@ def scale(
                     _scale_execute_one,
                     job,
                     additional_parameters,
-                    exist_ok,
-                    exist_skip,
+                    on_existing,
                     kernel_name,
                     storage_parameter_name,
                     None,

@@ -223,6 +223,8 @@ class _StageRun:
     figures: list[dict[str, Any]] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
     declared_inputs: list[str] = field(default_factory=list)
+    #: the ``summary.json`` sections this run wrote (see :func:`note_summary_section`)
+    summary_sections: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
     calibration: dict[str, Any] | None = None
     status: str = "running"
@@ -453,6 +455,141 @@ def _resolve_source(image_id: str | Path | None, output_dir: Path) -> str | Path
             stacklevel=3,
         )
     return image_id
+
+
+def _summary_name() -> str:
+    from acia.analysis.cell_cycle import SUMMARY_NAME  # noqa: PLC0415 -- import cycle
+
+    return SUMMARY_NAME
+
+
+def note_summary_section(output_dir: str | Path, section: str) -> bool:
+    """Record that the stage running on ``output_dir`` wrote ``section`` of its summary.
+
+    Called by :func:`acia.analysis.cell_cycle.update_summary`, so a notebook never
+    has to say who owns which section: the owner is the one stage context that is
+    open (built with ``stage=`` and not yet finished) on that folder. The entry's
+    ``summary_sections`` is what lets :func:`clear_stage` remove exactly that
+    stage's numbers from the shared ``summary.json``.
+
+    Returns:
+        Whether an owner was found. With none open, or several on the same folder
+        (ambiguous), nothing is recorded -- the section is then simply not
+        cleared with any stage, which is the behaviour from before ownership
+        existed.
+    """
+    target = Path(output_dir).resolve()
+    owners = []
+    for ref, run in list(_UNFINISHED.values()):
+        ctx = ref()
+        if ctx is None or run.finalized or run.stage is None:
+            continue
+        with contextlib.suppress(OSError):
+            if Path(ctx.output_dir).resolve() == target:
+                owners.append((ctx, run))
+    if len(owners) != 1:
+        return False
+    ctx, run = owners[0]
+    run.summary_sections.append(section)
+    with contextlib.suppress(Exception):
+        ctx._persist(collect_io=False)
+    return True
+
+
+def clear_stage(output_dir: str | Path, stage: str) -> list[Path]:
+    """Delete a stage's recorded outputs and drop its manifest entry.
+
+    The honest undo for a stage that failed half-way, and what
+    ``scale(on_existing="overwrite")`` does before re-running a stage: a
+    half-finished stage is otherwise skipped on every later ``"skip"`` run until
+    its traces are gone. Removing exactly what the stage recorded is more precise
+    than deleting a folder -- it also catches whatever it wrote elsewhere -- and it
+    is a no-op for a stage that never ran.
+
+    What is removed, all inside ``output_dir`` (one population):
+
+    * every output this stage recorded in ``stage_manifest.json``, **except** a
+      file or directory another stage also recorded (every stage's figures land
+      in the shared ``figures/``, and several stages write ``summary.json``) --
+      inside such a shared directory, only the files this stage named as its
+      own artifacts (``ctx.output_path``) are removed;
+    * the ``summary.json`` sections this stage wrote (``summary_sections``), unless
+      another stage wrote the same section; ``summary.json`` itself is deleted
+      only once no section is left;
+    * this stage's manifest entry.
+
+    Never touched: other stages' outputs, the source movie, anything outside
+    ``output_dir``.
+
+    Returns:
+        The paths removed (``summary.json`` is listed when sections were removed
+        from it).
+    """
+    output_dir = Path(output_dir)
+    manifest = read_manifest(output_dir)
+    entry = manifest.get("stages", {}).pop(stage, None)
+    if entry is None:
+        return []
+    others = manifest.get("stages") or {}
+    claimed = {
+        item["path"]
+        for other_entry in others.values()
+        for item in (other_entry.get("io") or {}).get("outputs", [])
+    }
+    claimed_sections = {
+        section
+        for other_entry in others.values()
+        for section in other_entry.get("summary_sections") or []
+    }
+    summary_name = _summary_name()
+
+    other_artifacts = {
+        artifact
+        for other_entry in others.values()
+        for artifact in other_entry.get("artifacts") or []
+    }
+
+    removed = []
+    for item in (entry.get("io") or {}).get("outputs", []):
+        if item["path"] == summary_name:
+            continue  # shared by design -- handled section by section below
+        target = (output_dir / item["path"]).resolve()
+        if item["path"] in claimed:
+            # a shared directory: only the files this stage named as its own
+            prefix = item["path"].rstrip("/") + "/"
+            for artifact in entry.get("artifacts") or []:
+                own = (output_dir / artifact).resolve()
+                if (
+                    artifact.startswith(prefix)
+                    and artifact not in other_artifacts
+                    and own.is_file()
+                ):
+                    own.unlink()
+                    removed.append(own)
+            continue
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+            removed.append(target)
+        elif target.exists():
+            target.unlink()
+            removed.append(target)
+
+    sections = [
+        s for s in entry.get("summary_sections") or [] if s not in claimed_sections
+    ]
+    if sections:
+        from acia.analysis.cell_cycle import (  # noqa: PLC0415 -- import cycle
+            remove_summary_sections,
+        )
+
+        path = remove_summary_sections(output_dir, sections)
+        if path is not None:
+            removed.append(path)
+
+    path = output_dir / MANIFEST_NAME
+    if path.exists():
+        _write_manifest(path, manifest)
+    return removed
 
 
 def _warn_if_stale(output_dir: Path) -> None:
@@ -1065,6 +1202,8 @@ class StageContext:
             entry["error"] = run.error
         if run.declared_inputs:
             entry["declared_inputs"] = sorted(set(run.declared_inputs))
+        if run.summary_sections:
+            entry["summary_sections"] = list(dict.fromkeys(run.summary_sections))
 
         started = run.started_at or self._started_at
         if started:
@@ -1280,38 +1419,9 @@ class StageContext:
     def clear(self, stage: str) -> list[Path]:
         """Delete a stage's recorded outputs and drop its manifest entry.
 
-        The honest undo for a stage that failed half-way: ``scale(exist_skip=True)``
-        keys on the copied notebook existing, so a half-finished stage is skipped on
-        every later run until its traces are gone. Removing exactly what the stage
-        recorded is more precise than deleting a folder -- it also catches whatever
-        it wrote elsewhere -- and it is a no-op for a stage that never ran.
+        See :func:`clear_stage`, which this calls for this context's folder.
         """
-        manifest = self.manifest()
-        entry = manifest.get("stages", {}).pop(stage, None)
-        if entry is None:
-            return []
-        # a directory artifact may be shared -- every stage's figures land in
-        # figures/ -- so only a directory no other stage also claims may be removed
-        # wholesale; otherwise clearing one stage would delete another's results
-        others = {
-            item["path"]
-            for other, other_entry in (manifest.get("stages") or {}).items()
-            if other != stage
-            for item in (other_entry.get("io") or {}).get("outputs", [])
-        }
-        removed = []
-        for item in (entry.get("io") or {}).get("outputs", []):
-            target = (self.output_dir / item["path"]).resolve()
-            if target.is_dir():
-                if item["path"] in others:
-                    continue
-                shutil.rmtree(target, ignore_errors=True)
-                removed.append(target)
-            elif target.exists():
-                target.unlink()
-                removed.append(target)
-        self.manifest_path.write_text(json.dumps(manifest, indent=2))
-        return removed
+        return clear_stage(self.output_dir, stage)
 
     # -- calibration -------------------------------------------------------
 
@@ -1731,6 +1841,7 @@ _ENTRY_RESERVED = frozenset(
         "calibration",
         "error",
         "declared_inputs",
+        "summary_sections",
     }
 )
 

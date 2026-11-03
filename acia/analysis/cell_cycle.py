@@ -29,6 +29,7 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -68,7 +69,10 @@ def _column(
 
 def _valid_mask(df: pd.DataFrame) -> np.ndarray:
     if "valid" in df.columns:
-        return np.asarray(df["valid"], dtype=bool)
+        valid = df["valid"]
+        if valid.dtype == object:  # e.g. "True"/"False" read back from text
+            return np.asarray(valid.astype(str).str.lower().isin(("true", "1")), bool)
+        return np.asarray(valid, dtype=bool)
     return np.ones(len(df), dtype=bool)
 
 
@@ -319,6 +323,111 @@ def plot_cycle_violins(
     return fig
 
 
+#: colour per flag reason of the fit-vs-doubling-time plots
+REASON_COLORS = {
+    "not flagged": "tab:blue",
+    "too few points": "0.6",
+    "size drop (missed division?)": "tab:orange",
+    "size jump (merged cells?)": "tab:purple",
+    "poor fit": "tab:brown",
+    "disagrees with doubling time": "tab:red",
+}
+
+
+def _rate_errors(df: pd.DataFrame, rate_unit: str) -> dict[str, np.ndarray]:
+    """Rates and their interval half-widths (``NaN`` where a column is missing)."""
+    out = {}
+    for col in (
+        "mu_fit",
+        "mu_fit_ci_lo",
+        "mu_fit_ci_hi",
+        "mu_from_dt",
+        "mu_from_dt_lo",
+        "mu_from_dt_hi",
+    ):
+        out[col] = (
+            _column(df, col, rate_unit)[0]
+            if col in df.columns
+            else np.full(len(df), np.nan)
+        )
+    out["y_err"] = np.vstack(
+        [out["mu_fit"] - out["mu_fit_ci_lo"], out["mu_fit_ci_hi"] - out["mu_fit"]]
+    )
+    out["x_err"] = np.vstack(
+        [
+            out["mu_from_dt"] - out["mu_from_dt_lo"],
+            out["mu_from_dt_hi"] - out["mu_from_dt"],
+        ]
+    )
+    for key in ("x_err", "y_err"):
+        err = out[key]
+        err[~np.isfinite(err)] = 0.0
+        out[key] = np.clip(err, 0, None)
+    return out
+
+
+def flag_reasons(df: pd.DataFrame) -> np.ndarray:
+    """``fit_outlier_reason`` per row, ``"not flagged"`` where there is none."""
+    if "fit_outlier_reason" not in df.columns:
+        return np.full(len(df), "not flagged", dtype=object)
+    reasons = df["fit_outlier_reason"].astype(object).to_numpy()
+    return np.where(pd.isna(reasons), "not flagged", reasons).astype(object)
+
+
+def plot_fit_vs_doubling(
+    rates: pd.DataFrame,
+    *,
+    rate_unit: str = "1/hour",
+    ax: Axes | None = None,
+    error_bars: bool = True,
+) -> Figure:
+    """Fitted growth rate against ``ln 2 / doubling time``, one point per cell.
+
+    How to read it: a cell on the dashed ``y = x`` line has two readouts that
+    agree. The error bars are the fit's confidence interval (vertical) and
+    the range of ``ln 2 / DT`` the frame timing allows (horizontal). Points
+    far from the line **with small error bars** are the cells worth
+    inspecting (:func:`acia.analysis.cell_inspect.show_cell`); points far off
+    with long bars are just imprecise. Colours give the flag reason (see
+    :func:`acia.analysis.growth_rate.compute_cell_growth_rates`).
+
+    Args:
+        rates: :func:`~acia.analysis.growth_rate.compute_cell_growth_rates` output.
+        rate_unit: unit of both axes.
+        ax: axes to draw into (a new figure otherwise).
+        error_bars: draw the intervals (default ``True``).
+    """
+    fig, ax = _axes(ax, figsize=(4.5, 4.5))
+    values = _rate_errors(rates, rate_unit)
+    reasons = flag_reasons(rates)
+    for reason, color in REASON_COLORS.items():
+        sel = reasons == reason
+        if not sel.any():
+            continue
+        x, y = values["mu_from_dt"][sel], values["mu_fit"][sel]
+        if error_bars:
+            ax.errorbar(
+                x,
+                y,
+                xerr=values["x_err"][:, sel],
+                yerr=values["y_err"][:, sel],
+                fmt="none",
+                ecolor=color,
+                alpha=0.35,
+                lw=0.8,
+            )
+        ax.scatter(x, y, s=18, color=color, label=f"{reason} ({int(sel.sum())})")
+    finite = np.r_[values["mu_fit"], values["mu_from_dt"], 0.0]
+    top = float(np.nanmax(finite[np.isfinite(finite)])) * 1.1 or 1.0
+    ax.plot([0, top], [0, top], ls="--", color="0.5", lw=1, label="y = x")
+    unit = f"{_label('', rate_unit).strip()}"
+    ax.set_xlabel(f"ln 2 / doubling time {unit}")
+    ax.set_ylabel(f"growth rate μ (fit) {unit}")
+    ax.legend(fontsize=7, frameon=False)
+    fig.tight_layout()
+    return fig
+
+
 def pick_percentile_cells(
     df: pd.DataFrame,
     value_col: str = "mu_fit",
@@ -397,6 +506,24 @@ def format_summary(name: str, stats: dict[str, Any], digits: int = 2) -> str:
     )
 
 
+def _json_safe(value: Any) -> Any:
+    """``value`` with every non-finite float (NaN, ±inf) replaced by ``None``.
+
+    ``json.dump`` writes NaN as a bare ``NaN`` -- not valid JSON, and its
+    ``default=`` hook is never called for floats -- so the summary is cleaned
+    before it is written. Numpy scalars are converted to Python numbers.
+    """
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def update_summary(
     output_dir: str | Path, section: str, values: dict[str, Any]
 ) -> Path:
@@ -407,6 +534,11 @@ def update_summary(
     owns one section and only ever replaces that one, so stages can write in any
     order; the file is replaced atomically, so a reader never sees half of it.
 
+    The section is attributed to the stage context open on ``output_dir`` (one
+    built with ``stage=`` and not yet finished), so clearing that stage --
+    :func:`acia.analysis.stage.clear_stage`, ``scale(on_existing="overwrite")`` --
+    removes exactly its sections and leaves the other stages' numbers in place.
+
     Returns:
         The path of ``summary.json``.
     """
@@ -416,12 +548,68 @@ def update_summary(
         current = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         current = {}
-    current[section] = values
+    current[section] = _json_safe(values)
 
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".summary-", suffix=".json")
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump(current, handle, indent=2, sort_keys=True, default=str)
+            json.dump(
+                _json_safe(current),
+                handle,
+                indent=2,
+                sort_keys=True,
+                default=str,
+                allow_nan=False,
+            )
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+    from acia.analysis.stage import note_summary_section  # noqa: PLC0415 -- cycle
+
+    note_summary_section(output_dir, section)
+    return path
+
+
+def remove_summary_sections(
+    output_dir: str | Path, sections: Iterable[str]
+) -> Path | None:
+    """Drop ``sections`` from ``<output_dir>/summary.json``, atomically.
+
+    The undo of :func:`update_summary`, used when a stage is cleared so its
+    numbers do not outlive its results. The file is deleted once no section is
+    left. Missing sections, a missing file and an unreadable file are no-ops.
+
+    Returns:
+        The path of ``summary.json`` when something was removed, else ``None``.
+    """
+    path = Path(output_dir) / SUMMARY_NAME
+    try:
+        current = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    drop = [s for s in sections if s in current]
+    if not drop:
+        return None
+    for section in drop:
+        current.pop(section)
+    if not current:
+        path.unlink(missing_ok=True)
+        return path
+
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".summary-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            # already-parsed JSON goes back out as it came in
+            json.dump(
+                _json_safe(current),
+                handle,
+                indent=2,
+                sort_keys=True,
+                default=str,
+                allow_nan=False,
+            )
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
