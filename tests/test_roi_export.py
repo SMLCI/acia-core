@@ -377,6 +377,11 @@ class TestExportReview(_Case):
         self.assertGreater(len(video.value), 0)
         picker.value = "pos002_roi001.tiff"
         self.assertIn("rendered in", caption.value)
+        # a fixed box: switching to an ROI of another aspect never resizes it
+        self.assertEqual((video.layout.width, video.layout.height), ("64px", "64px"))
+        self.assertEqual(video.layout.object_fit, "contain")
+        boxed = roi_export_viewer(self.out, fps=5, max_size=64, box_size=200)
+        self.assertEqual(boxed.children[2].layout.height, "200px")
 
 
 # --------------------------------------------------------------------------- #

@@ -1080,11 +1080,17 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
 .acia-sd .sd-rz{background:var(--border);cursor:col-resize;}
 .acia-sd .sd-rz:hover{background:var(--accent);}
 .acia-sd .sd-gal{overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:6px;}
+.acia-sd{position:relative;}
 .acia-sd .sd-thumb{position:relative;height:44px;flex:none;border-radius:7px;overflow:hidden;cursor:pointer;
-  border:1.5px solid transparent;background:var(--panel-3);
-  transition:height .3s cubic-bezier(.2,.75,.2,1);}
-.acia-sd .sd-thumb:hover{height:var(--exp,300px);}
+  border:1.5px solid transparent;background:var(--panel-3);}
+.acia-sd .sd-thumb:hover{border-color:var(--border-strong);}
 .acia-sd .sd-thumb.sel{border-color:var(--accent);}
+.acia-sd .sd-pop{position:absolute;z-index:20;display:none;pointer-events:none;border-radius:8px;overflow:hidden;
+  background:var(--panel-3);border:1px solid var(--border-strong);box-shadow:0 8px 28px rgba(0,0,0,.35);}
+.acia-sd .sd-pop.on{display:block;}
+.acia-sd .sd-pop img{display:block;width:100%;height:100%;object-fit:contain;}
+.acia-sd .sd-pop .ix{position:absolute;left:8px;bottom:6px;font-family:var(--font-mono);font-size:12px;
+  font-weight:600;color:#fff;text-shadow:0 1px 3px #000;}
 .acia-sd .sd-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
 .acia-sd .sd-thumb .ix{position:absolute;left:6px;bottom:4px;font-family:var(--font-mono);font-size:11px;
   font-weight:600;color:#fff;text-shadow:0 1px 3px #000;}
@@ -1173,6 +1179,25 @@ _SEQUENCE_DASHBOARD_ESM = _SEQUENCE_DASHBOARD_ESM_TEXT = r"""
 // SequenceDashboard render() -- three-pane curation UI (accordion gallery,
 // resizable panes, ROI editor with draw + point-fit). Images arrive from Python
 // as PNG bytes (model.send/on). UNVERIFIED headless; validated by a real run.
+// Where the hover preview of a gallery row goes. All rects share one coordinate
+// system. The preview starts right of the gallery pane, so it can never cover
+// the list it previews (rows keep a fixed height -- hovering never reflows the
+// list); it is centred on the hovered row and clamped into the editor pane,
+// scaled down to fit that pane. Pure, so it can be checked without a browser.
+function placePreview(galRect, rowRect, paneRect, aspect, maxW) {
+  const GAP = 8;
+  const left = galRect.right + GAP;
+  const availW = Math.max(0, paneRect.right - GAP - left);
+  const availH = Math.max(0, paneRect.bottom - paneRect.top - 2 * GAP);
+  let w = Math.min(maxW, availW), h = w * aspect;
+  if (h > availH) { h = availH; w = h / aspect; }
+  w = Math.round(w); h = Math.round(h);
+  const mid = (rowRect.top + rowRect.bottom) / 2;
+  const top = Math.round(Math.max(paneRect.top + GAP,
+    Math.min(mid - h / 2, paneRect.bottom - GAP - h)));
+  return { left: left, top: top, width: w, height: h };
+}
+
 function render({ model, el }) {
   el.innerHTML = "";
   const root = document.createElement("div");
@@ -1385,6 +1410,7 @@ function render({ model, el }) {
         const t = e.target, ix = +t.dataset.ix;
         pending["t" + ix] = (url) => {
           const img = document.createElement("img"); img.src = url; t.insertBefore(img, t.firstChild);
+          if (popIx === ix) showPreview(t);
         };
         thumbQueue.push(ix);
         io.unobserve(t);
@@ -1392,10 +1418,29 @@ function render({ model, el }) {
     });
     pumpThumbQueue();
   }, { root: gal, rootMargin: "150px" });
-  function computeExp() {
-    const w = gal.clientWidth - 16;
-    root.querySelectorAll(".sd-thumb").forEach((t) => t.style.setProperty("--exp", Math.max(150, Math.round(w * ASPECT)) + "px"));
+  // hover preview: one shared popover beside the gallery (see placePreview)
+  const PREVIEW_MAX_W = 420;
+  const pop = document.createElement("div"); pop.className = "sd-pop"; root.appendChild(pop);
+  let popIx = -1;
+  function relRect(r, o) {
+    return { left: r.left - o.left, right: r.right - o.left, top: r.top - o.top, bottom: r.bottom - o.top };
   }
+  function showPreview(t) {
+    const o = root.getBoundingClientRect();
+    const p = placePreview(relRect(main.children[0].getBoundingClientRect(), o),
+      relRect(t.getBoundingClientRect(), o), relRect(main.children[2].getBoundingClientRect(), o),
+      ASPECT, PREVIEW_MAX_W);
+    popIx = +t.dataset.ix;
+    if (p.width < 40 || p.height < 30) { pop.classList.remove("on"); return; }
+    const img = t.querySelector("img");
+    pop.innerHTML = (img ? "<img src='" + img.src + "'>" : "") + "<span class='ix'>" + posLabel(popIx) + "</span>";
+    pop.style.left = p.left + "px"; pop.style.top = p.top + "px";
+    pop.style.width = p.width + "px"; pop.style.height = p.height + "px";
+    pop.classList.add("on");
+  }
+  function hidePreview() { popIx = -1; pop.classList.remove("on"); pop.innerHTML = ""; }
+  gal.addEventListener("scroll", hidePreview, { passive: true });
+  gal.addEventListener("pointerleave", hidePreview);
   function buildGallery() {
     gal.innerHTML = "";
     for (let i = 0; i < NPOS; i++) {
@@ -1405,9 +1450,10 @@ function render({ model, el }) {
       d.innerHTML = "<span class='ix'>" + posLabel(i) + "</span>" +
         (roisAt(i).length ? "<span class='dot'></span>" : "");
       d.onclick = () => selectPos(i);
+      d.addEventListener("pointerenter", () => showPreview(d));
+      d.addEventListener("pointerleave", hidePreview);
       gal.appendChild(d); io.observe(d);
     }
-    computeExp();
   }
 
   // ---- editor ----
@@ -1909,7 +1955,7 @@ function render({ model, el }) {
       const pane = side === "l" ? main.children[0] : main.children[4];
       const sw = pane.getBoundingClientRect().width;
       const mv = (ev) => { const d = ev.clientX - sx;
-        if (side === "l") { main.style.setProperty("--lw", Math.max(140, Math.min(360, sw + d)) + "px"); computeExp(); }
+        if (side === "l") { main.style.setProperty("--lw", Math.max(140, Math.min(360, sw + d)) + "px"); }
         else main.style.setProperty("--rw", Math.max(180, Math.min(420, sw - d)) + "px"); };
       const up = () => { window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up); };
       window.addEventListener("pointermove", mv); window.addEventListener("pointerup", up, { once: true });
@@ -4325,7 +4371,9 @@ else:
         )
 
 
-def roi_export_viewer(export_dir, *, fps: int = 10, max_size: int = 512):
+def roi_export_viewer(
+    export_dir, *, fps: int = 10, max_size: int = 512, box_size: int | None = None
+):
     """Review an ROI export: pick an exported ROI, watch it as a video.
 
     Each ROI is rendered on demand to a small mp4 (:func:`acia.roi_export.
@@ -4339,6 +4387,10 @@ def roi_export_viewer(export_dir, *, fps: int = 10, max_size: int = 512):
         export_dir: the folder :func:`acia.roi_export.export_rois` wrote.
         fps: playback speed of the previews.
         max_size: longest side of the previews in pixels.
+        box_size: side of the square player box in pixels (default ``max_size``).
+            The box keeps this size for every ROI -- a preview is fitted into it
+            (``object-fit: contain``) -- so switching between ROIs of different
+            aspect ratios does not resize the panel.
 
     Returns:
         The ipywidgets panel (display it, or leave it as the cell's last line).
@@ -4358,6 +4410,7 @@ def roi_export_viewer(export_dir, *, fps: int = 10, max_size: int = 512):
             return text + (f" · {e['label']}" if e.get("label") else "")
         return e["file"]
 
+    box = int(box_size or max_size)
     picker = widgets.Dropdown(
         options=[(label(e), e["file"]) for e in entries],
         description="ROI",
@@ -4368,7 +4421,12 @@ def roi_export_viewer(export_dir, *, fps: int = 10, max_size: int = 512):
         autoplay=True,
         loop=True,
         controls=True,
-        layout=widgets.Layout(max_width="100%"),
+        layout=widgets.Layout(
+            width=f"{box}px",
+            height=f"{box}px",
+            max_width="100%",
+            object_fit="contain",
+        ),
     )
     caption = widgets.HTML()
 
