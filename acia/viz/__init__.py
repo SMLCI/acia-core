@@ -38,7 +38,9 @@ from acia.segm.local import InMemorySequenceSource, LocalImage, THWCSequenceSour
 from acia.segm.rasterize import contour_labels as _contour_labels
 from acia.segm.rasterize import frame_label_mask as _frame_label_mask
 
+from .compose import AnnotatedSequenceSource as AnnotatedSequenceSource
 from .compose import ComposedSequenceSource as ComposedSequenceSource
+from .compose import annotate_sequence as annotate_sequence
 from .compose import compose_sequences as compose_sequences
 from .compose import label_sequence as label_sequence
 from .utils import strfdelta
@@ -136,7 +138,7 @@ def draw_scale_bar(
             image,
             (xstart, ystart),
             (xstart + bar_pixel_width, ystart - bar_pixel_height),
-            (255, 255, 255),
+            color,
             -1,
         )
 
@@ -797,7 +799,7 @@ def render_scalebar(
             image,
             (xstart, ystart),
             (xstart + bar_pixel_width, ystart - bar_pixel_height),
-            (255, 255, 255),
+            color,
             -1,
         )
 
@@ -904,7 +906,9 @@ def render_time(
 
         if background_color:
             # get size of text
-            left, top, right, bottom = draw.textbbox(xy_position, time_text, font=font)
+            left, top, right, bottom = draw.textbbox(
+                (xstart, ystart), time_text, font=font
+            )
 
             text_width = right - left
             text_height = bottom - top
@@ -927,7 +931,7 @@ def render_time(
             draw = ImageDraw.Draw(pil_image)
 
         # draw on image
-        draw.text(xy_position, time_text, fill=color, font=font)
+        draw.text((xstart, ystart), time_text, fill=color, font=font)
 
         # convert PIL image back to numpy
         image = np.array(pil_image)

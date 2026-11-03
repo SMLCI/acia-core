@@ -372,3 +372,338 @@ def compose_sequences(
         pad_color=pad_color,
         n_frames=n_frames,
     )
+
+
+# --- time stamp & scale bar annotation ---------------------------------------
+
+Placement = Literal["border_bottom", "border_top", "overlay"]
+
+
+def _annotation_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """DejaVu Sans (ships with matplotlib, has ``µ``) at ``size``, else fallback."""
+    try:
+        from matplotlib import font_manager
+
+        return ImageFont.truetype(font_manager.findfont("DejaVu Sans"), size)
+    except Exception:  # pragma: no cover - matplotlib font cache unavailable
+        return _load_font(size)
+
+
+def _pixel_size_x(pixel_size):
+    """The x (width) component of a scalar or ``[y, x]`` pint pixel size."""
+    magnitude = np.atleast_1d(np.asarray(pixel_size.magnitude, dtype=float))
+    return float(magnitude[-1]) * pixel_size.units
+
+
+class AnnotatedSequenceSource(ImageSequenceSource):
+    """A lazy view of ``source`` with a time stamp and/or scale bar burnt in.
+
+    Built by :func:`annotate_sequence`, which documents the parameters. Frames
+    are drawn on demand, so annotating a movie holds no second copy of it.
+    The calibration of the view is the one used for the annotation.
+    """
+
+    def __init__(
+        self,
+        source: ImageSequenceSource,
+        *,
+        time_texts: list[str] | None,
+        bar_pixels: int | None,
+        bar_label: str | None,
+        placement: Placement,
+        band_height: int,
+        font_size: int,
+        color: tuple[int, int, int],
+        band_color: tuple[int, int, int],
+        margin: int,
+        timepoints=None,
+        pixel_size=None,
+    ):
+        self._source = source
+        self._time_texts = time_texts
+        self._bar_pixels = bar_pixels
+        self._bar_label = bar_label
+        self._placement = placement
+        self._band_height = int(band_height)
+        self._font = _annotation_font(int(font_size))
+        self._color = tuple(int(c) for c in color)
+        self._band_color = tuple(int(c) for c in band_color)
+        self._margin = int(margin)
+        h, w = _frame_rgb(source, 0).shape[:2]
+        self._h, self._w = int(h), int(w)
+        self._init_calibration(timepoints=timepoints, pixel_size=pixel_size)
+
+    # -- layout -------------------------------------------------------------
+
+    def _text_size(
+        self, draw: ImageDraw.ImageDraw, text: str
+    ) -> tuple[int, int, int, int]:
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=self._font)
+        return int(left), int(top), int(right - left), int(bottom - top)
+
+    def _draw_time(self, draw, text: str, x0: int, y0: int, y1: int, boxed: bool):
+        """Draw ``text`` left-aligned at ``x0``, vertically centred in ``[y0, y1)``."""
+        left, top, tw, th = self._text_size(draw, text)
+        y = y0 + (y1 - y0 - th) // 2
+        if boxed:
+            pad = max(2, self._margin // 2)
+            draw.rectangle(
+                (x0 - pad, y - pad, x0 + tw + pad, y + th + pad), fill=self._band_color
+            )
+        draw.text((x0 - left, y - top), text, fill=self._color, font=self._font)
+
+    def _draw_bar(self, draw, x1: int, y0: int, y1: int, boxed: bool):
+        """Draw the bar (label above it) right-aligned at ``x1`` in ``[y0, y1)``."""
+        assert self._bar_pixels is not None
+        thickness = max(2, int(round((y1 - y0) * 0.14)))
+        gap = max(2, thickness // 2)
+        if self._bar_label:
+            left, top, tw, th = self._text_size(draw, self._bar_label)
+        else:
+            left = top = tw = th = 0
+        block_h = th + (gap if th else 0) + thickness
+        by0 = y0 + (y1 - y0 - block_h) // 2
+        bx0 = x1 - self._bar_pixels
+        width = max(self._bar_pixels, tw)
+        if boxed:
+            pad = max(2, self._margin // 2)
+            cx = bx0 + self._bar_pixels / 2
+            draw.rectangle(
+                (
+                    cx - width / 2 - pad,
+                    by0 - pad,
+                    cx + width / 2 + pad,
+                    by0 + block_h + pad,
+                ),
+                fill=self._band_color,
+            )
+        if self._bar_label:
+            tx = bx0 + (self._bar_pixels - tw) / 2
+            draw.text(
+                (tx - left, by0 - top),
+                self._bar_label,
+                fill=self._color,
+                font=self._font,
+            )
+        ry = by0 + block_h - thickness
+        draw.rectangle((bx0, ry, x1 - 1, ry + thickness - 1), fill=self._color)
+
+    def _annotate(
+        self,
+        canvas: np.ndarray,
+        frame: int,
+        band: tuple[int, int],
+        *,
+        boxed: bool,
+        time: bool = True,
+        bar: bool = True,
+    ) -> np.ndarray:
+        """Draw the time (left) and/or the bar (right) in the rows ``band``."""
+        pil = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(pil)
+        y0, y1 = band
+        if time and self._time_texts is not None and frame < len(self._time_texts):
+            self._draw_time(draw, self._time_texts[frame], self._margin, y0, y1, boxed)
+        if bar and self._bar_pixels:
+            self._draw_bar(draw, self._w - self._margin, y0, y1, boxed)
+        return np.asarray(pil, dtype=np.uint8)
+
+    # -- ImageSequenceSource --------------------------------------------------
+
+    def get_frame(self, frame: int) -> BaseImage:
+        image = _frame_rgb(self._source, frame)
+        bh = self._band_height
+        if self._placement == "overlay":
+            # time in a strip at the top, scale bar in a strip at the bottom
+            top = (self._margin, self._margin + bh)
+            bottom = (self._h - self._margin - bh, self._h - self._margin)
+            out = self._annotate(image, frame, top, boxed=True, bar=False)
+            out = self._annotate(out, frame, bottom, boxed=True, time=False)
+            return LocalImage(np.ascontiguousarray(out))
+
+        canvas = np.empty((self._h + bh, self._w, 3), dtype=np.uint8)
+        canvas[:] = self._band_color
+        if self._placement == "border_top":
+            canvas[bh:] = image
+            band = (0, bh)
+        else:
+            canvas[: self._h] = image
+            band = (self._h, self._h + bh)
+        return LocalImage(self._annotate(canvas, frame, band, boxed=False))
+
+    def __len__(self) -> int:
+        return len(self._source)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self.get_frame(i)
+
+    @property
+    def num_channels(self) -> int:
+        return 3
+
+    @property
+    def size_c(self) -> int:
+        return 3
+
+    @property
+    def size_t(self) -> int:
+        return len(self._source)
+
+    @property
+    def size_h(self) -> int:
+        return self._h if self._placement == "overlay" else self._h + self._band_height
+
+    @property
+    def size_w(self) -> int:
+        return self._w
+
+
+def annotate_sequence(
+    source: ImageSequenceSource,
+    *,
+    timepoints=None,
+    pixel_size=None,
+    show_time: bool = True,
+    time_format: str = "{H:02}h {M:02}m",
+    scalebar_length: str | object | None = "10 µm",
+    placement: Placement = "border_bottom",
+    band_height: int | None = None,
+    font_size: int | None = None,
+    color: tuple[int, int, int] = (255, 255, 255),
+    band_color: tuple[int, int, int] = (0, 0, 0),
+    margin: int | None = None,
+) -> AnnotatedSequenceSource:
+    """Burn a time stamp and a scale bar into every frame of a movie.
+
+    Typical use, right before writing a video::
+
+        video = render_segmentation_mask(source.to_rgb(), overlay)
+        video = annotate_sequence(video, timepoints=source.timepoints,
+                                  pixel_size=source.pixel_size)
+        render_video(video, "seg.mp4")
+
+    Pass ``timepoints`` / ``pixel_size`` from the *original* image source: the
+    rendered sequences (``render_segmentation_mask`` & co.) do not carry the
+    calibration along. When left ``None`` they are read from ``source``.
+
+    Args:
+        source: the frames to annotate (any channel layout; drawn as RGB uint8).
+        timepoints: per-frame pint quantities (e.g. ``source.timepoints``).
+            Without them no time stamp is drawn (with a warning if ``show_time``).
+        pixel_size: pint length per pixel, scalar or ``[y, x]`` (the x part is
+            used). Without it no scale bar is drawn (with a warning).
+        show_time: draw the time stamp.
+        time_format: :func:`acia.viz.utils.strfdelta` format, e.g.
+            ``"{H:02}h {M:02}m"`` (hours keep counting past a day) or
+            ``"{M} min"``.
+        scalebar_length: bar length as a pint-parsable string or quantity
+            (``"10 µm"``); ``None`` draws no scale bar.
+        placement: ``"border_bottom"`` (default) adds a band below the image —
+            time on the left, scale bar on the right — so nothing covers the
+            cells. ``"border_top"`` puts the band above. ``"overlay"`` draws onto
+            the image itself (time top-left, bar bottom-right, each on a small
+            ``band_color`` box), keeping the frame size.
+        band_height: band height in pixels; defaults to ~9 % of the frame
+            height, at least 22 px.
+        font_size: text size; defaults to ~40 % of ``band_height``.
+        color: RGB colour of text and bar.
+        band_color: RGB colour of the band (or of the boxes for ``"overlay"``).
+        margin: distance from the image edges; defaults to ~3 % of the width.
+
+    Returns:
+        A lazy :class:`AnnotatedSequenceSource` (frames drawn on demand), taller
+        by ``band_height`` for the border placements.
+    """
+    from acia import ureg
+    from acia.viz.utils import strfdelta
+
+    if placement not in ("border_bottom", "border_top", "overlay"):
+        raise ValueError(
+            "placement must be 'border_bottom', 'border_top' or 'overlay', "
+            f"got {placement!r}"
+        )
+    if timepoints is None:
+        timepoints = source.timepoints
+    if pixel_size is None:
+        pixel_size = source.pixel_size
+
+    h, w = _frame_rgb(source, 0).shape[:2]
+    if band_height is None:
+        band_height = max(22, int(round(h * 0.09)))
+        # keep the annotated frame height even (yuv420p video needs it)
+        band_height += (h + band_height) % 2
+    if font_size is None:
+        font_size = max(8, int(round(band_height * 0.4)))
+    if margin is None:
+        margin = max(3, int(round(w * 0.03)))
+
+    time_texts = None
+    if show_time:
+        if timepoints is None:
+            logger.warning(
+                "annotate_sequence: no timepoints (pass timepoints=source.timepoints "
+                "from the original source); drawing no time stamp."
+            )
+        else:
+            from datetime import timedelta
+
+            seconds = np.asarray(
+                ureg.Quantity(timepoints).to("s").magnitude, dtype=float
+            )
+            if len(seconds) < len(source):
+                logger.warning(
+                    "annotate_sequence: %d timepoints for %d frames; the last frames "
+                    "get no time stamp.",
+                    len(seconds),
+                    len(source),
+                )
+            time_texts = [
+                strfdelta(timedelta(seconds=float(s)), fmt=time_format) for s in seconds
+            ]
+
+    bar_pixels = None
+    bar_label = None
+    if scalebar_length is not None:
+        if pixel_size is None:
+            logger.warning(
+                "annotate_sequence: no pixel size (pass pixel_size=source.pixel_size "
+                "from the original source); drawing no scale bar."
+            )
+        else:
+            length = ureg.Quantity(scalebar_length)
+            px = _pixel_size_x(ureg.Quantity(pixel_size))
+            bar_pixels = int(round(float((length / px).to("dimensionless").magnitude)))
+            bar_label = f"{length:~P}"
+            if bar_pixels < 2:
+                logger.warning(
+                    "annotate_sequence: a %s scale bar is %d px at %s/pixel; drawing "
+                    "no scale bar (choose a longer scalebar_length).",
+                    bar_label,
+                    bar_pixels,
+                    px,
+                )
+                bar_pixels = None
+            elif bar_pixels > w - 2 * margin:
+                logger.warning(
+                    "annotate_sequence: a %s scale bar (%d px) is wider than the "
+                    "%d px frame; choose a shorter scalebar_length.",
+                    bar_label,
+                    bar_pixels,
+                    w,
+                )
+
+    return AnnotatedSequenceSource(
+        source,
+        time_texts=time_texts,
+        bar_pixels=bar_pixels,
+        bar_label=bar_label,
+        placement=placement,
+        band_height=band_height,
+        font_size=font_size,
+        color=color,
+        band_color=band_color,
+        margin=margin,
+        timepoints=timepoints,
+        pixel_size=pixel_size,
+    )
