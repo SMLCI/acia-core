@@ -16,6 +16,62 @@ as the work lands.
 
 ### Changed
 
+**Per-cell growth rates come with their uncertainty, and cells are flagged by what the
+measurement can resolve** (`acia.analysis.growth_rate.compute_cell_growth_rates`):
+- `compute_doubling_times` adds `doubling_time_lo`/`doubling_time_hi` (the narrowest and
+  widest cycle the frames allow: birth and division are each only known to within one
+  frame interval), `doubling_time_sd` (`Δ/√6` for equal frames) and `frame_gap` (frames
+  between the mother's last and the daughters' first observation).
+- The size fit adds `mu_fit_ci_lo`/`mu_fit_ci_hi`, optional HAC (Newey-West) standard
+  errors (`se_type='hac'`), the smallest/largest frame-to-frame size ratio, and
+  `mu_from_dt_se`/`_lo`/`_hi` from the frame timing.
+- **Flags changed.** A cell is now flagged when its two rates differ by more than
+  `agreement_z` (default 2) combined standard errors (`agreement_z` column), or when its
+  size drops below `size_jump_ratio` (0.65) times the previous frame (*missed division?*) or
+  jumps above its inverse (*merged cells?*). The R² rule is off by default
+  (`r2_min=None`): one cycle spans only ln 2 in log-size, so R² ≥ 0.9 flagged healthy cells
+  for ordinary segmentation noise. The fixed relative tolerance is opt-in (`rel_tol=None`).
+  **Existing calls that relied on the defaults flag different cells.**
+- `flag_report(rates)` counts flagged cells per reason, next to the thresholds used
+  (`rates.attrs["flag_thresholds"]`).
+
+**`scale()` takes one `on_existing` instead of `exist_ok`/`exist_skip`** — the same
+`'skip' | 'overwrite' | 'error'` vocabulary as `export_rois`, decided per stage notebook
+and execution folder:
+- `'skip'` is the former `exist_skip=True`: a stage that already ran is kept unless an
+  input it recorded changed, and once one stage re-runs every later stage of the chain does.
+- `'overwrite'` is new: before any stage runs, every stage in `analysis_script` is
+  cleared (see `clear_stage` below), and its executed notebook (+ `.html`) is deleted. Stages
+  not in `analysis_script` are kept, so `scale(..., ['03_DoublingTime.ipynb'],
+  on_existing='overwrite')` redoes only that stage. A notebook is matched to its stage(s)
+  through the `code.notebook` the manifest records.
+- `'error'` (the default) refuses a folder in which one of the stages already ran; the
+  source fails and the others still run. Previously the default refused any existing
+  folder.
+- `exist_ok`/`exist_skip` still work and warn (`DeprecationWarning`): `exist_skip=True`
+  → `'skip'`, `exist_ok=True` → `'overwrite'`, `exist_ok=False` → `'error'`. Passing both
+  styles raises `TypeError`.
+
+**`StageContext.clear(stage)` (now also `acia.analysis.stage.clear_stage(output_dir,
+stage)`) no longer deletes other stages' results.**
+- It used to unlink every *file* the stage recorded. That included `summary.json`, which
+  every stage writing a summary records, so clearing 03_DoublingTime also wiped
+  03_GrowthRate's numbers. Now a file another stage also recorded is kept, as directories
+  already were.
+- Inside a shared directory (`figures/`) the stage's own artifacts (written via
+  `ctx.output_path`) are removed, so its figures do not outlive it.
+- Its `summary.json` sections are removed (see below). The file is deleted once empty.
+
+**The SequenceDashboard gallery no longer reflows on hover.** Hovering a position row
+used to animate that row's height to a large preview, pushing every row below it down
+and shifting the list under the pointer. Rows now keep their fixed height; the larger
+preview is a single popover placed beside the gallery (never over it), centred on the
+hovered row and clamped into the image pane (`placePreview` in the dashboard ESM). It
+ignores the pointer, so moving down the list just moves the preview along.
+`roi_export_viewer` gains `box_size` (default `max_size`): the player is a fixed square
+box with `object-fit: contain`, so switching between ROIs of different aspect ratios no
+longer resizes the panel.
+
 **`export_rois` no longer holds a whole position in memory, and a re-run only exports
 what is new.** Two changes to `acia.roi_export.export_rois`, plus the handle hygiene
 around it:
@@ -64,6 +120,40 @@ around it:
   reviewing a folder of ROIs no longer holds one decoded stack per preview.
 
 ### Added
+
+**Cells that never divide are accounted for, not dropped**
+(`acia.analysis.doubling_time`):
+- `classify_tracklets(tracklet_graph, source)` gives every tracklet a status (`divided`,
+  `censored`, `excluded`) and a reason (alive at movie end, lost, present at start, one
+  daughter, …), so nothing disappears silently from the doubling-time analysis.
+- `growth_rate.fit_tracklet_sizes(overlay, tracklets, source)` fits any tracklet's size,
+  dividing or not: a non-growing cell measures μ ≈ 0 with its own interval.
+- `division_census(status, sizes, arrest_min_observation=…, arrest_max_growth=0.2)` reports
+  `n_divided`, `n_censored`, `n_long_not_divided`, `n_arrested` and `fraction_divided`. It is
+  a report, not an analysis input; undefined values are `None`.
+- `cell_cycle.plot_fit_vs_doubling` (static) and a reworked
+  `plot_fit_vs_doubling_interactive`: μ_fit against ln 2 / DT with both intervals as error
+  bars, coloured (and, interactively, toggleable) by flag reason.
+
+**`summary.json` sections have an owner.** `update_summary` attributes the section to the
+stage context open on that folder (built with `stage=`, not yet finished), recorded as
+`summary_sections` in its manifest entry; no notebook change is needed. Entries from
+before this have no owner and their sections are kept by `clear_stage`.
+`acia.analysis.cell_cycle.remove_summary_sections(output_dir, sections)` is the atomic
+undo of `update_summary`.
+
+**`acia.viz.annotate_sequence(source, *, timepoints, pixel_size, ...)`** — burns a time
+stamp and a scale bar into every frame of a movie, lazily (frames are drawn on demand).
+By default it adds a black band **below** the image (`placement='border_bottom'`: time on
+the left, scale bar with its length label on the right), so nothing covers the cells;
+`'border_top'` puts the band above and `'overlay'` draws onto the image in small boxes,
+keeping the frame size. Pass the calibration of the *original* source — the rendered
+overlays (`render_segmentation_mask` & co.) do not carry it; without a pixel size or
+timepoints the bar or time is skipped with a warning. The default band height keeps the
+frame height even, as yuv420p video requires. Two fixes in the older burn-in renderers:
+`render_time` drew the text at the raw `xy_position`, so relative (float) positions put
+it at the top-left corner; `render_scalebar` and `draw_scale_bar` ignored `color` for
+the bar itself (always white).
 
 **`acia.base.warp_rotated_crop(raw, spec)`** — the frame-level half of
 `RotatedCropSequenceSource`, factored out so a caller holding a decoded frame can crop it
@@ -472,6 +562,13 @@ warning-free under `-W`.
   to the slow path.
 
 ### Fixed
+- `update_summary` wrote a bare `NaN` (invalid JSON) for undefined values, e.g. the
+  population doubling time of a run that did not grow. Non-finite numbers are now written
+  as `null`.
+- `hover_table` (interactive cell plots) showed row numbers for tables read back from CSV;
+  it now uses the `tracklet` column when there is one. `valid` read back as text is parsed.
+- `plot_doubling_time_hose`'s docstring said a cell counts up to its last frame; it counts
+  until its division (`start_time <= t < division_time`), as the code always did.
 - Re-running a recorded stage left the manifest describing two runs as one. The new run
   inherited the previous one's recorded outputs, so until it collected its own the entry
   showed fresh parameters beside stale outputs — and a re-run that died half-way left

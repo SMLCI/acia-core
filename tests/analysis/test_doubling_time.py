@@ -14,7 +14,9 @@ import pandas as pd
 from acia import Q_, ureg
 from acia.analysis.doubling_time import (
     _compute_hose_bands,
+    classify_tracklets,
     compute_doubling_times,
+    division_census,
     plot_doubling_time_hose,
 )
 from acia.segm.local import THWCSequenceSource
@@ -445,3 +447,79 @@ class TestPlotDoublingTimeHose(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDoublingTimeUncertainty(unittest.TestCase):
+    """Frame-timing interval of the doubling time."""
+
+    def test_interval_and_sd(self):
+        g = _mixed_lineage_graph()
+        df = compute_doubling_times(g, _src(frame_interval="10 min"))
+        row = df.loc[3]
+        # tracklet 3: frames 3..5, daughters from 6 -> DT 30 min, lo 20, hi 40
+        self.assertAlmostEqual(row["doubling_time"].to("minute").magnitude, 30.0)
+        self.assertAlmostEqual(row["doubling_time_lo"].to("minute").magnitude, 20.0)
+        self.assertAlmostEqual(row["doubling_time_hi"].to("minute").magnitude, 40.0)
+        self.assertAlmostEqual(
+            row["doubling_time_sd"].to("minute").magnitude, 10 / np.sqrt(6)
+        )
+        self.assertEqual(row["frame_gap"], 0)
+
+    def test_frame_gap(self):
+        g = nx.DiGraph()
+        g.add_node(0, start_frame=0, end_frame=1)
+        g.add_node(1, start_frame=2, end_frame=4)
+        g.add_node(2, start_frame=7, end_frame=9)
+        g.add_node(3, start_frame=7, end_frame=9)
+        g.add_edges_from([(0, 1), (1, 2), (1, 3)])
+        df = compute_doubling_times(g, _src(frame_interval="10 min"))
+        self.assertEqual(df.loc[1, "frame_gap"], 2)
+        status = classify_tracklets(g, _src(frame_interval="10 min"))
+        self.assertEqual(status.loc[1, "reason"], "clean division (frame gap)")
+
+
+class TestClassifyAndCensus(unittest.TestCase):
+    """Every tracklet is accounted for; zero growth is reported, not imputed."""
+
+    def test_reasons(self):
+        g = _mixed_lineage_graph()
+        status = classify_tracklets(g, _src(t=13, frame_interval="10 min"))
+        self.assertEqual(len(status), g.number_of_nodes())
+        self.assertEqual(status.loc[3, "status"], "divided")
+        self.assertEqual(status.loc[1, "reason"], "present at start (birth unknown)")
+        self.assertEqual(status.loc[2, "reason"], "lost (no division seen)")
+        self.assertEqual(status.loc[30, "reason"], "alive at movie end")
+        self.assertEqual(status.loc[40, "reason"], "one daughter (other lost)")
+        self.assertEqual(status.loc[41, "reason"], "more than two daughters")
+        self.assertAlmostEqual(status.loc[2, "observed"].to("minute").magnitude, 70.0)
+
+    def test_census_counts_and_json_safe(self):
+        import json
+
+        g = _mixed_lineage_graph()
+        status = classify_tracklets(g, _src(t=13, frame_interval="10 min"))
+        census = division_census(status)
+        self.assertEqual(census["n_divided"], 1)
+        self.assertIsNone(census["fraction_divided"])
+        json.dumps(census, allow_nan=False)
+
+        census = division_census(status, arrest_min_observation="60 min")
+        # long-observed non-dividers: 2 (70 min), 30/31 (60 min) -> 3
+        self.assertEqual(census["n_long_not_divided"], 3)
+        self.assertAlmostEqual(census["fraction_divided"], 1 / 4)
+        self.assertIsNone(census["n_arrested"])
+
+    def test_arrested_uses_size_fit(self):
+        g = _mixed_lineage_graph()
+        status = classify_tracklets(g, _src(t=13, frame_interval="10 min"))
+        ids = [2, 30, 31]
+        sizes = pd.DataFrame(
+            {
+                "size_change": [0.05, 1.0, 0.9],
+                "mu_fit_ci_lo": [-0.1, 0.5, 0.4],
+                "mu_fit_ci_hi": [0.1, 0.9, 0.8],
+            },
+            index=pd.Index(ids, name="tracklet"),
+        )
+        census = division_census(status, sizes, arrest_min_observation="60 min")
+        self.assertEqual(census["n_arrested"], 1)

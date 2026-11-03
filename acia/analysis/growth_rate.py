@@ -261,6 +261,172 @@ def _cell_size(cont, measure: str) -> float:
     raise ValueError(f"measure must be 'area' or 'length', got {measure!r}")
 
 
+#: default threshold of the size-jump flags: a frame-to-frame size ratio below
+#: this (or above its inverse) marks a likely missed division (or merged cells)
+DEFAULT_SIZE_JUMP_RATIO = 0.65
+
+#: flag reasons of :func:`compute_cell_growth_rates`, in the order they are tested
+FLAG_REASONS = (
+    "too few points",
+    "size drop (missed division?)",
+    "size jump (merged cells?)",
+    "poor fit",
+    "disagrees with doubling time",
+)
+
+
+@dataclass
+class _SizeFit:
+    mu: float = np.nan
+    se: float = np.nan
+    ci_lo: float = np.nan
+    ci_hi: float = np.nan
+    r2: float = np.nan
+    n_points: int = 0
+    min_ratio: float = np.nan
+    max_ratio: float = np.nan
+    t_first: float = np.nan
+    t_last: float = np.nan
+
+
+def _fit_log_size(
+    t: np.ndarray, y: np.ndarray, *, min_points: int, ci_level: float, se_type: str
+) -> _SizeFit:
+    """OLS of ``log(size)`` on time for one tracklet (sizes > 0 and finite only)."""
+    ok = np.isfinite(y) & (y > 0)
+    t, y = t[ok], y[ok]
+    out = _SizeFit(n_points=int(t.size))
+    if t.size:
+        out.t_first, out.t_last = float(t[0]), float(t[-1])
+    if t.size >= 2:
+        ratios = y[1:] / y[:-1]
+        out.min_ratio, out.max_ratio = float(ratios.min()), float(ratios.max())
+    if t.size < max(min_points, 2):
+        return out
+    design = sm.add_constant(t, has_constant="add")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = sm.OLS(np.log(y), design).fit()
+        if se_type == "hac" and t.size >= 4:
+            model = model.get_robustcov_results(
+                cov_type="HAC", maxlags=max(1, int(np.floor(t.size ** (1 / 3))))
+            )
+    params = np.asarray(model.params, float)
+    out.mu = float(params[1])
+    out.r2 = float(model.rsquared)
+    if t.size >= 3:
+        out.se = float(np.asarray(model.bse, float)[1])
+        lo, hi = np.asarray(model.conf_int(alpha=1 - ci_level), float)[1]
+        out.ci_lo, out.ci_hi = float(lo), float(hi)
+    return out
+
+
+def fit_tracklet_sizes(
+    overlay,
+    tracklets,
+    source: ImageSequenceSource,
+    *,
+    measure: Literal["area", "length"] = "area",
+    rate_unit: str = "1/hour",
+    min_points: int = 4,
+    ci_level: float = 0.95,
+    se_type: Literal["ols", "hac"] = "ols",
+) -> pd.DataFrame:
+    """Fit ``size(t) = size_0 * exp(mu * t)`` for each tracklet, dividing or not.
+
+    The building block of :func:`compute_cell_growth_rates`, usable on any set
+    of tracklets -- including cells that never divide, where it is the only
+    growth readout there is (a non-growing cell measures ``mu`` near 0, with its
+    own confidence interval; nothing is imputed).
+
+    Args:
+        overlay: the tracked overlay; each contour's ``label`` is its tracklet id.
+        tracklets: the tracklet ids to fit (any iterable, e.g. ``df.index``).
+        source: the time-calibrated image sequence (for ``timepoints``).
+        measure: ``"area"`` or ``"length"`` as the cell size.
+        rate_unit: unit of the rates.
+        min_points: minimum number of observations for a fit.
+        ci_level: confidence level of ``mu_fit_ci_lo``/``mu_fit_ci_hi``.
+        se_type: ``"ols"`` (plain standard errors) or ``"hac"`` (Newey-West,
+            robust to the autocorrelated segmentation errors of consecutive
+            frames; wider, more honest intervals).
+
+    Returns:
+        One row per tracklet (index ``"tracklet"``): ``mu_fit``, ``mu_fit_se``,
+        ``mu_fit_ci_lo``, ``mu_fit_ci_hi`` (``pint[rate_unit]``), ``r2``,
+        ``n_points``, ``size_min_ratio``/``size_max_ratio`` (smallest/largest
+        frame-to-frame size ratio), ``observed`` (first to last observation,
+        in ``1/rate_unit``) and ``size_change`` (fitted relative size change
+        over the observation, ``exp(mu * observed) - 1``).
+    """
+    timepoints = source.timepoints
+    if timepoints is None:
+        raise ValueError(
+            "per-cell growth rates require time calibration -- the source has "
+            "neither a frame_interval nor per-frame timepoints"
+        )
+    if se_type not in ("ols", "hac"):
+        raise ValueError(f"se_type must be 'ols' or 'hac', got {se_type!r}")
+    time_unit = str((1 / Q_(1.0, rate_unit)).units)
+    t_all = np.asarray(timepoints.to(time_unit).magnitude, dtype=float)
+
+    by_label: dict = {}
+    for cont in overlay.contours:
+        by_label.setdefault(cont.label, []).append(cont)
+
+    labels = list(tracklets)
+    fits = []
+    for tracklet in labels:
+        conts = sorted(by_label.get(tracklet, []), key=lambda c: c.frame)
+        t = np.array([t_all[int(c.frame)] for c in conts], dtype=float)
+        y = np.array([_cell_size(c, measure) for c in conts], dtype=float)
+        fits.append(
+            _fit_log_size(
+                t, y, min_points=min_points, ci_level=ci_level, se_type=se_type
+            )
+        )
+
+    def col(name):
+        return np.asarray([getattr(f, name) for f in fits], dtype=float)
+
+    pint_dtype = f"pint[{rate_unit}]"
+    mu = col("mu")
+    observed = col("t_last") - col("t_first")
+    with np.errstate(over="ignore", invalid="ignore"):
+        size_change = np.expm1(mu * observed)
+    df = pd.DataFrame(
+        {
+            "mu_fit": pd.array(mu, dtype=pint_dtype),
+            "mu_fit_se": pd.array(col("se"), dtype=pint_dtype),
+            "mu_fit_ci_lo": pd.array(col("ci_lo"), dtype=pint_dtype),
+            "mu_fit_ci_hi": pd.array(col("ci_hi"), dtype=pint_dtype),
+            "r2": col("r2"),
+            "n_points": np.asarray([f.n_points for f in fits], dtype=int),
+            "size_min_ratio": col("min_ratio"),
+            "size_max_ratio": col("max_ratio"),
+            "observed": pd.array(observed, dtype=f"pint[{time_unit}]"),
+            "size_change": size_change,
+        },
+        index=pd.Index(labels, name="tracklet"),
+    )
+    df.attrs[UNIT_ATTR] = {
+        "mu_fit": rate_unit,
+        "mu_fit_se": rate_unit,
+        "mu_fit_ci_lo": rate_unit,
+        "mu_fit_ci_hi": rate_unit,
+        "observed": time_unit,
+    }
+    return df
+
+
+def _magnitudes(df: pd.DataFrame, col: str, unit: str) -> np.ndarray:
+    values = df[col]
+    if _is_pint_column(values):
+        return np.asarray(values.values.quantity.to(unit).magnitude, float)
+    src_unit = (df.attrs.get(UNIT_ATTR) or {}).get(col) or unit
+    return np.asarray(Q_(np.asarray(values, float), src_unit).to(unit).magnitude)
+
+
 def compute_cell_growth_rates(
     overlay,
     cycles: pd.DataFrame,
@@ -269,119 +435,207 @@ def compute_cell_growth_rates(
     measure: Literal["area", "length"] = "area",
     rate_unit: str = "1/hour",
     min_points: int = 4,
-    r2_min: float = 0.9,
-    rel_tol: float = 0.3,
+    agreement_z: float | None = 2.0,
+    size_jump_ratio: float | None = DEFAULT_SIZE_JUMP_RATIO,
+    r2_min: float | None = None,
+    rel_tol: float | None = None,
+    ci_level: float = 0.95,
+    se_type: Literal["ols", "hac"] = "ols",
 ) -> pd.DataFrame:
     """Per-cell exponential growth rate, fitted and derived from the doubling time.
 
     For every cell cycle in ``cycles`` (one row per tracklet, as returned by
     :func:`acia.analysis.doubling_time.compute_doubling_times`), the cell's size
     over its life is fitted as ``size(t) = size_0 * exp(mu * t)`` -- an OLS of
-    ``log(size)`` on time. The pixel calibration cancels in the slope, so sizes
-    are taken in pixels.
+    the **natural** log of size on time (:func:`fit_tracklet_sizes`). A constant
+    pixel calibration cancels in the slope, so sizes are taken in pixels.
 
-    Two growth rates are reported side by side:
+    Two growth rates are reported side by side, both natural-log rates in
+    ``rate_unit`` and therefore directly comparable:
 
-    * ``mu_fit`` -- from the size fit, with its standard error and ``r2``;
+    * ``mu_fit`` -- from the size fit, with its standard error and confidence
+      interval;
     * ``mu_from_dt`` -- ``ln(2) / doubling_time``, i.e. what the cell's cycle
-      duration implies if it doubled exactly once.
+      duration implies if it doubled exactly once. Its uncertainty
+      ``mu_from_dt_se`` comes from the frame timing: birth and division are each
+      only known to within one frame interval, so the doubling time is uncertain
+      by ``doubling_time_sd`` (``Δ/√6`` for equal frames), propagated as
+      ``ln2 * sd / DT²``. ``mu_from_dt_lo``/``_hi`` are ``ln2`` over the widest
+      possible doubling times.
 
-    A healthy cell has a good fit and the two agree. ``fit_outlier`` flags cells
-    where ``r2 < r2_min`` or ``|mu_fit - mu_from_dt| / mu_from_dt > rel_tol``
-    (reason in ``fit_outlier_reason``) -- typically a segmentation or tracking
-    error (a merged neighbour, a swapped identity, a missed division).
+    **How cells are flagged** (``fit_outlier`` / ``fit_outlier_reason``; the
+    first matching reason wins, see :data:`FLAG_REASONS`):
+
+    1. ``"too few points"`` -- fewer than ``min_points`` observations.
+    2. ``"size drop (missed division?)"`` -- the size falls below
+       ``size_jump_ratio`` times its previous frame (default 0.65, i.e. roughly
+       halves): usually a division the tracker did not see.
+    3. ``"size jump (merged cells?)"`` -- the size grows by more than
+       ``1 / size_jump_ratio`` between two frames: usually two cells merged by
+       the segmentation.
+    4. ``"poor fit"`` -- ``r2 < r2_min`` (off by default: one cycle spans only
+       ``ln 2`` in log-size, so R² mostly measures ordinary segmentation noise).
+    5. ``"disagrees with doubling time"`` -- the precision-scaled difference
+       ``agreement_z = |mu_fit - mu_from_dt| / sqrt(mu_fit_se² + mu_from_dt_se²)``
+       exceeds ``agreement_z`` (default 2). This is the difference in units of
+       the two readouts' combined measurement uncertainty: ``z <= 2`` means
+       they agree within what frame timing and fit noise explain; ``z > 2``
+       means something about the cell is off (tracking, segmentation, or
+       growth that is not exponential). Larger values are more lenient. A cell
+       with a very noisy fit has a large ``mu_fit_se`` and is rarely flagged --
+       check ``mu_fit_se`` for those. With ``rel_tol`` set, the old fixed
+       relative-tolerance test ``|mu_fit - mu_from_dt| / mu_from_dt > rel_tol``
+       is applied as well.
 
     Args:
         overlay: the tracked overlay; each contour's ``label`` is its tracklet
             id (the index of ``cycles``).
         cycles: per-cycle table with at least ``doubling_time``; its time
             columns and any ``valid``/``rejected_by`` columns are carried over.
+            With ``doubling_time_sd`` (from ``compute_doubling_times``) the
+            timing uncertainty is per cell; without it, it is estimated from
+            the median frame interval.
         source: the time-calibrated image sequence (for ``timepoints``).
         measure: ``"area"`` (default) or ``"length"`` (long side of the minimal
             rotated rectangle) as the cell size.
         rate_unit: unit of the growth rates (default ``"1/hour"``).
-        min_points: minimum number of observations for a fit; cells with fewer
-            get ``NaN`` fit values.
-        r2_min / rel_tol: thresholds of the ``fit_outlier`` flag.
+        min_points: minimum number of observations for a fit.
+        agreement_z: threshold of the precision-scaled agreement test
+            (``None`` switches it off).
+        size_jump_ratio: threshold of the size drop/jump flags (``None`` off).
+        r2_min: optional R² threshold (``None``, the default, switches it off).
+        rel_tol: optional fixed relative tolerance (``None`` off).
+        ci_level: confidence level of the fit's interval.
+        se_type: ``"ols"`` or ``"hac"`` standard errors (see
+            :func:`fit_tracklet_sizes`).
 
     Returns:
-        ``cycles`` (copied) plus ``mu_fit``, ``mu_fit_se``, ``mu_from_dt``
-        (``pint[rate_unit]``), ``r2``, ``n_points``, ``fit_outlier`` and
-        ``fit_outlier_reason``, indexed by tracklet.
+        ``cycles`` (copied) plus the :func:`fit_tracklet_sizes` columns,
+        ``mu_from_dt``, ``mu_from_dt_se``, ``mu_from_dt_lo``, ``mu_from_dt_hi``
+        (``pint[rate_unit]``), ``agreement_z``, ``fit_outlier`` and
+        ``fit_outlier_reason``, indexed by tracklet. The thresholds used are in
+        ``attrs["flag_thresholds"]`` (see :func:`flag_report`).
 
     Raises:
         ValueError: if ``source`` has no time calibration.
     """
-    timepoints = source.timepoints
-    if timepoints is None:
-        raise ValueError(
-            "per-cell growth rates require time calibration -- the source has "
-            "neither a frame_interval nor per-frame timepoints"
-        )
+    fits = fit_tracklet_sizes(
+        overlay,
+        cycles.index,
+        source,
+        measure=measure,
+        rate_unit=rate_unit,
+        min_points=min_points,
+        ci_level=ci_level,
+        se_type=se_type,
+    )
     time_unit = str((1 / Q_(1.0, rate_unit)).units)
-    t_all = np.asarray(timepoints.to(time_unit).magnitude, dtype=float)
-
-    by_label: dict = {}
-    for cont in overlay.contours:
-        by_label.setdefault(cont.label, []).append(cont)
-
-    mu, se, r2, npts = [], [], [], []
-    for tracklet in cycles.index:
-        conts = sorted(by_label.get(tracklet, []), key=lambda c: c.frame)
-        t = np.array([t_all[int(c.frame)] for c in conts], dtype=float)
-        y = np.array([_cell_size(c, measure) for c in conts], dtype=float)
-        ok = np.isfinite(y) & (y > 0)
-        t, y = t[ok], y[ok]
-        npts.append(int(t.size))
-        if t.size < max(min_points, 2):
-            mu.append(np.nan)
-            se.append(np.nan)
-            r2.append(np.nan)
-            continue
-        design = sm.add_constant(t, has_constant="add")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = sm.OLS(np.log(y), design).fit()
-        mu.append(float(model.params[1]))
-        se.append(float(model.bse[1]) if t.size >= 3 else np.nan)
-        r2.append(float(model.rsquared))
+    timepoints = source.timepoints
+    assert timepoints is not None  # checked by fit_tracklet_sizes
 
     out = cycles.copy()
     out.attrs = dict(cycles.attrs)
-    dt_col = cycles["doubling_time"]
-    if _is_pint_column(dt_col):
-        doubling = np.asarray(dt_col.values.quantity.to(time_unit).magnitude, float)
+    doubling = _magnitudes(cycles, "doubling_time", time_unit)
+    if "doubling_time_sd" in cycles.columns:
+        dt_sd = _magnitudes(cycles, "doubling_time_sd", time_unit)
     else:
-        unit = (cycles.attrs.get(UNIT_ATTR) or {}).get("doubling_time") or time_unit
-        doubling = np.asarray(
-            Q_(np.asarray(dt_col, float), unit).to(time_unit).magnitude
-        )
+        steps = np.diff(np.asarray(timepoints.to(time_unit).magnitude, float))
+        step = float(np.median(steps)) if steps.size else np.nan
+        dt_sd = np.full(len(cycles), step / np.sqrt(6))
+    dt_lo = (
+        _magnitudes(cycles, "doubling_time_lo", time_unit)
+        if "doubling_time_lo" in cycles.columns
+        else doubling - np.sqrt(6) * dt_sd
+    )
+    dt_hi = (
+        _magnitudes(cycles, "doubling_time_hi", time_unit)
+        if "doubling_time_hi" in cycles.columns
+        else doubling + np.sqrt(6) * dt_sd
+    )
     with np.errstate(divide="ignore", invalid="ignore"):
         from_dt = np.where(doubling > 0, np.log(2) / doubling, np.nan)
+        from_dt_se = np.where(doubling > 0, np.log(2) * dt_sd / doubling**2, np.nan)
+        from_dt_lo = np.where(dt_hi > 0, np.log(2) / dt_hi, np.nan)
+        from_dt_hi = np.where(dt_lo > 0, np.log(2) / dt_lo, np.inf)
 
-    mu_arr, from_dt = np.asarray(mu, float), np.asarray(from_dt, float)
-    r2_arr = np.asarray(r2, float)
+    for name in fits.columns:
+        out[name] = fits[name].values
     pint_dtype = f"pint[{rate_unit}]"
-    out["mu_fit"] = pd.array(mu_arr, dtype=pint_dtype)
-    out["mu_fit_se"] = pd.array(np.asarray(se, float), dtype=pint_dtype)
     out["mu_from_dt"] = pd.array(from_dt, dtype=pint_dtype)
-    out["r2"] = r2_arr
-    out["n_points"] = npts
+    out["mu_from_dt_se"] = pd.array(from_dt_se, dtype=pint_dtype)
+    out["mu_from_dt_lo"] = pd.array(from_dt_lo, dtype=pint_dtype)
+    out["mu_from_dt_hi"] = pd.array(from_dt_hi, dtype=pint_dtype)
 
+    mu_arr = _magnitudes(fits, "mu_fit", rate_unit)
+    mu_se = _magnitudes(fits, "mu_fit_se", rate_unit)
     with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.abs(mu_arr - from_dt) / np.sqrt(
+            np.nan_to_num(mu_se) ** 2 + np.nan_to_num(from_dt_se) ** 2
+        )
         rel_diff = np.abs(mu_arr - from_dt) / from_dt
+    z = np.where(np.isfinite(mu_arr) & np.isfinite(from_dt), z, np.nan)
+    out["agreement_z"] = z
+
+    r2_arr = fits["r2"].to_numpy(float)
+    min_ratio = fits["size_min_ratio"].to_numpy(float)
+    max_ratio = fits["size_max_ratio"].to_numpy(float)
     reasons = np.full(len(out), None, dtype=object)
-    reasons[np.isnan(mu_arr)] = "too few points"
-    reasons[(reasons == None) & (r2_arr < r2_min)] = "poor fit"  # noqa: E711
-    reasons[(reasons == None) & (rel_diff > rel_tol)] = "disagrees with doubling time"  # noqa: E711
+
+    def flag(mask, reason):
+        reasons[(reasons == None) & mask] = reason  # noqa: E711
+
+    flag(np.isnan(mu_arr), "too few points")
+    if size_jump_ratio is not None:
+        flag(min_ratio < size_jump_ratio, "size drop (missed division?)")
+        flag(max_ratio > 1 / size_jump_ratio, "size jump (merged cells?)")
+    if r2_min is not None:
+        flag(r2_arr < r2_min, "poor fit")
+    if agreement_z is not None:
+        flag(z > agreement_z, "disagrees with doubling time")
+    if rel_tol is not None:
+        flag(rel_diff > rel_tol, "disagrees with doubling time")
     out["fit_outlier"] = reasons != None  # noqa: E711
     out["fit_outlier_reason"] = reasons
 
-    out.attrs.setdefault(UNIT_ATTR, {})
     out.attrs[UNIT_ATTR] = {
-        **out.attrs[UNIT_ATTR],
-        "mu_fit": rate_unit,
-        "mu_fit_se": rate_unit,
+        **(out.attrs.get(UNIT_ATTR) or {}),
+        **fits.attrs[UNIT_ATTR],
         "mu_from_dt": rate_unit,
+        "mu_from_dt_se": rate_unit,
+        "mu_from_dt_lo": rate_unit,
+        "mu_from_dt_hi": rate_unit,
+    }
+    out.attrs["flag_thresholds"] = {
+        "min_points": min_points,
+        "size_jump_ratio": size_jump_ratio,
+        "r2_min": r2_min,
+        "agreement_z": agreement_z,
+        "rel_tol": rel_tol,
+        "ci_level": ci_level,
+        "se_type": se_type,
+        "measure": measure,
     }
     return out
+
+
+def flag_report(rates: pd.DataFrame) -> pd.DataFrame:
+    """Count flagged cells per reason, in the order the flags are tested.
+
+    The table to read next to the thresholds (``rates.attrs["flag_thresholds"]``,
+    copied to the result's ``attrs``): change a threshold, re-run, and the
+    counts show the effect at once. Every reason is listed, also with 0 cells.
+
+    Returns:
+        A DataFrame with columns ``reason`` and ``n`` -- one row per
+        :data:`FLAG_REASONS` entry, then ``"not flagged"`` and ``"total"``.
+    """
+    reasons = rates.get("fit_outlier_reason")
+    counts = (
+        reasons.dropna().value_counts() if reasons is not None else pd.Series(dtype=int)
+    )
+    rows = [(r, int(counts.get(r, 0))) for r in FLAG_REASONS]
+    n_flagged = sum(n for _, n in rows)
+    rows += [("not flagged", len(rates) - n_flagged), ("total", len(rates))]
+    report = pd.DataFrame(rows, columns=["reason", "n"])
+    report.attrs["flag_thresholds"] = dict(rates.attrs.get("flag_thresholds") or {})
+    return report

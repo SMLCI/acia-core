@@ -103,7 +103,7 @@ def test_traces_and_show_cell(lineage):
 
 def test_interactive_figures_carry_tracklet_ids(lineage):
     _, _, cycles, rates = lineage
-    rates = rates.copy()
+    rates = lineage[3].copy()
     rates.loc[3, "fit_outlier"] = True
     assert list(cell_status(rates)) == ["valid", "valid", "flagged"]
 
@@ -120,3 +120,28 @@ def test_interactive_figures_carry_tracklet_ids(lineage):
     scatter = plot_fit_vs_doubling_interactive(rates)
     assert "tracklet" in scatter.data[0].hovertemplate
     assert isinstance(rates, pd.DataFrame)
+
+
+def test_fit_vs_doubling_plots_group_by_reason(lineage):
+    from acia.analysis.cell_cycle import plot_fit_vs_doubling
+    from acia.analysis.cell_cycle_interactive import plot_fit_vs_doubling_interactive
+
+    rates = lineage[3].copy()
+    rates["fit_outlier_reason"] = rates["fit_outlier_reason"].astype(object)
+    first = rates.index[0]
+    rates.loc[first, "fit_outlier_reason"] = "size drop (missed division?)"
+    fig = plot_fit_vs_doubling(rates)
+    labels = [t.get_text() for t in fig.axes[0].get_legend().get_texts()]
+    assert any(lab.startswith("size drop") for lab in labels)
+    ifig = plot_fit_vs_doubling_interactive(rates)
+    names = [t.name for t in ifig.data]
+    assert any(n.startswith("size drop") for n in names) and "y = x" in names
+
+
+def test_hover_table_prefers_tracklet_column(lineage):
+    from acia.analysis.cell_cycle_interactive import hover_table
+
+    rates = lineage[3]
+
+    flat = rates.reset_index()
+    assert list(hover_table(flat)["tracklet"]) == [str(i) for i in rates.index]

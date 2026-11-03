@@ -93,6 +93,10 @@ def compute_doubling_times(
     end_times: list[float] = []
     division_times: list[float] = []
     doubling_times: list[float] = []
+    dt_lo: list[float] = []
+    dt_hi: list[float] = []
+    dt_sd: list[float] = []
+    frame_gaps: list[int] = []
 
     n_timepoints = len(timepoints)
 
@@ -134,6 +138,23 @@ def compute_doubling_times(
                 "starts before parent)"
             )
 
+        # Frame timing: the true birth lies after the frame before the first
+        # observation, and the true division after the mother's last frame --
+        # each end is only known to within one frame interval. The widest
+        # possible cycle runs from the frame before birth to the daughters'
+        # first frame, the narrowest from birth to the frame before that.
+        s_frame = node_attrs["start_frame"]
+        c_frame = tracklet_graph.nodes[child]["start_frame"]
+        before_birth = timepoints[s_frame - 1] if s_frame > 0 else start_time
+        before_division = timepoints[c_frame - 1] if c_frame > 0 else division_time
+        birth_step = (start_time - before_birth).to(unit_str).magnitude
+        division_step = (division_time - before_division).to(unit_str).magnitude
+        dt_lo.append((before_division - start_time).to(unit_str).magnitude)
+        dt_hi.append((division_time - before_birth).to(unit_str).magnitude)
+        # each end is uniform over its interval: variance step**2 / 12
+        dt_sd.append(float(np.sqrt((birth_step**2 + division_step**2) / 12)))
+        frame_gaps.append(int(c_frame - node_attrs["end_frame"] - 1))
+
         labels.append(n)
         start_times.append(start_time.to(unit_str).magnitude)
         end_times.append(end_time.to(unit_str).magnitude)
@@ -147,16 +168,213 @@ def compute_doubling_times(
             "end_time": pd.array(end_times, dtype=pint_dtype),
             "division_time": pd.array(division_times, dtype=pint_dtype),
             "doubling_time": pd.array(doubling_times, dtype=pint_dtype),
+            "doubling_time_lo": pd.array(dt_lo, dtype=pint_dtype),
+            "doubling_time_hi": pd.array(dt_hi, dtype=pint_dtype),
+            "doubling_time_sd": pd.array(dt_sd, dtype=pint_dtype),
+            "frame_gap": np.asarray(frame_gaps, dtype=int),
         },
         index=pd.Index(labels, name="tracklet"),
     )
     df.attrs[UNIT_ATTR] = {
-        "start_time": unit_str,
-        "end_time": unit_str,
-        "division_time": unit_str,
-        "doubling_time": unit_str,
+        col: unit_str
+        for col in (
+            "start_time",
+            "end_time",
+            "division_time",
+            "doubling_time",
+            "doubling_time_lo",
+            "doubling_time_hi",
+            "doubling_time_sd",
+        )
     }
     return df
+
+
+#: tracklet status values of :func:`classify_tracklets`
+TRACKLET_STATUSES = ("divided", "censored", "excluded")
+
+
+def classify_tracklets(
+    tracklet_graph: nx.DiGraph, source: ImageSequenceSource
+) -> pd.DataFrame:
+    """Say for *every* tracklet whether it yields a doubling time, and why not.
+
+    :func:`compute_doubling_times` keeps only clean divisions; this is the
+    complete account of the rest, so that cells which never divide do not
+    silently disappear. Each tracklet gets a ``status`` and a ``reason``:
+
+    * ``divided`` -- one mother, two daughters: a doubling time exists
+      (``reason`` is ``"clean division"``, or ``"clean division (frame gap)"``
+      when the daughters appear more than one frame after the mother's last
+      frame).
+    * ``censored`` -- the cycle was not seen to its end or from its start, so
+      it says nothing about growth by itself: ``"alive at movie end"``,
+      ``"lost (no division seen)"`` (ends before the movie does without
+      daughters: left the field, or the tracker lost it) or
+      ``"present at start (birth unknown)"``.
+    * ``excluded`` -- a topology a doubling time cannot be read from:
+      ``"one daughter (other lost)"``, ``"more than two daughters"`` or
+      ``"more than one mother"``.
+
+    Args:
+        tracklet_graph: as for :func:`compute_doubling_times`.
+        source: the time-calibrated image sequence.
+
+    Returns:
+        One row per tracklet (index ``"tracklet"``): ``start_frame``,
+        ``end_frame``, ``n_mothers``, ``n_daughters``, ``observed`` (first to
+        last frame, ``pint[<time unit>]``), ``status`` and ``reason``.
+    """
+    timepoints = source.timepoints
+    if timepoints is None:
+        raise ValueError(
+            "classifying tracklets requires time calibration -- source has "
+            "neither an explicit frame_interval nor per-frame timepoints set"
+        )
+    unit_str = str(timepoints.units)
+    last_frame = len(timepoints) - 1
+    rows = []
+    for n in tracklet_graph.nodes:
+        attrs = tracklet_graph.nodes[n]
+        s, e = int(attrs["start_frame"]), int(attrs["end_frame"])
+        n_in = tracklet_graph.in_degree(n)
+        n_out = tracklet_graph.out_degree(n)
+        if n_out == 0:
+            status = "censored"
+            reason = (
+                "alive at movie end" if e >= last_frame else "lost (no division seen)"
+            )
+        elif n_out == 1:
+            status, reason = "excluded", "one daughter (other lost)"
+        elif n_out > 2:
+            status, reason = "excluded", "more than two daughters"
+        elif n_in == 0:
+            status, reason = "censored", "present at start (birth unknown)"
+        elif n_in > 1:
+            status, reason = "excluded", "more than one mother"
+        else:
+            child_start = min(
+                tracklet_graph.nodes[c]["start_frame"]
+                for c in tracklet_graph.successors(n)
+            )
+            status = "divided"
+            reason = (
+                "clean division"
+                if child_start == e + 1
+                else "clean division (frame gap)"
+            )
+        e_clamped = min(max(e, 0), last_frame)
+        s_clamped = min(max(s, 0), last_frame)
+        observed = (
+            (timepoints[e_clamped] - timepoints[s_clamped]).to(unit_str).magnitude
+        )
+        rows.append((n, s, e, n_in, n_out, observed, status, reason))
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "tracklet",
+            "start_frame",
+            "end_frame",
+            "n_mothers",
+            "n_daughters",
+            "observed",
+            "status",
+            "reason",
+        ],
+    ).set_index("tracklet")
+    df["observed"] = pd.array(df["observed"].to_numpy(float), dtype=f"pint[{unit_str}]")
+    df.attrs[UNIT_ATTR] = {"observed": unit_str}
+    return df
+
+
+def division_census(
+    status: pd.DataFrame,
+    sizes: pd.DataFrame | None = None,
+    *,
+    arrest_min_observation: Any = None,
+    arrest_max_growth: float = 0.2,
+) -> dict[str, Any]:
+    """How many cells divided, were cut off, or stopped growing -- one dict.
+
+    A report, not an analysis input: it makes zero growth visible without
+    imputing anything. Cells that were not seen to divide are *not* counted as
+    "no growth" by default -- most of them were simply cut off by the movie's
+    end or lost by the tracker. Only a cell that was **watched long enough**
+    without dividing counts towards the denominator of ``fraction_divided``,
+    and only such a cell whose size did not grow counts as ``n_arrested``.
+
+    Args:
+        status: :func:`classify_tracklets` output.
+        sizes: optional :func:`acia.analysis.growth_rate.fit_tracklet_sizes`
+            output for (at least) the non-dividing tracklets; needed for
+            ``n_arrested``.
+        arrest_min_observation: how long a non-dividing cell must have been
+            observed to count (``"120 min"``, a pint quantity, or a number in
+            the unit of ``status["observed"]``). ``None`` disables the
+            long-observation counts.
+        arrest_max_growth: a long-observed, non-dividing cell is ``arrested``
+            when its fitted relative size change over the observation is below
+            this (default 0.2 = 20 %) or its growth-rate interval includes 0.
+
+    Returns:
+        ``n_tracklets``, ``n_divided``, ``n_censored``, ``n_excluded``,
+        ``n_long_not_divided``, ``n_arrested``, ``fraction_divided``
+        (``n_divided / (n_divided + n_long_not_divided)``) and the settings.
+        Undefined values are ``None`` -- never NaN or infinity, so the dict is
+        valid JSON.
+    """
+    from acia import Q_
+
+    counts = status["status"].value_counts()
+    out: dict[str, Any] = {
+        "n_tracklets": int(len(status)),
+        "n_divided": int(counts.get("divided", 0)),
+        "n_censored": int(counts.get("censored", 0)),
+        "n_excluded": int(counts.get("excluded", 0)),
+        "n_long_not_divided": None,
+        "n_arrested": None,
+        "fraction_divided": None,
+        "arrest_min_observation": None
+        if arrest_min_observation is None
+        else str(arrest_min_observation),
+        "arrest_max_growth": arrest_max_growth,
+    }
+    if arrest_min_observation is None:
+        return out
+    unit = _unit_of(status, "observed")
+    if isinstance(arrest_min_observation, (int, float)):
+        threshold = float(arrest_min_observation)
+    else:
+        threshold = float(Q_(arrest_min_observation).to(unit).magnitude)
+    observed = (
+        np.asarray(status["observed"].values.quantity.to(unit).magnitude, float)
+        if _is_pint_column(status["observed"])
+        else np.asarray(status["observed"], float)
+    )
+    long_nd = (
+        (status["status"].to_numpy() == "censored")
+        & (status["n_daughters"].to_numpy() == 0)
+        & (observed >= threshold)
+    )
+    out["n_long_not_divided"] = int(long_nd.sum())
+    denom = out["n_divided"] + out["n_long_not_divided"]
+    out["fraction_divided"] = (out["n_divided"] / denom) if denom else None
+    if sizes is not None:
+        ids = status.index[long_nd]
+        sub = sizes.reindex(ids)
+        change = sub["size_change"].to_numpy(float)
+        lo_col, hi_col = sub["mu_fit_ci_lo"], sub["mu_fit_ci_hi"]
+        lo = np.asarray(
+            lo_col.values.quantity.magnitude if _is_pint_column(lo_col) else lo_col,
+            float,
+        )
+        hi = np.asarray(
+            hi_col.values.quantity.magnitude if _is_pint_column(hi_col) else hi_col,
+            float,
+        )
+        arrested = (change < arrest_max_growth) | ((lo <= 0) & (hi >= 0))
+        out["n_arrested"] = int(np.sum(arrested))
+    return out
 
 
 def _unit_of(df: pd.DataFrame, col: str) -> str:
@@ -269,7 +487,7 @@ def plot_doubling_time_hose(
 
     At every time ``t`` in ``time_grid``, a cell contributes its
     ``doubling_time`` to the cross-section at ``t`` for as long as it was
-    alive -- i.e. whenever ``start_time <= t <= end_time`` -- not just at the
+    alive -- i.e. whenever ``start_time <= t < division_time`` -- not just at the
     single instant it divided. Grid points with fewer than ``min_n``
     alive-and-qualifying cells are left as ``NaN`` (a gap in the plotted line
     and bands, rather than a value computed from too few observations).

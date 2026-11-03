@@ -164,7 +164,10 @@ def plot_cell_traces(
         _plain_log_axis(ax)
     ax.set_xlabel(f"time since birth [{unit}]")
     ax.set_ylabel("area [px²]" if measure == "area" else "length [px]")
-    ax.legend(fontsize=8)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8)
+    else:  # nothing to show (e.g. no cell with a fit): say so instead of a blank axes
+        ax.text(0.5, 0.5, "no cells", ha="center", va="center", transform=ax.transAxes)
     fig.tight_layout()
     return fig
 

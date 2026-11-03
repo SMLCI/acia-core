@@ -317,9 +317,17 @@ class TestCellGrowthRates(unittest.TestCase):
         overlay, cycles, src = self._setup(noisy_label=2)
         rates = compute_cell_growth_rates(overlay, cycles, src)
 
+        # every other frame 2.56x the area: abrupt drops and jumps
         self.assertTrue(rates.loc[2, "fit_outlier"])
-        self.assertEqual(rates.loc[2, "fit_outlier_reason"], "poor fit")
+        self.assertEqual(
+            rates.loc[2, "fit_outlier_reason"], "size drop (missed division?)"
+        )
         self.assertFalse(rates.loc[1, "fit_outlier"])
+        # without the size flags the old R² rule still works, on request
+        rates = compute_cell_growth_rates(
+            overlay, cycles, src, size_jump_ratio=None, r2_min=0.9
+        )
+        self.assertEqual(rates.loc[2, "fit_outlier_reason"], "poor fit")
 
     def test_too_few_points(self):
         from acia.analysis.growth_rate import compute_cell_growth_rates
@@ -328,3 +336,110 @@ class TestCellGrowthRates(unittest.TestCase):
         rates = compute_cell_growth_rates(overlay, cycles, src, min_points=10)
         self.assertTrue(rates["mu_fit"].isna().all())
         self.assertEqual(set(rates["fit_outlier_reason"]), {"too few points"})
+
+
+class TestCellGrowthUncertainty(TestCellGrowthRates):
+    """Interval columns, precision-scaled agreement, size flags, report."""
+
+    def test_interval_columns(self):
+        from acia.analysis.growth_rate import compute_cell_growth_rates
+
+        overlay, cycles, src = self._setup()
+        rates = compute_cell_growth_rates(overlay, cycles, src)
+        h = "1/hour"
+        mu = rates["mu_fit"].values.quantity.to(h).magnitude
+        lo = rates["mu_fit_ci_lo"].values.quantity.to(h).magnitude
+        hi = rates["mu_fit_ci_hi"].values.quantity.to(h).magnitude
+        self.assertTrue(np.all(lo <= mu) and np.all(mu <= hi))
+        # DT 60 min, 10 min frames: sd = 10/sqrt(6) min -> se = ln2*sd/DT^2
+        # (cell 1 starts on frame 0, so its birth has no earlier frame; use 2, 3)
+        rates = rates.loc[[2, 3]]
+        se_dt = rates["mu_from_dt_se"].values.quantity.to(h).magnitude
+        np.testing.assert_allclose(
+            se_dt, np.log(2) * (10 / np.sqrt(6) / 60) / 1.0, rtol=1e-6
+        )
+        dt_lo = rates["mu_from_dt_lo"].values.quantity.to(h).magnitude
+        dt_hi = rates["mu_from_dt_hi"].values.quantity.to(h).magnitude
+        np.testing.assert_allclose(dt_lo, np.log(2) / (70 / 60), rtol=1e-6)
+        np.testing.assert_allclose(dt_hi, np.log(2) / (50 / 60), rtol=1e-6)
+        self.assertTrue((rates["agreement_z"] < 1e-3).all())
+        self.assertTrue(np.all(lo <= mu))
+
+    def test_disagreement_is_precision_scaled(self):
+        from acia.analysis.growth_rate import compute_cell_growth_rates
+
+        overlay, cycles, src = self._setup()
+        # pretend cell 2 divided after 120 min: ln2/DT halves, far outside the
+        # frame-timing uncertainty of a perfect fit
+        cycles = cycles.copy()
+        cycles["doubling_time"] = (
+            cycles["doubling_time"].values.quantity.to("minute").magnitude
+        )
+        cycles.attrs = {"units": {"doubling_time": "minute"}}
+        cycles.loc[2, "doubling_time"] = 120.0
+        cycles = cycles.drop(
+            columns=["doubling_time_sd", "doubling_time_lo", "doubling_time_hi"]
+        )
+        rates = compute_cell_growth_rates(overlay, cycles, src)
+        self.assertEqual(
+            rates.loc[2, "fit_outlier_reason"], "disagrees with doubling time"
+        )
+        self.assertFalse(rates.loc[1, "fit_outlier"])
+        lenient = compute_cell_growth_rates(overlay, cycles, src, agreement_z=None)
+        self.assertFalse(lenient.loc[2, "fit_outlier"])
+
+    def test_size_drop_flag_and_report(self):
+        from acia.analysis.growth_rate import (
+            FLAG_REASONS,
+            compute_cell_growth_rates,
+            flag_report,
+        )
+        from acia.base import Contour, Overlay
+
+        overlay, cycles, src = self._setup()
+        # halve cell 3 from its 4th frame on: an unseen division
+        conts = []
+        for c in overlay.contours:
+            if c.label == 3 and c.frame >= 9:
+                side = np.sqrt(c.area / 2)
+                c = Contour(
+                    [[0, 0], [side, 0], [side, side], [0, side]], -1, c.frame, c.id, 3
+                )
+            conts.append(c)
+        overlay = Overlay(conts, frames=list(range(14)))
+        rates = compute_cell_growth_rates(overlay, cycles, src)
+        self.assertEqual(
+            rates.loc[3, "fit_outlier_reason"], "size drop (missed division?)"
+        )
+        report = flag_report(rates)
+        self.assertEqual(
+            list(report["reason"][: len(FLAG_REASONS)]), list(FLAG_REASONS)
+        )
+        counts = dict(zip(report["reason"], report["n"], strict=True))
+        self.assertEqual(counts["size drop (missed division?)"], 1)
+        self.assertEqual(counts["total"], 3)
+        self.assertEqual(counts["not flagged"], 2)
+        self.assertEqual(report.attrs["flag_thresholds"]["agreement_z"], 2.0)
+
+    def test_fit_tracklet_sizes_non_dividing(self):
+        from acia.analysis.growth_rate import fit_tracklet_sizes
+        from acia.base import Contour, Overlay
+        from acia.segm.local import THWCSequenceSource
+
+        # a cell that does not grow at all over 10 frames
+        conts = [
+            Contour([[0, 0], [10, 0], [10, 10], [0, 10]], -1, f, f, 9)
+            for f in range(10)
+        ]
+        src = THWCSequenceSource(
+            np.zeros((10, 4, 4, 1), np.uint8), frame_interval="10 min"
+        )
+        sizes = fit_tracklet_sizes(Overlay(conts, frames=list(range(10))), [9], src)
+        self.assertAlmostEqual(
+            float(sizes.loc[9, "mu_fit"].to("1/hour").magnitude), 0.0, places=9
+        )
+        self.assertAlmostEqual(sizes.loc[9, "size_change"], 0.0, places=9)
+        self.assertEqual(sizes.loc[9, "n_points"], 10)
+        self.assertAlmostEqual(
+            float(sizes.loc[9, "observed"].to("minute").magnitude), 90.0
+        )

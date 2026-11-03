@@ -16,7 +16,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from acia.analysis.cell_cycle import _column, _label, _valid_mask
+from acia.analysis.cell_cycle import (
+    REASON_COLORS,
+    _column,
+    _label,
+    _rate_errors,
+    _valid_mask,
+    flag_reasons,
+)
 from acia.analysis.units import UNIT_ATTR, _is_pint_column
 
 if TYPE_CHECKING:
@@ -34,7 +41,9 @@ _HOVER_COLUMNS = (
     "division_time",
     "doubling_time",
     "mu_fit",
+    "mu_fit_se",
     "mu_from_dt",
+    "agreement_z",
     "r2",
     "n_points",
     "rejected_by",
@@ -53,8 +62,14 @@ def cell_status(df: pd.DataFrame) -> np.ndarray:
 
 
 def hover_table(df: pd.DataFrame) -> pd.DataFrame:
-    """The hover columns as plain values: ``tracklet`` plus what is present."""
-    out = pd.DataFrame({"tracklet": df.index.astype(str)}, index=df.index)
+    """The hover columns as plain values: ``tracklet`` plus what is present.
+
+    The tracklet id is the ``tracklet`` column when there is one (tables read
+    back from CSV, e.g. :meth:`acia.analysis.results.ResultSet.table`), the
+    index otherwise.
+    """
+    ids = df["tracklet"] if "tracklet" in df.columns else df.index
+    out = pd.DataFrame({"tracklet": np.asarray(ids).astype(str)}, index=df.index)
     for col in _HOVER_COLUMNS:
         if col not in df.columns:
             continue
@@ -223,48 +238,63 @@ def plot_distributions_interactive(
 
 
 def plot_fit_vs_doubling_interactive(
-    rates: pd.DataFrame, *, title: str = ""
+    rates: pd.DataFrame, *, title: str = "", rate_unit: str = "1/hour"
 ) -> go.Figure:
-    """Fitted growth rate against ``ln 2 / doubling time`` per cell, coloured by R²."""
+    """Fitted growth rate against ``ln 2 / doubling time`` per cell.
+
+    The interactive twin of :func:`acia.analysis.cell_cycle.plot_fit_vs_doubling`:
+    one trace per flag reason (click the legend to hide one), error bars for
+    both intervals, and the cell's details on hover.
+    """
     import plotly.graph_objects as go
 
-    fit = rates["mu_fit"].values.quantity.to("1/hour").magnitude
-    from_dt = rates["mu_from_dt"].values.quantity.to("1/hour").magnitude
+    values = _rate_errors(rates, rate_unit)
+    reasons = flag_reasons(rates)
     hover = hover_table(rates)
-    status = cell_status(rates)
-    fig = _figure(title, "ln 2 / doubling time [1/h]", "growth rate μ (fit) [1/h]")
-    fig.add_trace(
-        go.Scatter(
-            x=from_dt,
-            y=fit,
-            mode="markers",
-            name="cells",
-            marker={
-                "color": rates["r2"],
-                "colorscale": "Viridis",
-                "cmin": 0,
-                "cmax": 1,
-                "size": 8,
-                "colorbar": {"title": "R²"},
-                "line": {
-                    "color": [
-                        STATUS_COLORS["flagged"] if s == "flagged" else "white"
-                        for s in status
-                    ],
-                    "width": [2 if s == "flagged" else 0.5 for s in status],
+    unit = _label("", rate_unit).strip()
+    fig = _figure(title, f"ln 2 / doubling time {unit}", f"growth rate μ (fit) {unit}")
+    for reason, color in REASON_COLORS.items():
+        sel = reasons == reason
+        if not sel.any():
+            continue
+        if color.replace(".", "", 1).isdigit():  # matplotlib grey level
+            grey = int(float(color) * 255)
+            color = f"rgb({grey},{grey},{grey})"
+        else:
+            color = color.removeprefix("tab:")
+        fig.add_trace(
+            go.Scatter(
+                x=values["mu_from_dt"][sel],
+                y=values["mu_fit"][sel],
+                mode="markers",
+                name=f"{reason} ({int(sel.sum())})",
+                marker={"color": color, "size": 8},
+                error_x={
+                    "type": "data",
+                    "symmetric": False,
+                    "array": values["x_err"][1, sel],
+                    "arrayminus": values["x_err"][0, sel],
+                    "thickness": 0.8,
                 },
-            },
-            customdata=hover.to_numpy(),
-            hovertemplate=_hovertemplate(hover.columns),
+                error_y={
+                    "type": "data",
+                    "symmetric": False,
+                    "array": values["y_err"][1, sel],
+                    "arrayminus": values["y_err"][0, sel],
+                    "thickness": 0.8,
+                },
+                customdata=hover.to_numpy()[sel],
+                hovertemplate=_hovertemplate(hover.columns),
+            )
         )
-    )
-    top = float(np.nanmax(np.r_[fit, from_dt, 0])) * 1.1 or 1.0
+    finite = np.r_[values["mu_fit"], values["mu_from_dt"], 0.0]
+    top = float(np.nanmax(finite[np.isfinite(finite)])) * 1.1 or 1.0
     fig.add_trace(
         go.Scatter(
             x=[0, top],
             y=[0, top],
             mode="lines",
-            name="identity",
+            name="y = x",
             line={"dash": "dash", "color": "grey"},
             hoverinfo="skip",
         )
