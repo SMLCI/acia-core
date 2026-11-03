@@ -18,11 +18,15 @@ from acia.analysis.conditions import assign_conditions, parse_position_ranges
 from acia.analysis.results import (
     ResultSet,
     distribution,
+    division_census_table,
     dynamics,
     fit_monod,
+    group_palette,
     growth_rates,
     per_run,
     plot_monod,
+    plot_over_time,
+    step_through,
 )
 
 
@@ -54,7 +58,7 @@ def test_assign_conditions_nested_flat_overlap_unmapped():
         assign_conditions(df, {"a": "1-2", "b": "2-3"})
 
 
-def _run(root, experiment, position, roi, mu, n_cells=6, seed=0):
+def _run(root, experiment, position, roi, mu, n_cells=6, seed=0, census=None):
     """One run's output folder with manifest, doubling times, growth rates, properties."""
     rng = np.random.default_rng(seed)
     exports = root / "exports" / experiment
@@ -96,6 +100,10 @@ def _run(root, experiment, position, roi, mu, n_cells=6, seed=0):
     pd.DataFrame(
         [{"method": "TSCA", "growth_rate": mu, "growth_rate_unit": "1/h", **ctx.keys}]
     ).to_csv(ctx.output_path("growth_estimates.csv"), index=False)
+    if census is not None:
+        from acia.analysis.cell_cycle import update_summary
+
+        update_summary(ctx.output_dir, "division_census", census)
     ctx.finish()
 
 
@@ -232,3 +240,143 @@ def test_condition_of_a_position_covers_all_its_rois(tmp_path):
     by_roi, _ = distribution(dt, "doubling_time", by=["position", "roi"])
     assert len(by_roi) == 3
     plt.close("all")
+
+
+def _conditioned(two_batches):
+    return ResultSet.open(list(two_batches)).with_conditions(
+        {
+            "e1": {"low": "1-2", "mid": "3-4", "high": "5-6"},
+            "e2": {"low": "1", "mid": "2", "high": "3"},
+        },
+        values={"low": 0.1, "mid": 1.0, "high": 10.0},
+        value_name="substrate",
+    )
+
+
+def test_order_and_palette_select_and_colour_groups(two_batches):
+    dt = _conditioned(two_batches).table("doubling_times")
+    stats, fig = distribution(
+        dt, "doubling_time", order=["high", "low"], palette={"high": "#ff0000"}
+    )
+    assert list(stats.index) == ["high", "low"]
+    labels = [t.get_text().split("\n")[0] for t in fig.axes[0].get_xticklabels()]
+    assert labels == ["high", "low"]
+    _, ifig = distribution(
+        dt,
+        "doubling_time",
+        order=["high"],
+        palette={"high": "#ff0000"},
+        interactive=True,
+    )
+    assert [tr.marker.color for tr in ifig.data] == ["#ff0000"]
+    cells = _conditioned(two_batches).table("cell_properties")
+    curves, _ = dynamics(cells, "area", agg="sum", order=["mid"])
+    assert set(curves["condition"]) == {"mid"}
+    assert group_palette(["a", "b"]) == {"a": "#1f77b4", "b": "#ff7f0e"}
+    plt.close("all")
+
+
+def test_monod_band_contains_the_curve_and_covers_truth():
+    rng = np.random.default_rng(2)
+    rows = [
+        {
+            "condition": f"{s}",
+            "substrate": s,
+            "mu": 0.9 * s / (0.4 + s) + rng.normal(0, 0.03),
+        }
+        for s in (0.05, 0.1, 0.3, 1.0, 3.0, 10.0)
+        for _ in range(30)
+    ]
+    fit = fit_monod(pd.DataFrame(rows), s_unit="mM")
+    grid = np.linspace(0.01, 10, 50)
+    lo, hi = fit.band(grid)
+    mu = fit.predict(grid)
+    assert np.all(lo <= mu) and np.all(mu <= hi) and np.all(hi - lo > 0)
+    truth = 0.9 * grid / (0.4 + grid)
+    assert np.mean((lo <= truth) & (truth <= hi)) > 0.9
+    fig = plot_monod(fit)
+    assert any("CI" in t.get_text() for t in fig.axes[0].get_legend().get_texts())
+    ifig = plot_monod(fit, interactive=True, ci=None)
+    assert not any("CI" in (tr.name or "") for tr in ifig.data)
+    plt.close("all")
+
+
+def test_plot_over_time_layers_and_mean(two_batches):
+    rs = _conditioned(two_batches)
+    dt = rs.table("doubling_times")
+    table, fig = plot_over_time(
+        dt, "doubling_time", kind=("violin", "dots", "bars"), order=["low", "high"]
+    )
+    assert set(table["group"]) == {"low", "high"}
+    stats, _ = distribution(dt, "doubling_time", order=["low", "high"])
+    dashed = [ln for ln in fig.axes[0].lines if ln.get_linestyle() == "--"]
+    assert sorted(round(ln.get_ydata()[0], 6) for ln in dashed) == sorted(
+        round(float(m), 6) for m in stats["mean"]
+    )
+    _, ifig = plot_over_time(
+        dt, "doubling_time", kind=("dots", "bars"), interactive=True
+    )
+    groups = {tr.legendgroup for tr in ifig.data}
+    assert groups == {"low", "mid", "high"}
+    assert ifig.layout.legend.groupclick == "toggleitem"
+    with pytest.raises(ValueError, match="kind"):
+        plot_over_time(dt, "doubling_time", kind="lines")
+    plt.close("all")
+
+
+def test_step_through_png_sequence_and_slider(two_batches, tmp_path):
+    dt = _conditioned(two_batches).table("doubling_times")
+    order = ["low", "mid", "high"]
+    paths = step_through(
+        plot_over_time, dt, order, "doubling_time", out_dir=tmp_path / "steps"
+    )
+    assert [p.name for p in paths] == ["step_01.png", "step_02.png", "step_03.png"]
+    assert all(p.stat().st_size > 0 for p in paths)
+    fig = step_through(
+        plot_over_time, dt, order[::-1], "doubling_time", interactive=True
+    )
+    steps = fig.layout.sliders[0].steps
+    assert [st.label for st in steps] == ["high", "mid", "low"]
+    first = steps[0].args[0]["visible"]
+    shown = {tr.legendgroup for tr, v in zip(fig.data, first, strict=True) if v}
+    assert shown == {"high"}
+    plt.close("all")
+
+
+def test_division_census_table_warns_about_groups_without_divisions(tmp_path):
+    root = tmp_path / "batch"
+    for position, divided in ((1, 5), (2, 4), (3, 0)):
+        _run(
+            root / f"pos{position:03d}_roi001",
+            "e1",
+            position,
+            1,
+            0.5,
+            seed=position,
+            census={
+                "n_tracklets": 10,
+                "n_divided": divided,
+                "n_censored": 10 - divided,
+                "n_excluded": 0,
+                "n_long_not_divided": 3 if not divided else 0,
+                "n_arrested": 3 if not divided else 0,
+                "fraction_divided": (1.0 if divided else 0.0),
+            },
+        )
+    rs = ResultSet.open([root]).with_conditions({"grow": "1-2", "starved": "3"})
+    with pytest.warns(UserWarning, match="starved: no cell divided"):
+        table = division_census_table(rs)
+    assert table.loc["grow", "n_divided"] == 9
+    assert table.loc["starved", "fraction_divided"] == 0.0
+    assert table.loc["starved", "n_arrested"] == 3
+
+
+def test_natural_sorted_mixed_labels():
+    from acia.analysis.results import natural_sorted
+
+    assert natural_sorted(["10 mM", "high", "0.1 mM", "1 mM"]) == [
+        "0.1 mM",
+        "1 mM",
+        "10 mM",
+        "high",
+    ]

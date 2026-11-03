@@ -121,6 +121,24 @@ around it:
 
 ### Added
 
+**Cross-run plots: choose, order and colour the conditions; see them over time, one at a
+time** (`acia.analysis.results`):
+- `distribution` and `dynamics` take `order=` (which groups, in which order -- a subset
+  leaves the rest out) and `palette=` (a `{group: colour}` mapping or a list). Static plots
+  are now coloured per group. `group_palette(groups)` fixes one colour per group for every
+  plot; `natural_sorted(values)` is the default group order.
+- `plot_over_time(df, value, kind=("violin", "dots", "bars"), by="condition", ...)`:
+  per-cell doubling time or μ over the experiment, one colour per group, each group's mean
+  (the reported value) dashed. Interactively, each group is a legend group and every
+  layer its own entry, so one condition or one layer can be hidden.
+- `step_through(plot_fn, df, order, ...)` re-draws any of these plots with one more group
+  per step, axes and colours fixed: one PNG per step for slides, or a plotly slider.
+- `division_census_table(rs)` sums the runs' division census per group and warns, naming
+  the group, when no cell divided (the group is then missing from every per-cell table and
+  from a Monod fit on them) or when only a minority did.
+- `plot_monod(fit, ci=0.95)` shades the confidence band of the fitted curve
+  (`MonodFit.band`, delta method on the fit's covariance, now stored in `MonodFit.cov`).
+
 **Cells that never divide are accounted for, not dropped**
 (`acia.analysis.doubling_time`):
 - `classify_tracklets(tracklet_graph, source)` gives every tracklet a status (`divided`,

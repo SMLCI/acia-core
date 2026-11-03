@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -353,6 +353,8 @@ def distribution(
     kind: str = "violin",
     valid_only: bool = True,
     unit: str | None = None,
+    order: Sequence[str] | None = None,
+    palette: Mapping[str, str] | Sequence[str] | None = None,
     interactive: bool = False,
     ax: Axes | None = None,
 ):
@@ -366,6 +368,11 @@ def distribution(
         kind: ``"violin"`` (default), ``"box"``, ``"strip"`` or ``"ecdf"``.
         valid_only: drop rows whose ``valid`` is False (tracking artifacts).
         unit: convert the value to this unit first (e.g. ``"1/hour"``).
+        order: which groups to show, in this order (group labels as they appear
+            in the ``stats`` index / x axis, e.g. ``["0.1 mM", "1 mM"]``); groups
+            not listed are left out. ``None``: every group, naturally sorted.
+        palette: colours per group -- a ``{group: colour}`` mapping (keeps each
+            group's colour when ``order`` changes) or a list in ``order``.
         interactive: plotly figure (hover shows the keys and ids) instead of
             matplotlib.
 
@@ -379,6 +386,9 @@ def distribution(
     plot_df[value] = v
     plot_df = plot_df.dropna(subset=[value])
     plot_df["group"] = plot_df[by_cols].astype(str).agg(" · ".join, axis=1)
+    groups = _select_groups(plot_df["group"].unique(), order)
+    colors = _colors_for(groups, palette)
+    plot_df = plot_df[plot_df["group"].isin(groups)]
 
     stats = (
         plot_df.groupby(by_cols, dropna=False)[value]
@@ -388,38 +398,25 @@ def distribution(
     )
     stats["unit"] = v_unit
     label = f"{value.replace('_', ' ')}" + (f" [{v_unit}]" if v_unit else "")
-    groups = sorted(plot_df["group"].unique(), key=_natural_key)
 
     if interactive:
         import plotly.express as px
 
         hover = [c for c in _hover_cols(plot_df)]
+        style = {
+            "color": "group",
+            "color_discrete_map": colors,
+            "category_orders": {"group": groups},
+        }
         if kind == "ecdf":
-            fig = px.ecdf(
-                plot_df,
-                x=value,
-                color="group",
-                hover_data=hover,
-                category_orders={"group": groups},
-            )
+            fig = px.ecdf(plot_df, x=value, hover_data=hover, **style)
             fig.update_xaxes(title=label)
         elif kind == "box":
             fig = px.box(
-                plot_df,
-                x="group",
-                y=value,
-                points="all",
-                hover_data=hover,
-                category_orders={"group": groups},
+                plot_df, x="group", y=value, points="all", hover_data=hover, **style
             )
         elif kind == "strip":
-            fig = px.strip(
-                plot_df,
-                x="group",
-                y=value,
-                hover_data=hover,
-                category_orders={"group": groups},
-            )
+            fig = px.strip(plot_df, x="group", y=value, hover_data=hover, **style)
         else:
             fig = px.violin(
                 plot_df,
@@ -428,7 +425,7 @@ def distribution(
                 points="all",
                 box=True,
                 hover_data=hover,
-                category_orders={"group": groups},
+                **style,
             )
         if kind != "ecdf":
             fig.update_yaxes(title=label)
@@ -450,8 +447,9 @@ def distribution(
             xs = np.sort(s)
             ax.step(
                 xs,
-                np.arange(1, len(xs) + 1) / len(xs),
+                np.arange(1, len(xs) + 1) / max(len(xs), 1),
                 where="post",
+                color=colors[g],
                 label=f"{g} (n={len(xs)})",
             )
         ax.set_xlabel(label)
@@ -460,26 +458,30 @@ def distribution(
     else:
         if kind == "violin":
             usable = [
-                (p, s) for p, s in zip(positions, samples, strict=True) if len(s) > 1
+                (p, s, g)
+                for p, s, g in zip(positions, samples, groups, strict=True)
+                if len(s) > 1
             ]
             if usable:
                 parts = ax.violinplot(
-                    [s for _, s in usable],
-                    positions=[p for p, _ in usable],
+                    [s for _, s, _ in usable],
+                    positions=[p for p, _, _ in usable],
                     showmeans=True,
                     showextrema=False,
                 )
-                for body in list(parts["bodies"]):  # type: ignore[call-overload]
+                bodies = list(parts["bodies"])  # type: ignore[call-overload]
+                for body, (_, _, g) in zip(bodies, usable, strict=True):
+                    body.set_facecolor(colors[g])
                     body.set_alpha(0.35)
         elif kind == "box":
             ax.boxplot(samples, positions=positions, widths=0.5, showfliers=False)
-        for p, s in zip(positions, samples, strict=True):
+        for p, s, g in zip(positions, samples, groups, strict=True):
             ax.scatter(
                 p + rng.uniform(-0.08, 0.08, len(s)),
                 s,
                 s=8,
                 alpha=0.5,
-                color="tab:blue",
+                color=colors[g],
             )
         ax.set_xticks(
             positions,
@@ -501,6 +503,8 @@ def dynamics(
     unit: str | None = None,
     time_unit: str | None = None,
     show_runs: bool = True,
+    order: Sequence[str] | None = None,
+    palette: Mapping[str, str] | Sequence[str] | None = None,
     interactive: bool = False,
     ax: Axes | None = None,
 ):
@@ -511,6 +515,9 @@ def dynamics(
     ignored for ``"count"``), then the runs of a group are averaged, with a band
     of ``"sem"``, ``"std"`` or ``"ci"`` (95%) across runs. Thin lines are the
     single runs.
+
+    ``order`` and ``palette`` select, order and colour the groups as in
+    :func:`distribution`.
 
     Returns:
         ``(curves, figure)``: per group and time point the mean over runs, the
@@ -559,15 +566,17 @@ def dynamics(
     curves.attrs[UNIT_ATTR] = {time: t_unit, "mean": v_unit}
     per_run["group"] = per_run[by_cols].astype(str).agg(" · ".join, axis=1)
     curves["group"] = curves[by_cols].astype(str).agg(" · ".join, axis=1)
-    groups = sorted(curves["group"].unique(), key=_natural_key)
+    groups = _select_groups(curves["group"].unique(), order)
+    colors = _colors_for(groups, palette)
+    curves = curves[curves["group"].isin(groups)]
     x_label = f"{time} [{t_unit}]" if t_unit else time
 
     if interactive:
         import plotly.graph_objects as go
 
         fig = go.Figure()
-        palette = _palette(len(groups))
-        for color, g in zip(palette, groups, strict=True):
+        for g in groups:
+            color = colors[g]
             c = curves[curves["group"] == g]
             if show_runs:
                 for _, run in per_run[per_run["group"] == g].groupby(run_keys):
@@ -612,7 +621,8 @@ def dynamics(
         fig, ax = plt.subplots(figsize=(7, 4))
     else:
         fig = ax.figure
-    for color, g in zip(_palette(len(groups)), groups, strict=True):
+    for g in groups:
+        color = colors[g]
         c = curves[curves["group"] == g]
         if show_runs:
             for _, run in per_run[per_run["group"] == g].groupby(run_keys):
@@ -788,6 +798,8 @@ class MonodFit:
     r2: float
     points: pd.DataFrame
     s_unit: str = ""
+    cov: np.ndarray | None = None
+    dof: int = 1
 
     def to_dict(self) -> dict:
         return {
@@ -805,6 +817,31 @@ class MonodFit:
     def predict(self, s) -> np.ndarray:
         s = np.asarray(s, dtype=float)
         return np.asarray(self.mu_max * s / (self.ks + s), dtype=float)
+
+    def band(self, s, level: float = 0.95) -> tuple[np.ndarray, np.ndarray]:
+        """Confidence band of the fitted curve at ``s`` (delta method).
+
+        The uncertainty of μmax and Ks -- including their correlation, from the
+        fit's covariance -- propagated to the predicted μ(S):
+        ``var = g Σ gᵀ`` with ``g = (S/(Ks+S), -μmax·S/(Ks+S)²)``, and a
+        Student-t quantile with the fit's degrees of freedom. It is the band
+        of the *curve* (where the true μ(S) plausibly runs), not of single
+        measurements. ``NaN`` when the fit has no covariance.
+        """
+        from scipy.stats import t as student_t
+
+        s = np.asarray(s, dtype=float)
+        mu = self.predict(s)
+        if self.cov is None or not np.all(np.isfinite(self.cov)):
+            nan = np.full_like(mu, np.nan)
+            return nan, nan
+        grad = np.vstack(
+            [s / (self.ks + s), -self.mu_max * s / (self.ks + s) ** 2]
+        )  # (2, n)
+        var = np.einsum("in,ij,jn->n", grad, np.asarray(self.cov, float), grad)
+        q = float(student_t.ppf(0.5 + level / 2, max(1, self.dof)))
+        half = q * np.sqrt(np.clip(var, 0, None))
+        return mu - half, mu + half
 
 
 def fit_monod(
@@ -893,6 +930,8 @@ def fit_monod(
         r2=r2,
         points=points,
         s_unit=s_unit,
+        cov=np.asarray(cov, dtype=float),
+        dof=dof,
     )
 
 
@@ -902,8 +941,14 @@ def plot_monod(
     interactive: bool = False,
     ax: Axes | None = None,
     log_x: bool = False,
+    ci: float | None = 0.95,
 ):
-    """The fitted Monod curve over the condition means (± SEM), with μmax and Ks."""
+    """The fitted Monod curve over the condition means (± SEM), with μmax and Ks.
+
+    With ``ci`` (default 0.95) the curve's confidence band is shaded
+    (:meth:`MonodFit.band`): where the true μ(S) plausibly runs given the
+    uncertainty of μmax and Ks. ``None`` hides it.
+    """
     pts = fit.points
     s_max = float(pts["S"].max()) * 1.1 or 1.0
     grid = (
@@ -935,6 +980,19 @@ def plot_monod(
                 + "<br>S %{x}, μ %{y:.3f}<extra></extra>",
             )
         )
+        if ci is not None:
+            lo, hi = fit.band(grid, ci)
+            fig.add_trace(
+                go.Scatter(
+                    x=np.r_[grid, grid[::-1]],
+                    y=np.r_[hi, lo[::-1]],
+                    fill="toself",
+                    fillcolor="rgba(255,127,14,0.2)",
+                    line={"width": 0},
+                    name=f"{ci:.0%} CI of the fit",
+                    hoverinfo="skip",
+                )
+            )
         fig.add_trace(
             go.Scatter(x=grid, y=fit.predict(grid), mode="lines", name="Monod fit")
         )
@@ -966,7 +1024,18 @@ def plot_monod(
     ax.errorbar(
         pts["S"], pts["mu"], yerr=pts["sem"], fmt="o", capsize=3, label="conditions"
     )
-    ax.plot(grid, fit.predict(grid), "-", label="Monod fit")
+    line = ax.plot(grid, fit.predict(grid), "-", label="Monod fit")[0]
+    if ci is not None:
+        lo, hi = fit.band(grid, ci)
+        ax.fill_between(
+            grid,
+            lo,
+            hi,
+            color=line.get_color(),
+            alpha=0.2,
+            lw=0,
+            label=f"{ci:.0%} CI of the fit",
+        )
     ax.axhline(fit.mu_max, color="0.6", lw=0.8, ls=":")
     ax.axvline(fit.ks, color="0.6", lw=0.8, ls=":")
     ax.text(
@@ -988,6 +1057,391 @@ def plot_monod(
 
 
 # --------------------------------------------------------------------------- #
+# per-cell values over time, per condition
+# --------------------------------------------------------------------------- #
+OVER_TIME_KINDS = ("dots", "bars", "violin")
+
+
+def plot_over_time(
+    df: pd.DataFrame,
+    value: str,
+    *,
+    kind: str | Sequence[str] = "dots",
+    time: str = "division_time",
+    start: str = "start_time",
+    by: str | list[str] = "condition",
+    order: Sequence[str] | None = None,
+    palette: Mapping[str, str] | Sequence[str] | None = None,
+    bin_width: float | None = None,
+    mean_line: bool = True,
+    valid_only: bool = True,
+    unit: str | None = None,
+    time_unit: str | None = None,
+    interactive: bool = False,
+    ax: Axes | None = None,
+):
+    """Per-cell values (doubling time, μ) over the experiment, one colour per group.
+
+    The cross-run version of the single-run dot/bar plots: every condition in
+    its own colour on one time axis, so drifts and differences between
+    conditions show together.
+
+    * ``"dots"`` -- one dot per cell at ``time`` (its division);
+    * ``"bars"`` -- one horizontal bar per cell from ``start`` (birth) to ``time``;
+    * ``"violin"`` -- the cells binned by ``time`` (``bin_width``, default: the
+      time range in 8 bins), one violin per group and bin, side by side.
+
+    ``kind`` may list several (``("violin", "dots")``) to layer them. With
+    ``mean_line`` each group's mean over all its cells -- the value
+    :func:`distribution` reports -- is drawn as a dashed line in its colour.
+    Conditions overlap; :func:`step_through` adds them one at a time.
+
+    Args:
+        df: a per-cell table, e.g. ``rs.table("doubling_times")`` or
+            :func:`growth_rates`.
+        value: the column to plot (e.g. ``"doubling_time"``, ``"mu"``).
+        kind: ``"dots"``, ``"bars"``, ``"violin"`` or several of them.
+        time, start: the time columns (division and birth).
+        by: grouping column(s) -- one colour each.
+        order, palette: which groups, in which order and colour (see
+            :func:`distribution`; pass :func:`group_palette` of all groups to keep
+            colours fixed across subsets).
+        bin_width: violin bin width in ``time_unit``.
+        mean_line: dashed line at each group's mean.
+        valid_only: drop rows whose ``valid`` is False.
+        unit, time_unit: convert the value / time first.
+        interactive: plotly figure. Each group is a legend group and every layer
+            (dots, bars, violins, mean) its own entry, so a click hides one layer
+            of one condition and the group title hides the whole condition.
+
+    Returns:
+        ``(table, figure)``: the plotted rows (``group``, ``_t``, ``_v``,
+        ``_start``) and the plot.
+    """
+    kinds = (kind,) if isinstance(kind, str) else tuple(kind)
+    unknown = set(kinds) - set(OVER_TIME_KINDS)
+    if unknown:
+        raise ValueError(f"kind must be among {OVER_TIME_KINDS}, got {sorted(unknown)}")
+    data = _only_valid(df, valid_only)
+    by_cols = [by] if isinstance(by, str) else list(by)
+    v, v_unit = _values(data, value, unit)
+    t, t_unit = _values(data, time, time_unit)
+    table = data[list(dict.fromkeys(by_cols + _hover_cols(data)))].copy()
+    table["_v"], table["_t"] = v, t
+    table["_start"] = (
+        _values(data, start, t_unit or None)[0] if start in data.columns else np.nan
+    )
+    table = table.dropna(subset=["_v", "_t"])
+    table["group"] = table[by_cols].astype(str).agg(" · ".join, axis=1)
+    groups = _select_groups(table["group"].unique(), order)
+    colors = _colors_for(groups, palette)
+    table = table[table["group"].isin(groups)]
+    means = table.groupby("group")["_v"].mean()
+
+    t_min = float(np.nanmin(table["_start"].fillna(table["_t"]))) if len(table) else 0.0
+    t_max = float(table["_t"].max()) if len(table) else 1.0
+    width = bin_width or (max(t_max - t_min, 1e-9) / 8)
+    edges = np.arange(t_min, t_max + width, width) if len(table) else np.array([0, 1])
+    table["_bin"] = np.clip(np.digitize(table["_t"], edges) - 1, 0, len(edges) - 2)
+    y_label = f"{value.replace('_', ' ')}" + (f" [{v_unit}]" if v_unit else "")
+    x_label = "time" + (f" [{t_unit}]" if t_unit else "")
+    n_groups = max(len(groups), 1)
+    slot = width * 0.8 / n_groups
+
+    if interactive:
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+        for i, g in enumerate(groups):
+            part = table[table["group"] == g]
+            style = {"legendgroup": g, "legendgrouptitle_text": g}
+            color = colors[g]
+            if "bars" in kinds:
+                xs, ys = [], []
+                for a, b, y in zip(part["_start"], part["_t"], part["_v"], strict=True):
+                    xs += [a, b, None]
+                    ys += [y, y, None]
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="lines",
+                        name="bars",
+                        line={"color": color, "width": 2},
+                        opacity=0.6,
+                        **style,
+                    )
+                )
+            if "violin" in kinds:
+                centers = (
+                    edges[part["_bin"].to_numpy()] + width * 0.1 + slot * (i + 0.5)
+                )
+                fig.add_trace(
+                    go.Violin(
+                        x=centers,
+                        y=part["_v"],
+                        name="violins",
+                        line_color=color,
+                        width=slot,
+                        points=False,
+                        meanline_visible=True,
+                        **style,
+                    )
+                )
+            if "dots" in kinds:
+                fig.add_trace(
+                    go.Scatter(
+                        x=part["_t"],
+                        y=part["_v"],
+                        mode="markers",
+                        name="dots",
+                        marker={"color": color, "size": 6},
+                        opacity=0.8,
+                        **style,
+                    )
+                )
+            if mean_line and g in means:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[t_min, t_max],
+                        y=[means[g]] * 2,
+                        mode="lines",
+                        name=f"mean {means[g]:.3g}",
+                        line={"color": color, "dash": "dash", "width": 2},
+                        **style,
+                    )
+                )
+        fig.update_layout(
+            template="plotly_white",
+            height=440,
+            xaxis_title=x_label,
+            yaxis_title=y_label,
+            violinmode="overlay",
+            legend={"groupclick": "toggleitem"},
+        )
+        return table, fig
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(9, 4))
+    else:
+        fig = ax.figure
+    for i, g in enumerate(groups):
+        part = table[table["group"] == g]
+        color = colors[g]
+        if "bars" in kinds:
+            ax.hlines(
+                part["_v"], part["_start"], part["_t"], color=color, lw=1.5, alpha=0.6
+            )
+        if "violin" in kinds:
+            for b, cell_values in part.groupby("_bin")["_v"]:
+                if len(cell_values) < 2:
+                    continue
+                pos = edges[int(b)] + width * 0.1 + slot * (i + 0.5)
+                body = ax.violinplot(
+                    [cell_values.to_numpy()],
+                    positions=[pos],
+                    widths=slot,
+                    showmeans=True,
+                    showextrema=False,
+                )
+                for patch in body["bodies"]:  # type: ignore[attr-defined]
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.35)
+                body["cmeans"].set_color(color)
+        if "dots" in kinds:
+            ax.scatter(part["_t"], part["_v"], s=10, color=color, alpha=0.8)
+        if mean_line and g in means:
+            ax.axhline(means[g], color=color, ls="--", lw=1.2)
+    handles = [
+        Line2D(
+            [],
+            [],
+            color=colors[g],
+            marker="o",
+            ls="--" if mean_line else "",
+            label=f"{g} (n={int((table['group'] == g).sum())})",
+        )
+        for g in groups
+    ]
+    if handles:
+        ax.legend(
+            handles=handles, fontsize=8, title="dashed = mean" if mean_line else None
+        )
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    fig.tight_layout()
+    return table, fig
+
+
+def step_through(
+    plot_fn: Callable[..., Any],
+    df: pd.DataFrame,
+    order: Sequence[str],
+    *args,
+    out_dir: str | Path | None = None,
+    name: str = "step",
+    interactive: bool = False,
+    dpi: int = 150,
+    **kwargs,
+):
+    """Show groups one after another -- the same plot, one more condition each step.
+
+    Not a new kind of plot: ``plot_fn`` is any plot here that takes ``order=``
+    and ``palette=`` (:func:`plot_over_time`, :func:`distribution`,
+    :func:`dynamics`), called with ``order[:1]``, ``order[:2]``, ... -- so axes
+    and colours stay fixed while conditions are added (low → high:
+    ``order``; high → low: ``order[::-1]``; any custom order works).
+
+    Args:
+        plot_fn: the plot function; ``*args``/``**kwargs`` are passed on.
+        df: its table.
+        order: the groups, in the order they are added.
+        out_dir: static mode -- write one PNG per step there
+            (``{name}_01.png`` ...), ready to drop onto slides.
+        name: file name stem.
+        interactive: build one plotly figure with a slider instead: step *k*
+            shows the first *k* groups.
+        dpi: PNG resolution.
+
+    Returns:
+        Static: the list of PNG paths (empty without ``out_dir``; the figures are
+        closed). Interactive: the plotly figure.
+    """
+    order = [str(g) for g in order]
+    palette = kwargs.pop("palette", None) or group_palette(order)
+
+    def call(groups, **extra):
+        out = plot_fn(df, *args, order=groups, palette=palette, **kwargs, **extra)
+        return out[-1] if isinstance(out, tuple) else out
+
+    if interactive:
+        fig = call(order, interactive=True)
+        steps = []
+        for k in range(1, len(order) + 1):
+            shown = set(order[:k])
+            visible = [
+                (getattr(tr, "legendgroup", None) or "") in shown
+                or not getattr(tr, "legendgroup", None)
+                for tr in fig.data
+            ]
+            steps.append(
+                {
+                    "method": "update",
+                    "label": order[k - 1],
+                    "args": [{"visible": visible}],
+                }
+            )
+        fig.update_layout(
+            sliders=[
+                {
+                    "active": len(order) - 1,
+                    "steps": steps,
+                    "currentvalue": {"prefix": "up to: "},
+                }
+            ]
+        )
+        return fig
+
+    import matplotlib.pyplot as plt
+
+    full = call(order)
+    limits = [(a.get_xlim(), a.get_ylim()) for a in full.axes]
+    plt.close(full)
+    paths: list[Path] = []
+    for k in range(1, len(order) + 1):
+        fig = call(order[:k])
+        for a, (xlim, ylim) in zip(fig.axes, limits, strict=False):
+            a.set_xlim(xlim)
+            a.set_ylim(ylim)
+        if out_dir is not None:
+            path = Path(out_dir) / f"{name}_{k:02d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=dpi, bbox_inches="tight")
+            paths.append(path)
+        plt.close(fig)
+    return paths
+
+
+def division_census_table(
+    rs: ResultSet,
+    *,
+    by: str | list[str] = "condition",
+    min_fraction_divided: float = 0.5,
+) -> pd.DataFrame:
+    """How many cells divided per group -- and which groups the per-cell rates miss.
+
+    Reads the ``division_census`` section every run's 03_DoublingTime wrote to
+    its ``summary.json``, sums it per group (and keeps the per-run rows in
+    ``attrs["runs"]``). Per-cell doubling times and growth rates only exist for
+    cells that divided, so a group with no divisions is **absent** from every
+    per-cell table and from a Monod fit on them. This warns, naming the group,
+    when a group has no division or a ``fraction_divided`` below
+    ``min_fraction_divided`` -- so a non-growing condition is never dropped
+    silently.
+
+    Returns:
+        Per group: ``runs``, ``n_tracklets``, ``n_divided``, ``n_censored``,
+        ``n_long_not_divided``, ``n_arrested``, ``fraction_divided``.
+    """
+    import warnings
+
+    by_cols = [by] if isinstance(by, str) else list(by)
+    summaries = rs.summaries()
+    prefix = "division_census."
+    cols = [c for c in summaries.columns if c.startswith(prefix)]
+    if not cols:
+        warnings.warn(
+            "no run has a division_census in its summary.json -- re-run "
+            "03_DoublingTime with this acia version",
+            stacklevel=2,
+        )
+        return pd.DataFrame()
+    runs = summaries.rename(columns={c: c[len(prefix) :] for c in cols})
+    counts = [
+        "n_tracklets",
+        "n_divided",
+        "n_censored",
+        "n_long_not_divided",
+        "n_arrested",
+    ]
+    for c in counts:
+        runs[c] = pd.to_numeric(runs.get(c), errors="coerce")
+    present = [c for c in by_cols if c in runs.columns]
+    grouped = (
+        runs.groupby(present, dropna=False)
+        if present
+        else runs.groupby(lambda _: "all")
+    )
+    table = grouped[counts].sum(min_count=1)
+    table.insert(0, "runs", grouped.size())
+    denom = table["n_divided"] + table["n_long_not_divided"]
+    table["fraction_divided"] = (table["n_divided"] / denom).where(denom > 0)
+    table.attrs["runs"] = runs
+    for group, row in table.iterrows():
+        if not row["n_divided"]:
+            warnings.warn(
+                f"{group}: no cell divided in {int(row['runs'])} run(s) -- this group "
+                "has no doubling times or per-cell growth rates and is missing from "
+                "every per-cell plot and a Monod fit on them; see the census",
+                stacklevel=2,
+            )
+        elif (
+            pd.notna(row["fraction_divided"])
+            and row["fraction_divided"] < min_fraction_divided
+        ):
+            warnings.warn(
+                f"{group}: only {row['fraction_divided']:.0%} of the long-observed "
+                "cells divided -- the per-cell statistics describe the dividing "
+                "minority",
+                stacklevel=2,
+            )
+    return table
+
+
+# --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 def _natural_key(text: str):
@@ -997,6 +1451,39 @@ def _natural_key(text: str):
     # "0.1 mM" < "0.3 mM" < "1 mM" < "10 mM", "pos2" < "pos10"
     parts = re.split(r"(\d+(?:\.\d+)?)", str(text))
     return [(0, float(p), "") if i % 2 else (1, 0.0, p) for i, p in enumerate(parts)]
+
+
+def _select_groups(present, order: Sequence[str] | None) -> list[str]:
+    """The groups to draw: ``order`` (as text, those present) or all, sorted."""
+    present_set = {str(g) for g in present}
+    if order is None:
+        return sorted(present_set, key=_natural_key)
+    return [str(g) for g in dict.fromkeys(order) if str(g) in present_set]
+
+
+def _colors_for(
+    groups: Sequence[str], palette: Mapping[str, str] | Sequence[str] | None
+) -> dict[str, str]:
+    """``{group: colour}``: from a mapping, a list in group order, or tab10/20."""
+    if isinstance(palette, Mapping):
+        default = _palette(len(groups))
+        return {g: str(palette.get(g, default[i])) for i, g in enumerate(groups)}
+    colors = list(palette) if palette is not None else _palette(len(groups))
+    if len(colors) < len(groups):
+        colors += _palette(len(groups))[len(colors) :]
+    return {g: str(c) for g, c in zip(groups, colors, strict=False)}
+
+
+def natural_sorted(values) -> list[str]:
+    """``values`` as text, sorted the way the plots order groups by default:
+    numbers by value (``"0.1 mM" < "1 mM" < "10 mM"``, ``"pos2" < "pos10"``)."""
+    return sorted({str(v) for v in values}, key=_natural_key)
+
+
+def group_palette(groups: Sequence[str]) -> dict[str, str]:
+    """A fixed ``{group: colour}`` for ``groups`` -- pass it as ``palette=`` so a
+    condition keeps its colour in every plot, whichever subset is shown."""
+    return _colors_for([str(g) for g in groups], None)
 
 
 def _palette(n: int) -> list:
@@ -1031,10 +1518,15 @@ __all__ = [
     "MonodFit",
     "ResultSet",
     "distribution",
+    "division_census_table",
     "dynamics",
     "fit_monod",
+    "group_palette",
+    "natural_sorted",
     "growth_rates",
     "per_run",
     "plot_monod",
+    "plot_over_time",
     "save_json",
+    "step_through",
 ]
