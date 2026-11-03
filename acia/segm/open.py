@@ -399,6 +399,22 @@ class SequenceFile:
 
     # --- cleanup ---------------------------------------------------------------
 
+    def release(self, index: int) -> None:
+        """Drop one position's cached reader, closing its file handle.
+
+        Per-position sources are cached for the lifetime of the handle, which is
+        what makes browsing the gallery fast -- but a batch that walks every
+        position once (``export_rois``) would otherwise end up holding one open
+        reader per position. Releasing a position once it is done keeps that at
+        one; the source is rebuilt lazily on the next access.
+        """
+        for cache in (self._corrected_cache, self._pos_cache):
+            src = cache.pop(index, None)
+            close = getattr(src, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+
     def close(self) -> None:
         """Release cached per-position readers."""
         for src in self._pos_cache.values():

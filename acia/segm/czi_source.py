@@ -17,6 +17,8 @@ axis, the exact analogue of ND2's ``P``.
 
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 
 from acia import Q_
@@ -443,7 +445,20 @@ class CZISequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         except Exception:  # noqa: BLE001 - cleanup must never raise
             pass
 
+    def close(self) -> None:
+        """Release the open CZI file handle (the source stays usable).
+
+        A :class:`~acia.segm.open.SequenceFile` caches one source per position
+        and releases them through this method, so without it a long multi-position
+        run keeps every position's handle open until the garbage collector
+        happens to get to it. Reading again simply re-opens the file.
+        """
+        reader, self._reader = self._reader, None
+        self._sizes = None
+        if reader is not None:
+            self._safe_close(reader)
+
     def __del__(self) -> None:
         """Best-effort close of the underlying CZI file handle."""
-        if self._reader is not None:
-            self._safe_close(self._reader)
+        with contextlib.suppress(Exception):
+            self.close()

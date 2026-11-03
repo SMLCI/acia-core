@@ -1132,6 +1132,53 @@ class RotatedCropSpec:
         )
 
 
+def warp_rotated_crop(raw: np.ndarray, spec: RotatedCropSpec) -> np.ndarray:
+    """Straighten one frame's rotated rectangle into an axis-aligned crop.
+
+    The frame-level half of :class:`RotatedCropSequenceSource`, factored out so a
+    caller that already holds a decoded frame (e.g. a frames-outer export pass
+    cropping one frame for several ROIs) can reuse the exact same warp instead of
+    going back through the lazy view -- there is one implementation of this
+    matrix, just as there is one :func:`acia.registration.apply_correction`.
+
+    A rotated rectangle that extends past the image bounds is filled with a zero
+    border (no crash). Frames are interpolated with ``INTER_LINEAR``; this crops
+    intensity images, not label/mask images (linear interpolation would blend
+    label ids).
+
+    Args:
+        raw: One frame, grayscale ``(H, W)`` or multi-channel ``(H, W, C)``.
+        spec: The rotated rectangle to straighten.
+
+    Returns:
+        np.ndarray: The crop, ``(h, w)`` for a 2D input and ``(h, w, C)``
+            otherwise, with ``(w, h) == spec.size``.
+    """
+    cx, cy = spec.center
+    w, h = spec.size
+    M = cv2.getRotationMatrix2D((cx, cy), spec.angle, 1.0)
+    M[0, 2] += w / 2 - cx
+    M[1, 2] += h / 2 - cy
+
+    if raw.ndim == 2:
+        # grayscale (H, W): warpAffine handles directly
+        return cv2.warpAffine(raw, M, (w, h), flags=cv2.INTER_LINEAR)
+
+    if raw.shape[2] <= 4:
+        # up to 4 channels: warpAffine handles directly, but it collapses a
+        # trailing singleton channel -- restore the (H, W, C) axis so a
+        # (H, W, 1) parent does not silently become a 2D frame.
+        out = cv2.warpAffine(raw, M, (w, h), flags=cv2.INTER_LINEAR)
+        return out if out.ndim == 3 else out[..., None]
+
+    # cv2.warpAffine only supports <= 4 channels: warp per-channel and re-stack
+    channels = [
+        cv2.warpAffine(raw[..., c], M, (w, h), flags=cv2.INTER_LINEAR)
+        for c in range(raw.shape[2])
+    ]
+    return np.stack(channels, axis=-1)
+
+
 class RotatedCropSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
     """A lazy rotated-rectangle crop view over a parent sequence.
 
@@ -1157,29 +1204,7 @@ class RotatedCropSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         self.spec = spec
 
     def _warp(self, raw: np.ndarray) -> np.ndarray:
-        cx, cy = self.spec.center
-        w, h = self.spec.size
-        M = cv2.getRotationMatrix2D((cx, cy), self.spec.angle, 1.0)
-        M[0, 2] += w / 2 - cx
-        M[1, 2] += h / 2 - cy
-
-        if raw.ndim == 2:
-            # grayscale (H, W): warpAffine handles directly
-            return cv2.warpAffine(raw, M, (w, h), flags=cv2.INTER_LINEAR)
-
-        if raw.shape[2] <= 4:
-            # up to 4 channels: warpAffine handles directly, but it collapses a
-            # trailing singleton channel -- restore the (H, W, C) axis so a
-            # (H, W, 1) parent does not silently become a 2D frame.
-            out = cv2.warpAffine(raw, M, (w, h), flags=cv2.INTER_LINEAR)
-            return out if out.ndim == 3 else out[..., None]
-
-        # cv2.warpAffine only supports <= 4 channels: warp per-channel and re-stack
-        channels = [
-            cv2.warpAffine(raw[..., c], M, (w, h), flags=cv2.INTER_LINEAR)
-            for c in range(raw.shape[2])
-        ]
-        return np.stack(channels, axis=-1)
+        return warp_rotated_crop(raw, self.spec)
 
     def get_frame(self, frame: int) -> BaseImage:
         idx = self._resolve_t_index(frame)
@@ -1287,44 +1312,112 @@ class RegisteredSequenceSource(ImageSequenceSource):
         nearest = min(self.transforms, key=lambda stored: (abs(stored - idx), stored))
         return self.transforms[nearest]
 
-    def get_frame(self, frame: int) -> BaseImage:
-        idx = self._resolve_t_index(frame)
+    def transform_for(self, frame: int) -> FrameTransform | None:
+        """The correction this view applies to ``frame``, per ``on_missing``.
+
+        The single place the missing-transform policy lives: it resolves the
+        stored transform (or the nearest one), warns once per frame index and
+        records the index in :attr:`missing_frames`. :meth:`get_frame` uses it
+        to correct pixels; a caller that wants to *compose* the correction with
+        something else -- :meth:`spec_for`, so a crop can be taken from the
+        uncorrected frame in one warp -- asks for the transform instead, and
+        the report of what was missing comes out the same either way.
+
+        Returns:
+            FrameTransform | None: ``None`` means "use the frame as it is",
+            which is what ``on_missing='warn'`` does for a frame that has no
+            transform of its own and no neighbour to borrow from.
+
+        Raises:
+            KeyError: if the frame has no transform and ``on_missing='error'``.
+        """
+        return self._transform_for(self._resolve_t_index(frame))
+
+    def _transform_for(self, idx: int) -> FrameTransform | None:
+        """:meth:`transform_for` for an already-resolved frame index."""
         transform = self.transforms.get(idx)
+        if transform is not None:
+            return transform
+
+        first_time = idx not in self._missing
+        self._missing.add(idx)
+
+        if self.on_missing == "error":
+            raise KeyError(
+                f"RegisteredSequenceSource: no stored correction for frame "
+                f"{idx} (on_missing='error')."
+            )
+
+        if self.on_missing == "nearest":
+            transform = self._nearest_transform(idx)
 
         if transform is None:
-            first_time = idx not in self._missing
-            self._missing.add(idx)
-
-            if self.on_missing == "error":
-                raise KeyError(
-                    f"RegisteredSequenceSource: no stored correction for frame "
-                    f"{idx} (on_missing='error')."
-                )
-
-            if self.on_missing == "nearest":
-                transform = self._nearest_transform(idx)
-
-            if transform is None:
-                if first_time:
-                    warnings.warn(
-                        f"RegisteredSequenceSource: no stored correction for "
-                        f"frame {idx}; returning it uncorrected.",
-                        stacklevel=2,
-                    )
-                return self.parent.get_frame(idx)
-
             if first_time:
                 warnings.warn(
-                    f"RegisteredSequenceSource: no stored correction for frame "
-                    f"{idx}; correcting it with the nearest available frame's "
-                    "transform instead (approximate).",
-                    stacklevel=2,
+                    f"RegisteredSequenceSource: no stored correction for "
+                    f"frame {idx}; returning it uncorrected.",
+                    stacklevel=3,
                 )
+            return None
+
+        if first_time:
+            warnings.warn(
+                f"RegisteredSequenceSource: no stored correction for frame "
+                f"{idx}; correcting it with the nearest available frame's "
+                "transform instead (approximate).",
+                stacklevel=3,
+            )
+        return transform
+
+    def spec_for(self, frame: int, spec: RotatedCropSpec) -> RotatedCropSpec:
+        """``spec``, given in this corrected view's coordinates, in ``frame``'s own.
+
+        The corrected view lives in the reference frame's coordinate system, so
+        a crop spec against it is a reference-frame rectangle. Running it back
+        through this frame's own transform says where that same rectangle sits
+        in the *uncorrected* frame -- which is what lets
+        :class:`RegisteredRotatedCropSource` take the crop straight out of the
+        raw frame, with one interpolation instead of correcting the whole frame
+        and then cropping the result.
+
+        Args:
+            frame: Frame index, resolved as everywhere else.
+            spec: The rectangle in reference-frame (corrected) coordinates.
+
+        Returns:
+            RotatedCropSpec: The same rectangle in ``frame``'s coordinates, or
+                ``spec`` unchanged where there is no correction to undo.
+        """
+        from acia.registration import apply_correction_to_spec, invert
+
+        transform = self._transform_for(self._resolve_t_index(frame))
+        if transform is None:
+            return spec
+        # The rotation pivots about the FULL frame's center, so this has to be
+        # the full frame's shape -- a crop's would silently misplace the box.
+        return apply_correction_to_spec(
+            spec, invert(transform), shape=(self.size_h, self.size_w)
+        )
+
+    def crop_rotated(self, spec: RotatedCropSpec) -> RegisteredRotatedCropSource:
+        """A rotated crop of this corrected view, taken in a single warp.
+
+        Overrides :meth:`ImageSequenceSource.crop_rotated` so that cropping a
+        corrected view does not resample twice (correct the whole frame, then
+        crop it). See :class:`RegisteredRotatedCropSource`.
+        """
+        return RegisteredRotatedCropSource(self, spec)
+
+    def get_frame(self, frame: int) -> BaseImage:
+        idx = self._resolve_t_index(frame)
+        transform = self._transform_for(idx)
+        image = self.parent.get_frame(idx)
+        if transform is None:
+            return image
 
         from acia.registration import apply_correction
 
-        raw = np.asarray(self.parent.get_frame(idx).raw)
-        corrected = apply_correction(raw, transform)
+        corrected = apply_correction(np.asarray(image.raw), transform)
         return ArrayImage(corrected, frame=idx)
 
     @property
@@ -1354,6 +1447,39 @@ class RegisteredSequenceSource(ImageSequenceSource):
     @property
     def pixel_size(self):
         return self.parent.pixel_size
+
+
+class RegisteredRotatedCropSource(RotatedCropSequenceSource):
+    """A rotated crop of a drift-corrected view, taken in a **single** warp.
+
+    What :meth:`RegisteredSequenceSource.crop_rotated` returns. Correcting a
+    frame and then cropping the result are both affine maps, so they compose:
+    instead of resampling the whole frame onto the reference grid and resampling
+    that again into the rectangle, this maps the rectangle back into the
+    uncorrected frame's own coordinates (:meth:`RegisteredSequenceSource.spec_for`)
+    and takes it straight out of the raw frame.
+
+    Same crop, geometrically -- the composition is exact -- but one
+    interpolation instead of two, so it is both sharper and cheaper: the
+    full-frame warp disappears, which on a 2048x2048 frame is the bulk of the
+    per-frame cost. A rectangle that overhangs the frame also picks up the zero
+    border once rather than twice.
+
+    The parent read from is the corrected view's *parent* (the raw sequence); a
+    correction changes no dimension, so every size and the calibration are the
+    same either way, and the missing-transform bookkeeping still runs through
+    :meth:`RegisteredSequenceSource.transform_for`.
+    """
+
+    def __init__(self, registered: RegisteredSequenceSource, spec: RotatedCropSpec):
+        super().__init__(registered.parent, spec)
+        self.registered = registered
+
+    def get_frame(self, frame: int) -> BaseImage:
+        idx = self._resolve_t_index(frame)
+        spec = self.registered.spec_for(idx, self.spec)
+        raw = np.asarray(self.parent.get_frame(idx).raw)
+        return ArrayImage(warp_rotated_crop(raw, spec), frame=idx)
 
 
 class RGBSequenceSource(ImageSequenceSource):

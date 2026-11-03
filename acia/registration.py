@@ -246,7 +246,7 @@ def apply_correction(frame: np.ndarray, transform: FrameTransform) -> np.ndarray
     inverting it and warping ``frame`` maps it back onto the reference frame's
     coordinate system. Same convention as the rotation-about-center + explicit
     translation used throughout this module (and mirrored by
-    :class:`~acia.base.RotatedCropSequenceSource`'s own warp matrix).
+    :func:`acia.base.warp_rotated_crop`, the crop's own warp matrix).
 
     This is the single place this warp math lives -- the verify view, the
     batch-apply step, and :class:`~acia.base.RegisteredSequenceSource` all call
@@ -621,6 +621,38 @@ def _decompose_similarity(
     dx = float(tx - cx + a * cx + b * cy)
     dy = float(ty - cy + c * cx + d * cy)
     return FrameTransform(dx=dx, dy=dy, theta=theta)
+
+
+def invert(transform: FrameTransform) -> FrameTransform:
+    """The transform that undoes ``transform``.
+
+    If ``transform`` was estimated as A->B, this is the B->A transform:
+    :func:`compose` of the two is the identity. Needed wherever a mapping has to
+    run the other way -- notably to carry a crop spec that lives in the
+    *reference* frame's coordinates back into one frame's own coordinates, so
+    the crop can be taken from the uncorrected frame in a single warp
+    (see :meth:`acia.base.RegisteredSequenceSource.spec_for`).
+
+    Like :func:`compose`, the result is independent of the pivot point, so no
+    frame shape is needed: inverting ``[R(theta) | (I - R(theta))c + d]`` gives
+    ``theta' = -theta`` and ``d' = -R(-theta) @ d``, with ``c`` cancelling.
+
+    Args:
+        transform: The A->B transform to invert.
+
+    Returns:
+        FrameTransform: The B->A transform, carrying ``confidence`` through
+            unchanged (inverting does not make a fit more or less trustworthy).
+    """
+    radians = np.radians(-transform.theta)
+    cos_t, sin_t = float(np.cos(radians)), float(np.sin(radians))
+    # R(-theta) applied to d, negated -- the same 2x2 convention as `compose`.
+    return FrameTransform(
+        dx=-(cos_t * transform.dx + sin_t * transform.dy),
+        dy=-(-sin_t * transform.dx + cos_t * transform.dy),
+        theta=-transform.theta,
+        confidence=transform.confidence,
+    )
 
 
 def compose(first: FrameTransform, second: FrameTransform) -> FrameTransform:

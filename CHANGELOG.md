@@ -14,7 +14,74 @@ as the work lands.
 
 ## [Unreleased]
 
+### Changed
+
+**`export_rois` no longer holds a whole position in memory, and a re-run only exports
+what is new.** Two changes to `acia.roi_export.export_rois`, plus the handle hygiene
+around it:
+- A position's frames are now walked **once**, and each frame is cropped for every ROI of
+  that position while it is in hand. Previously the whole position was read into memory up
+  front (`materialize()`, one `(T, H, W, C)` array — gigabytes on a long timelapse) and then
+  re-read per ROI, re-correcting the same full frame once for every ROI. Peak memory is now
+  the ROI stacks being filled, bounded by the new `max_roi_buffer_bytes` (default 2 GiB,
+  which splits the ROIs over as many passes as it takes), plus the frames the reader holds
+  (`chunk_frames`, default 8, read ahead on one background thread so a network read overlaps
+  the warping). Neither grows with the length of the timelapse.
+- **The drift correction is now composed into the crop, so each exported pixel is
+  interpolated once instead of twice.** The export used to correct the whole frame onto the
+  reference grid and then resample that into the ROI rectangle; it now carries the rectangle
+  back into the uncorrected frame's own coordinates and takes the crop in a single warp.
+  The two warps are affine and compose exactly — verified to 1e-13 on point mapping and
+  0.004 px on a blob centroid — so it is the same region, but less blurred (a Gaussian blob's
+  peak loses ~0.9% to the second resample) and much cheaper: on a 2048×2048 frame the
+  full-frame warp was 2.53 ms of the 2.77 ms per-frame warp cost at one ROI. **This changes
+  exported pixel values** (mean |difference| ~0.02% of range on smooth content, ~1% on
+  hard-edged content), so an export is no longer byte-identical to one made by an earlier
+  version. Each `roi_export.json` entry now records `crop_pipeline`, so a future change here
+  re-exports instead of mixing two resamplings in one folder; files written before this (which
+  carry no recorded settings at all) are still kept by `on_existing='skip'` — pass
+  `on_existing='overwrite'` once if you want a folder consistently on the new pipeline.
+- **Re-running is incremental** (`on_existing`, default `'skip'`): a selection whose file is
+  already there, unchanged and complete, is skipped, and a position whose ROIs are all
+  skipped is never opened, read or registered — so drawing one more ROI in the dashboard and
+  re-running the export costs one position. This is also how an interrupted export resumes.
+  `roi_export.json` is now written after every ROI rather than once at the end, each entry
+  records the selection's geometry and the settings that change pixels, and each TIFF is
+  written beside its target and renamed into place so a killed run cannot leave a truncated
+  file that looks finished (`verify_existing` header-checks one that was written before this
+  was true). `roi_nb` is kept stable across runs — a selection keeps the number it was given,
+  so inserting a new ROI no longer renumbers (and silently reassigns) the existing files.
+  `on_existing='overwrite'` restores the previous always-redo behaviour; `'error'` refuses.
+  `roi_export.json` is now `acia.roi_export/v2`; v1 files are still read.
+- `CZISequenceSource.close()` / `ND2SequenceSource.close()` and
+  `SequenceFile.release(index)` are new: a per-position reader is now released when the
+  export is done with it, instead of one open file handle per position accumulating for the
+  life of the kernel (`SequenceFile.close()` could not release CZI/ND2 readers at all, since
+  neither defined `close`). `export_rois` also closes the `RegistrationDashboard` it builds
+  (which pinned every position's transforms and the whole `SequenceFile`), closes its
+  per-position progress bar, and sends the dashboard's per-frame progress message at most
+  every 50 ms rather than once per frame. `render_roi_preview` closes the handle it opens, so
+  reviewing a folder of ROIs no longer holds one decoded stack per preview.
+
 ### Added
+
+**`acia.base.warp_rotated_crop(raw, spec)`** — the frame-level half of
+`RotatedCropSequenceSource`, factored out so a caller holding a decoded frame can crop it
+without going back through the lazy view. The class now delegates to it, so there is one
+implementation of that warp matrix (as there is one `acia.registration.apply_correction`).
+
+**`acia.registration.invert(transform)`** — the transform that undoes a `FrameTransform`
+(`compose(t, invert(t))` is the identity). Pivot-independent, like `compose`, so it needs no
+frame shape.
+
+**`RegisteredSequenceSource.transform_for` / `.spec_for` / `.crop_rotated`** — the
+missing-transform policy (`on_missing`, the `missing_frames` bookkeeping) now lives in
+`transform_for`, so a caller that wants to *compose* the correction rather than apply it to
+pixels can ask for the transform and still be counted in the per-position report. `spec_for`
+carries a reference-frame crop spec back into one frame's own coordinates, and
+`crop_rotated` on a corrected view returns a `RegisteredRotatedCropSource`, which crops the
+raw frame in a single warp instead of resampling twice.
+
 
 **Exporting curated ROIs** (`acia.roi_export.export_rois`) — the writing half of the
 curation workflow, moved out of `SequencePreprocessing.ipynb` and now tested:

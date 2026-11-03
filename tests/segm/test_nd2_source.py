@@ -395,3 +395,28 @@ class TestAxisOrderGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClose(_ND2TestBase):
+    """``close()`` releases the handle (and its memory map); the source stays usable."""
+
+    def test_close_releases_the_reader_and_reading_reopens_it(self) -> None:
+        src = self.make_source(position=1)
+        src.get_frame(0)
+        self.assertEqual(self.record["closed"], 0)
+
+        src.close()
+        self.assertEqual(self.record["closed"], 1)
+
+        # A SequenceFile hands its cached sources to whoever asked for them
+        # earlier, so closing one must not wedge it -- the next read re-opens.
+        frame = src.get_frame(1)
+        self.assertEqual(frame.raw.shape, (8, 10, 2))
+        self.assertEqual(src.size_t, 5)
+
+    def test_close_is_idempotent(self) -> None:
+        src = self.make_source(position=0)
+        _ = src.size_t
+        src.close()
+        src.close()
+        self.assertEqual(self.record["closed"], 1)

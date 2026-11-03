@@ -13,6 +13,7 @@ optional dependency, imported lazily inside :meth:`ND2SequenceSource._ensure_rea
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 import numpy as np
@@ -363,10 +364,23 @@ class ND2SequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
 
     # --- cleanup ---------------------------------------------------------------
 
+    def close(self) -> None:
+        """Release the open ND2 file handle (the source stays usable).
+
+        A :class:`~acia.segm.open.SequenceFile` caches one source per position
+        and releases them through this method, so without it a long multi-position
+        run keeps every position's handle (and its memory map) open until the
+        garbage collector happens to get to it. Reading again re-opens the file.
+        """
+        reader, self._reader = self._reader, None
+        self._sizes = None
+        self._dask = None
+        self._seq_lookup = None
+        if reader is not None:
+            with contextlib.suppress(Exception):
+                reader.close()
+
     def __del__(self) -> None:
         """Best-effort close of the underlying ND2 file handle."""
-        try:
-            if self._reader is not None:
-                self._reader.close()
-        except Exception:  # noqa: BLE001 - cleanup must never raise
-            pass
+        with contextlib.suppress(Exception):
+            self.close()

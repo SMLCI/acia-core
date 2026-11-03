@@ -8,6 +8,9 @@ crop can be traced back to the frame it came from.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import json
 import os
 import tempfile
 import unittest
@@ -18,8 +21,14 @@ import numpy as np
 import tifffile
 
 from acia.base import RotatedCropSpec
-from acia.roi_export import export_rois
+from acia.roi_export import (
+    _register_position,
+    _roi_bytes,
+    _roi_groups,
+    export_rois,
+)
 from acia.segm.open import open_sequence
+from acia.segm.tiff_export import save_tiff_stack
 from acia.selection import RoiSelection, SelectionManifest, make_source_block
 
 SIZE = 64
@@ -292,7 +301,7 @@ class TestExportInfo(_Case):
         export_rois(manifest, self.out, source=self.seqfile, progress=False)
         info = json.loads((Path(self.out) / "roi_export.json").read_text())
 
-        self.assertEqual(info["schema"], "acia.roi_export/v1")
+        self.assertEqual(info["schema"], "acia.roi_export/v2")
         self.assertEqual(
             [(r["file"], r["position"], r["position_index"]) for r in info["rois"]],
             [("pos001_roi001.tiff", 1, 0), ("pos002_roi001.tiff", 2, 1)],
@@ -368,3 +377,501 @@ class TestExportReview(_Case):
         self.assertGreater(len(video.value), 0)
         picker.value = "pos002_roi001.tiff"
         self.assertIn("rendered in", caption.value)
+
+
+# --------------------------------------------------------------------------- #
+# one read and one correction per frame, however many ROIs
+# --------------------------------------------------------------------------- #
+@contextlib.contextmanager
+def _count_reads():
+    """``{(position folder, frame): reads}`` for every decode during the block."""
+    from acia.segm.folder_source import FolderSequenceSource
+
+    counts: dict[tuple[str, int], int] = {}
+    original = FolderSequenceSource.get_frame
+
+    def counting(self, index):
+        key = (os.path.basename(self.folder), int(index))
+        counts[key] = counts.get(key, 0) + 1
+        return original(self, index)
+
+    with unittest.mock.patch.object(FolderSequenceSource, "get_frame", counting):
+        yield counts
+
+
+def _reads_per_frame(counts, folder="pos000", skip_first=True):
+    """Reads of each frame of one position; frame 0 is special, see the tests."""
+    return [
+        n
+        for (f, t), n in sorted(counts.items())
+        if f == folder and (t or not skip_first)
+    ]
+
+
+class _ThreeRois:
+    THREE_ROIS = [
+        (0, (16.0, 16.0), (8, 8), "a", 0),
+        (0, (32.0, 32.0), (8, 8), "b", 0),
+        (0, (48.0, 48.0), (8, 8), "c", 0),
+    ]
+
+
+class TestFramesOuterPass(_ThreeRois, _Case):
+    """A position is walked once, not once per ROI."""
+
+    num_positions = 1
+    num_t = 6
+
+    def test_each_frame_is_read_once_without_registration(self):
+        manifest = _manifest(self.seqfile, self.THREE_ROIS)
+        with _count_reads() as counts:
+            export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        # Three ROIs, one read per frame -- not one pass per ROI.
+        self.assertEqual(_reads_per_frame(counts), [1] * (self.num_t - 1))
+
+    def test_all_three_rois_hold_their_own_pixels(self):
+        manifest = _manifest(self.seqfile, self.THREE_ROIS)
+        written = export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        self.assertEqual(len(written), 3)
+        for path in written:
+            stack = tifffile.imread(path)
+            self.assertEqual(stack.shape, (self.num_t, 8, 8))
+            for t in range(self.num_t):
+                self.assertTrue((stack[t] == _encode(0, t)).all())
+
+
+class TestFramesOuterPassRegistered(_ThreeRois, _Case):
+    """Same, with drift correction in play (which needs frames to lock onto)."""
+
+    num_positions = 1
+    num_t = 6
+    shift = 2.0  # px per frame
+
+    def test_each_frame_is_read_twice_with_registration(self):
+        manifest = _manifest(self.seqfile, self.THREE_ROIS)
+        with _count_reads() as counts:
+            export_rois(
+                manifest,
+                self.out,
+                registration_method_name="GradientECC",
+                source=self.seqfile,
+                progress=False,
+            )
+        # Once to estimate the transform, once to crop -- still independent of
+        # how many ROIs the position holds.
+        self.assertEqual(_reads_per_frame(counts), [2] * (self.num_t - 1))
+
+    def test_no_frame_is_ever_corrected_as_a_whole(self):
+        """The drift correction is composed into each crop, not applied first."""
+        import acia.registration
+
+        manifest = _manifest(self.seqfile, self.THREE_ROIS)
+        calls = []
+        original = acia.registration.apply_correction
+
+        def counting(frame, transform):
+            calls.append(transform)
+            return original(frame, transform)
+
+        with unittest.mock.patch.object(
+            acia.registration, "apply_correction", counting
+        ):
+            written = export_rois(
+                manifest,
+                self.out,
+                registration_method_name="GradientECC",
+                source=self.seqfile,
+                progress=False,
+            )
+        self.assertEqual(len(written), 3)
+        # A per-ROI pass used to do T*3 of these and the frames-outer pass T;
+        # composing the correction into the crop warp does away with them.
+        self.assertEqual(calls, [])
+
+    def test_the_crop_is_one_warp_per_roi_per_frame(self):
+        import acia.base
+
+        manifest = _manifest(self.seqfile, self.THREE_ROIS)
+        calls = []
+        original = acia.base.warp_rotated_crop
+
+        def counting(raw, spec):
+            calls.append(spec)
+            return original(raw, spec)
+
+        with unittest.mock.patch.object(acia.base, "warp_rotated_crop", counting):
+            export_rois(
+                manifest,
+                self.out,
+                registration_method_name="GradientECC",
+                source=self.seqfile,
+                progress=False,
+            )
+        self.assertEqual(len(calls), 3 * self.num_t)
+
+
+class TestRoiGroups(unittest.TestCase):
+    """The ROI buffers are split into budget-sized passes, in manifest order."""
+
+    @staticmethod
+    def _specs(count, size=10):
+        return [
+            RotatedCropSpec(center=(20.0, 20.0), size=(size, size), angle=0.0)
+            for _ in range(count)
+        ]
+
+    def test_no_budget_is_a_single_pass(self):
+        groups = _roi_groups(self._specs(4), 10, 1, 2, None)
+        self.assertEqual(groups, [[0, 1, 2, 3]])
+
+    def test_consecutive_groups_fit_the_budget_and_keep_the_order(self):
+        specs = self._specs(5)  # 10 * 10 * 10 * 1 * 2 = 2000 bytes each
+        groups = _roi_groups(specs, 10, 1, 2, 4500)
+        self.assertEqual(groups, [[0, 1], [2, 3], [4]])
+        for group in groups:
+            total = sum(_roi_bytes(specs[i], 10, 1, 2) for i in group)
+            self.assertLessEqual(total, 4500)
+
+    def test_an_roi_that_does_not_fit_stands_alone(self):
+        specs = self._specs(3)
+        groups = _roi_groups(specs, 10, 1, 2, 100)
+        self.assertEqual(groups, [[0], [1], [2]])
+
+
+class TestRoiBufferBudget(_Case):
+    num_positions = 1
+    num_t = 5
+
+    SPECS = [
+        (0, (16.0, 16.0), (8, 8), "a", 0),
+        (0, (32.0, 32.0), (8, 8), "b", 0),
+    ]
+
+    def _export(self, out, **kwargs):
+        manifest = _manifest(self.seqfile, self.SPECS)
+        kwargs.setdefault("progress", False)
+        return export_rois(manifest, out, source=self.seqfile, **kwargs)
+
+    def test_a_small_budget_splits_the_pass_but_not_the_output(self):
+        unlimited = self._export(str(self.root / "a"))
+        with _count_reads() as counts:
+            limited = self._export(
+                str(self.root / "b"), max_roi_buffer_bytes=5 * 8 * 8 * 2
+            )
+        for one, other in zip(unlimited, limited, strict=True):
+            np.testing.assert_array_equal(tifffile.imread(one), tifffile.imread(other))
+        # One ROI per pass now, so each frame is decoded once per pass.
+        self.assertEqual(_reads_per_frame(counts), [2] * (self.num_t - 1))
+
+    def test_an_roi_too_big_to_buffer_still_exports(self):
+        lazy = self._export(str(self.root / "c"), max_roi_buffer_bytes=1)
+        buffered = self._export(str(self.root / "d"))
+        for one, other in zip(lazy, buffered, strict=True):
+            np.testing.assert_array_equal(tifffile.imread(one), tifffile.imread(other))
+
+
+class TestBudgetWithRegistration(_Case):
+    """The streamed and buffered paths must correct pixels the same way."""
+
+    num_positions = 1
+    num_t = 5
+    shift = 2.0  # px per frame
+
+    def _export(self, out, **kwargs):
+        manifest = _manifest(
+            self.seqfile,
+            [(0, (40.0, 40.0), (12, 12), "a", 0), (0, (56.0, 56.0), (12, 12), "b", 0)],
+        )
+        kwargs.setdefault("progress", False)
+        return export_rois(
+            manifest,
+            out,
+            registration_method_name="GradientECC",
+            source=self.seqfile,
+            **kwargs,
+        )
+
+    def test_the_lazy_fallback_writes_the_same_pixels_as_the_buffers(self):
+        # An ROI that cannot be buffered streams through `crop_rotated`, which
+        # composes the correction into the crop just as the buffered pass does;
+        # if one of the two ever went back to correcting whole frames, the two
+        # outputs would quietly stop matching.
+        lazy = self._export(str(self.root / "lazy"), max_roi_buffer_bytes=1)
+        buffered = self._export(str(self.root / "buffered"))
+        self.assertEqual(len(lazy), 2)
+        for one, other in zip(lazy, buffered, strict=True):
+            np.testing.assert_array_equal(tifffile.imread(one), tifffile.imread(other))
+
+
+class TestChunkFrames(_Case):
+    num_positions = 1
+    num_t = 7
+
+    def test_read_ahead_does_not_change_the_output(self):
+        specs = [(0, (16.0, 16.0), (8, 8), "a", 0), (0, (40.0, 40.0), (8, 8), "b", 0)]
+        out = {}
+        for depth in (1, 4):
+            manifest = _manifest(self.seqfile, specs)
+            out[depth] = export_rois(
+                manifest,
+                str(self.root / f"out{depth}"),
+                source=self.seqfile,
+                progress=False,
+                chunk_frames=depth,
+            )
+        for one, other in zip(out[1], out[4], strict=True):
+            np.testing.assert_array_equal(tifffile.imread(one), tifffile.imread(other))
+
+    def test_chunk_frames_must_be_at_least_one(self):
+        manifest = _manifest(self.seqfile, [(0, (16.0, 16.0), (8, 8), "a", 0)])
+        with self.assertRaisesRegex(ValueError, "chunk_frames"):
+            export_rois(
+                manifest, self.out, source=self.seqfile, progress=False, chunk_frames=0
+            )
+
+
+class TestMissingTransformReport(_Case):
+    """The per-position "no transform" line survives the single-pass crop."""
+
+    num_positions = 1
+    num_t = 5
+    shift = 0.6
+
+    def test_a_frame_without_a_transform_is_still_reported(self):
+        manifest = _manifest(
+            self.seqfile,
+            [(0, (24.0, 24.0), (8, 8), "a", 0), (0, (40.0, 40.0), (8, 8), "b", 0)],
+        )
+        real = _register_position
+
+        def drop_one(*args, **kwargs):
+            record = real(*args, **kwargs)
+            transforms = dict(record.transforms)
+            transforms.pop(2, None)
+            return dataclasses.replace(record, transforms=transforms)
+
+        lines = []
+        with (
+            unittest.mock.patch("acia.roi_export._register_position", drop_one),
+            unittest.mock.patch(
+                "tqdm.auto.tqdm.write", lambda text: lines.append(text)
+            ),
+        ):
+            export_rois(
+                manifest,
+                self.out,
+                registration_method_name="GradientECC",
+                source=self.seqfile,
+                progress=True,
+            )
+        reported = [text for text in lines if "had no transform of their own" in text]
+        self.assertEqual(len(reported), 1, lines)
+        self.assertIn("were corrected with the nearest frame", reported[0])
+
+
+# --------------------------------------------------------------------------- #
+# re-running: export only what is new, and pick up an interrupted run
+# --------------------------------------------------------------------------- #
+class TestIncrementalExport(_Case):
+    num_positions = 2
+    num_t = 4
+
+    FIRST = [(0, (16.0, 16.0), (8, 8), "a", 0)]
+    BOTH = [(0, (16.0, 16.0), (8, 8), "a", 0), (1, (32.0, 32.0), (8, 8), "b", 0)]
+
+    def _rois(self):
+        return json.loads((Path(self.out) / "roi_export.json").read_text())["rois"]
+
+    def test_only_a_newly_drawn_roi_is_exported(self):
+        export_rois(
+            _manifest(self.seqfile, self.FIRST),
+            self.out,
+            source=self.seqfile,
+            progress=False,
+        )
+        first = Path(self.out) / "pos001_roi001.tiff"
+        stamp = first.stat().st_mtime_ns
+
+        with _count_reads() as counts:
+            written = export_rois(
+                _manifest(self.seqfile, self.BOTH),
+                self.out,
+                source=self.seqfile,
+                progress=False,
+            )
+
+        self.assertEqual([os.path.basename(p) for p in written], ["pos002_roi001.tiff"])
+        self.assertEqual(first.stat().st_mtime_ns, stamp, "pos 1 was rewritten")
+        # The finished position was never opened again.
+        self.assertEqual(_reads_per_frame(counts, "pos000", skip_first=False), [])
+        self.assertEqual(
+            {r["file"] for r in self._rois()},
+            {"pos001_roi001.tiff", "pos002_roi001.tiff"},
+        )
+
+    def test_an_roi_inserted_before_another_keeps_the_old_numbering(self):
+        later = [(0, (16.0, 16.0), (8, 8), "a", 0)]
+        export_rois(
+            _manifest(self.seqfile, later),
+            self.out,
+            source=self.seqfile,
+            progress=False,
+        )
+        # The new ROI sorts *first* in the manifest but must not take roi001.
+        manifest = _manifest(
+            self.seqfile,
+            [(0, (40.0, 40.0), (8, 8), "new", 0), (0, (16.0, 16.0), (8, 8), "a", 0)],
+        )
+        manifest.selections[1].id = "sel0"  # the already-exported selection
+        manifest.selections[0].id = "selnew"
+        written = export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        self.assertEqual([os.path.basename(p) for p in written], ["pos001_roi002.tiff"])
+        by_id = {r["id"]: r["roi_nb"] for r in self._rois()}
+        self.assertEqual(by_id, {"sel0": 1, "selnew": 2})
+
+    def test_a_moved_roi_is_re_exported(self):
+        export_rois(
+            _manifest(self.seqfile, self.FIRST),
+            self.out,
+            source=self.seqfile,
+            progress=False,
+        )
+        moved = _manifest(self.seqfile, [(0, (40.0, 40.0), (8, 8), "a", 0)])
+        written = export_rois(moved, self.out, source=self.seqfile, progress=False)
+        self.assertEqual([os.path.basename(p) for p in written], ["pos001_roi001.tiff"])
+
+    def test_changed_settings_re_export(self):
+        manifest = _manifest(self.seqfile, self.FIRST)
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        written = export_rois(
+            manifest, self.out, source=self.seqfile, progress=False, max_frames=2
+        )
+        self.assertEqual([os.path.basename(p) for p in written], ["pos001_roi001.tiff"])
+        self.assertEqual(tifffile.imread(written[0]).shape[0], 2)
+
+    def test_a_truncated_file_is_detected_and_redone(self):
+        manifest = _manifest(self.seqfile, self.FIRST)
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        target = Path(self.out) / "pos001_roi001.tiff"
+        tifffile.imwrite(target, tifffile.imread(target)[:2])  # a short stack
+
+        written = export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        self.assertEqual([os.path.basename(p) for p in written], ["pos001_roi001.tiff"])
+        self.assertEqual(tifffile.imread(target).shape[0], self.num_t)
+
+    def test_verify_existing_false_trusts_the_file(self):
+        manifest = _manifest(self.seqfile, self.FIRST)
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        target = Path(self.out) / "pos001_roi001.tiff"
+        tifffile.imwrite(target, tifffile.imread(target)[:2])
+
+        written = export_rois(
+            manifest,
+            self.out,
+            source=self.seqfile,
+            progress=False,
+            verify_existing=False,
+        )
+        self.assertEqual(written, [])
+        self.assertEqual(tifffile.imread(target).shape[0], 2)
+
+    def test_overwrite_redoes_everything(self):
+        manifest = _manifest(self.seqfile, self.BOTH)
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        written = export_rois(
+            manifest,
+            self.out,
+            source=self.seqfile,
+            progress=False,
+            on_existing="overwrite",
+        )
+        self.assertEqual(len(written), 2)
+
+    def test_error_refuses_to_touch_an_existing_export(self):
+        manifest = _manifest(self.seqfile, self.FIRST)
+        export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        with self.assertRaisesRegex(ValueError, "on_existing='error'"):
+            export_rois(
+                manifest,
+                self.out,
+                source=self.seqfile,
+                progress=False,
+                on_existing="error",
+            )
+
+    def test_an_unknown_on_existing_policy_is_rejected(self):
+        manifest = _manifest(self.seqfile, self.FIRST)
+        with self.assertRaisesRegex(ValueError, "Unknown on_existing"):
+            export_rois(
+                manifest,
+                self.out,
+                source=self.seqfile,
+                progress=False,
+                on_existing="resume",
+            )
+
+
+class TestInterruptedExport(_Case):
+    """A run killed mid-write leaves no half-TIFF, and the next one finishes it."""
+
+    num_positions = 2
+    num_t = 4
+    BOTH = [(0, (16.0, 16.0), (8, 8), "a", 0), (1, (32.0, 32.0), (8, 8), "b", 0)]
+
+    def test_a_crash_records_what_finished_and_leaves_no_broken_tiff(self):
+        manifest = _manifest(self.seqfile, self.BOTH)
+        real = save_tiff_stack
+        seen = []
+
+        def fail_on_the_second(source, path, **kwargs):
+            seen.append(path)
+            if len(seen) == 2:
+                raise KeyboardInterrupt("killed mid-write")
+            return real(source, path, **kwargs)
+
+        with (
+            unittest.mock.patch(
+                "acia.segm.tiff_export.save_tiff_stack", fail_on_the_second
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            export_rois(manifest, self.out, source=self.seqfile, progress=False)
+
+        # The first ROI is complete; the second never appeared under its name.
+        self.assertEqual(
+            sorted(p.name for p in Path(self.out).glob("*.tif*")),
+            ["pos001_roi001.tiff"],
+        )
+        # ... and what did finish is on record, although the run never reached
+        # the end where the description used to be written.
+        rois = json.loads((Path(self.out) / "roi_export.json").read_text())["rois"]
+        self.assertEqual([r["file"] for r in rois], ["pos001_roi001.tiff"])
+
+        # The next run picks up exactly what is missing.
+        written = export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        self.assertEqual([os.path.basename(p) for p in written], ["pos002_roi001.tiff"])
+
+    def test_a_half_written_tiff_is_never_visible_under_its_real_name(self):
+        manifest = _manifest(self.seqfile, self.BOTH)
+        real = save_tiff_stack
+
+        def die_mid_write(source, path, **kwargs):
+            real(source, path, **kwargs)  # the temporary file now exists
+            raise KeyboardInterrupt("killed just before the rename")
+
+        with (
+            unittest.mock.patch("acia.segm.tiff_export.save_tiff_stack", die_mid_write),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            export_rois(manifest, self.out, source=self.seqfile, progress=False)
+
+        self.assertEqual(
+            sorted(p.name for p in Path(self.out).glob("*.tif*")),
+            ["pos001_roi001.part.tiff"],
+        )
+        self.assertFalse((Path(self.out) / "pos001_roi001.tiff").exists())
+
+        # The leftover is cleared and the ROI exported properly.
+        written = export_rois(manifest, self.out, source=self.seqfile, progress=False)
+        self.assertEqual(len(written), 2)
+        self.assertEqual(list(Path(self.out).glob("*.part.*")), [])

@@ -10,6 +10,7 @@ no pixel frame; ``thumbnail`` reads exactly one.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import types
 import unittest
@@ -640,3 +641,40 @@ class TestFolderBackend(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReleasePosition(unittest.TestCase):
+    """``release(index)`` drops one position's cached reader, not the handle."""
+
+    def test_release_closes_and_forgets_just_that_position(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            for position in range(2):
+                _write_frames(os.path.join(d, f"pos{position:03d}"), 3)
+            f = open_sequence(d)
+            self.assertEqual(f.num_positions, 2)
+
+            first, second = f.position(0), f.position(1)
+            self.assertIs(f.position(0), first)  # cached
+
+            f.release(0)
+            # Rebuilt on demand, so a caller that kept the old object still
+            # works -- it just no longer pins the file handle through the cache.
+            self.assertIsNot(f.position(0), first)
+            self.assertIs(f.position(1), second)
+            self.assertEqual(f.position(0).get_frame(2).raw[0, 0, 0], 2)
+
+    def test_releasing_an_unknown_position_is_a_no_op(self):
+        import tempfile
+
+        from acia.segm.open import open_sequence
+
+        with tempfile.TemporaryDirectory() as d:
+            _write_frames(d, 3)
+            f = open_sequence(d)
+            f.release(0)
+            f.release(7)
+            self.assertEqual(f.position(0).size_t, 3)

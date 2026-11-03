@@ -38,6 +38,7 @@ from acia.registration import (
     apply_correction,
     apply_correction_to_spec,
     compose,
+    invert,
     run_comparison,
 )
 
@@ -1516,3 +1517,67 @@ class TestLowConfidencePolicy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInvert(unittest.TestCase):
+    """:func:`invert` against :func:`compose` and the matrix it stands in for."""
+
+    TRANSFORMS = (
+        FrameTransform(dx=3.0, dy=-2.0, theta=4.0),
+        FrameTransform(dx=-11.25, dy=7.5, theta=-0.6),
+        FrameTransform(dx=0.0, dy=0.0, theta=0.0),
+        FrameTransform(dx=5.0, dy=5.0, theta=0.0),
+        FrameTransform(dx=0.0, dy=0.0, theta=13.0),
+    )
+
+    @staticmethod
+    def _matrix(transform: FrameTransform, center: tuple[float, float]) -> np.ndarray:
+        matrix = cv2.getRotationMatrix2D(center, transform.theta, 1.0)
+        matrix[0, 2] += transform.dx
+        matrix[1, 2] += transform.dy
+        return np.vstack([matrix, [0.0, 0.0, 1.0]])
+
+    def test_composing_with_the_inverse_gives_the_identity(self):
+        for transform in self.TRANSFORMS:
+            for order in (
+                compose(transform, invert(transform)),
+                compose(invert(transform), transform),
+            ):
+                self.assertAlmostEqual(order.dx, 0.0, places=9)
+                self.assertAlmostEqual(order.dy, 0.0, places=9)
+                self.assertAlmostEqual(order.theta, 0.0, places=9)
+
+    def test_matches_the_matrix_inverse_for_any_pivot(self):
+        # Pivot-independence is what lets invert() take no frame shape, same as
+        # compose(): assert it against three different centers.
+        for transform in self.TRANSFORMS:
+            for center in ((0.0, 0.0), (137.0, 42.0), (-11.0, 300.0)):
+                np.testing.assert_allclose(
+                    self._matrix(invert(transform), center),
+                    np.linalg.inv(self._matrix(transform, center)),
+                    atol=1e-9,
+                )
+
+    def test_inverting_twice_is_the_original(self):
+        for transform in self.TRANSFORMS:
+            again = invert(invert(transform))
+            self.assertAlmostEqual(again.dx, transform.dx, places=9)
+            self.assertAlmostEqual(again.dy, transform.dy, places=9)
+            self.assertAlmostEqual(again.theta, transform.theta, places=9)
+
+    def test_confidence_is_carried_through(self):
+        transform = FrameTransform(dx=1.0, dy=2.0, theta=3.0, confidence=0.87)
+        self.assertEqual(invert(transform).confidence, 0.87)
+        self.assertIsNone(invert(FrameTransform(dx=1.0, dy=2.0, theta=3.0)).confidence)
+
+    def test_undoes_a_spec_mapping(self):
+        spec = RotatedCropSpec(center=(300.0, 220.0), size=(32, 24), angle=12.0)
+        transform = FrameTransform(dx=7.3, dy=-4.1, theta=0.6)
+        shape = (512, 512)
+
+        mapped = apply_correction_to_spec(spec, transform, shape=shape)
+        back = apply_correction_to_spec(mapped, invert(transform), shape=shape)
+        self.assertAlmostEqual(back.center[0], spec.center[0], places=6)
+        self.assertAlmostEqual(back.center[1], spec.center[1], places=6)
+        self.assertAlmostEqual(back.angle, spec.angle, places=9)
+        self.assertEqual(back.size, spec.size)
