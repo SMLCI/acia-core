@@ -319,6 +319,30 @@ class JupyterVisualizationMixin:
         return ""
 
 
+def _resolve_channel(channel: int | str, names: list[str]) -> int:
+    """A display channel given as index or name -> its 0-based index.
+
+    A name is matched case-insensitively against ``names`` (the file's channel
+    names). An index is checked against the number of channels.
+
+    Raises:
+        ValueError: on an unknown name or an out-of-range index -- the message
+            lists the channels there are.
+    """
+    n = max(1, len(names))
+    listing = ", ".join(f"{i}: {name!r}" for i, name in enumerate(names)) or "0"
+    if isinstance(channel, str):
+        wanted = channel.strip().casefold()
+        for i, name in enumerate(names):
+            if str(name).casefold() == wanted:
+                return i
+        raise ValueError(f"no channel named {channel!r}; the file has {listing}.")
+    index = int(channel)
+    if not 0 <= index < n:
+        raise ValueError(f"channel {index} out of range; the file has {listing}.")
+    return index
+
+
 def _encode_frame_png(source, frame: int = 0, channel: int | None = None):
     """Encode one frame of ``source`` as a PNG data URL for an anywidget.
 
@@ -1170,6 +1194,12 @@ _SEQUENCE_DASHBOARD_CSS = _SEQUENCE_DASHBOARD_CSS_TEXT = r"""
   color:var(--text-dim);white-space:nowrap;cursor:pointer;}
 .acia-sd .sd-view{display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:10px;
   color:var(--text-faint);}
+.acia-sd .sd-chan{display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:10px;
+  color:var(--text-faint);}
+.acia-sd .sd-chan select{font-family:var(--font-mono);font-size:11px;}
+.acia-sd .sd-chan[hidden],.acia-sd .sd-frmissing[hidden]{display:none;}
+.acia-sd .sd-frbar .sd-frmissing{flex:none;white-space:nowrap;font-family:var(--font-mono);font-size:10.5px;
+  color:#8a4b00;background:rgba(230,150,30,.18);border-radius:4px;padding:1px 6px;}
 .acia-sd .sd-toast{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);background:var(--text);
   color:var(--bg);padding:8px 14px;border-radius:8px;font-size:12.5px;opacity:0;transition:.25s;pointer-events:none;}
 .acia-sd .sd-toast.show{opacity:1;}
@@ -1209,6 +1239,12 @@ function render({ model, el }) {
   const ASPECT = dims[1] / dims[0];
   const NPOS = md.num_positions || (model.get("positions") || []).length || 1;
   const NT = md.num_timepoints || 1;
+  // Display channel: one at a time, picked in the editor header (or `c`);
+  // the configured default arrives as the `channel` trait.
+  const CH_NAMES = (model.get("channel_names") || []).length
+    ? model.get("channel_names") : (md.channels || []);
+  const NCH = Math.max(1, CH_NAMES.length);
+  const chLabel = (c) => CH_NAMES[c] || ("ch" + c);
   // The frame the editor opens on -- the middle one by default, since frame 0
   // of a growing culture is usually empty (see SequenceDashboard.preview_frame).
   const FRAME0 = Math.max(0, Math.min(NT - 1, +model.get("preview_frame") || 0));
@@ -1237,6 +1273,9 @@ function render({ model, el }) {
       "<div class='sd-pane sd-editor'><div class='sd-head'>" +
         "<span class='sd-epos'>" + posLabel(0) + "</span>" +
         "<span style='display:flex;gap:10px;align-items:center'>" +
+        "<span class='sd-chan'" + (NCH > 1 ? "" : " hidden") +
+          " title='Display channel (c cycles through them while the pointer is over the widget)'>channel " +
+          "<select class='sd-ch'></select></span>" +
         "<span class='sd-view'>size <input type='range' class='sd-vs' min='300' max='2400' value='" +
           model.get("view_size") + "'></span>" +
         "<button class='sd-full' title='Toggle fullscreen (Ctrl/Cmd+scroll over the image also zooms)'>⛶ Fullscreen</button>" +
@@ -1258,6 +1297,7 @@ function render({ model, el }) {
         "<button class='sd-frbtn' data-step='last' title='Last frame'>⏭</button>" +
         "<input type='number' class='sd-frnum' min='0' max='" + (NT - 1) + "' value='" + FRAME0 + "' title='Type a frame number and press Enter'>" +
         " <span class='sd-frlbl'>/ " + (NT - 1) + "</span>" +
+        " <span class='sd-frmissing' hidden title='The display channel was not acquired at this frame (e.g. fluorescence imaged only every Nth frame); it is shown -- and exported -- as zeros here.'>channel not acquired at this frame</span>" +
         " <span class='sd-frstage' title='Stage position recorded for this image (from the file metadata). A jump against the neighbouring frames hints at a double shot.'></span>" +
         " <span class='sd-frhint' title='Frames are numbered from 0 (as in the Python API and every table); " +
         "positions from 1 (pos 001 = the file&#39;s first position, as in NIS-Elements/ZEN; its index in selection.json is 0). " +
@@ -1321,6 +1361,7 @@ function render({ model, el }) {
   };
   let selections = (model.get("selections") || []).map(fromTrait);
   let currentPos = 0, activeId = null, mode = model.get("roi_mode") || "single";
+  let channel = Math.max(0, Math.min(NCH - 1, +model.get("channel") || 0));
   const collapsedPos = new Set(); // position headers collapsed in the selections list
   // start past the highest id already present (e.g. resumed from a saved
   // selection.json) so newly drawn/fitted ROIs never collide with those ids
@@ -1338,16 +1379,21 @@ function render({ model, el }) {
   model.on("msg:custom", (msg, buffers) => {
     if (!msg) return;
     if (msg.type === "thumb") {
-      const cb = pending["t" + msg.pos]; delete pending["t" + msg.pos];
-      if (cb && buffers && buffers[0]) cb(blobUrl(buffers[0]));
+      // a reply for a channel the user has switched away from is dropped; the
+      // row was re-queued for the current channel when it switched
+      if (msg.channel === undefined || msg.channel === channel) {
+        const cb = pending["t" + msg.pos]; delete pending["t" + msg.pos];
+        if (cb && buffers && buffers[0]) cb(blobUrl(buffers[0]));
+      }
       thumbInFlight--; pumpThumbQueue();
     } else if (msg.type === "frame") {
       frameInFlight = false;
       if (buffers && buffers[0]) {
-        const entry = { url: blobUrl(buffers[0]), stage: msg.stage || null };
-        cachePut(frameKey(msg.pos, msg.t), entry);
+        const entry = { url: blobUrl(buffers[0]), stage: msg.stage || null, missing: !!msg.missing };
+        const mc = msg.channel === undefined ? channel : msg.channel;
+        cachePut(frameKey(msg.pos, msg.t, mc), entry);
         // a reply for a frame the user has already moved past is only cached
-        if (msg.pos === currentPos && msg.t === frame) { clearTimeout(frameTimer); showFrame(msg.pos, entry); }
+        if (msg.pos === currentPos && msg.t === frame && mc === channel) { clearTimeout(frameTimer); showFrame(msg.pos, entry); }
       }
       pumpFrame();
     } else if (msg.type === "error") {
@@ -1401,7 +1447,7 @@ function render({ model, el }) {
     while (thumbInFlight < MAX_THUMB_INFLIGHT && thumbQueue.length) {
       const ix = thumbQueue.shift();
       thumbInFlight++;
-      model.send({ type: "thumb", pos: ix, downscale: 8 });
+      model.send({ type: "thumb", pos: ix, downscale: 8, channel: channel });
     }
   }
   const io = new IntersectionObserver((ents) => {
@@ -1479,9 +1525,9 @@ function render({ model, el }) {
   // only the newest wanted frame queued behind it, and the last
   // FRAME_CACHE_MAX frames kept so jumping back and forth needs no reload.
   const FRAME_CACHE_MAX = 20, FRAME_DEBOUNCE_MS = 100;
-  const frameCache = new Map();   // "pos:t" -> {url, stage}, oldest first
+  const frameCache = new Map();   // "pos:t:channel" -> {url, stage, missing}, oldest first
   let frameTimer = null, frameDebounce = null, frameInFlight = false, frameWanted = null;
-  const frameKey = (p, t) => p + ":" + t;
+  const frameKey = (p, t, c) => p + ":" + t + ":" + (c === undefined ? channel : c);
   function cachePut(key, entry) {
     const old = frameCache.get(key);
     if (old && old.url !== entry.url && old.url !== frameImg.src) URL.revokeObjectURL(old.url);
@@ -1494,6 +1540,7 @@ function render({ model, el }) {
   }
   function showFrame(pos, entry) {
     frameImgPos = pos; frameImg.src = entry.url; showStage(entry.stage);
+    const miss = $(".sd-frmissing"); if (miss) miss.hidden = !entry.missing;
   }
   function showStage(st) {
     const el = $(".sd-frstage"); if (!el) return;
@@ -1502,20 +1549,20 @@ function render({ model, el }) {
   }
   function pumpFrame() {
     if (frameInFlight || !frameWanted) return;
-    const { pos, t } = frameWanted; frameWanted = null;
-    const hit = frameCache.get(frameKey(pos, t));
-    if (hit) { cachePut(frameKey(pos, t), hit); if (pos === currentPos && t === frame) showFrame(pos, hit); return pumpFrame(); }
+    const { pos, t, c } = frameWanted; frameWanted = null;
+    const hit = frameCache.get(frameKey(pos, t, c));
+    if (hit) { cachePut(frameKey(pos, t, c), hit); if (pos === currentPos && t === frame && c === channel) showFrame(pos, hit); return pumpFrame(); }
     frameInFlight = true;
     clearTimeout(frameTimer); hideStatus();
     frameTimer = setTimeout(() => showStatus("Loading " + posLabel(pos) + "…", false), 150);
-    model.send({ type: "frame", pos: pos, t: t });
+    model.send({ type: "frame", pos: pos, t: t, channel: c });
   }
   function requestFrame(debounce) {
     clearTimeout(frameDebounce);
     const go = () => {
       const hit = frameCache.get(frameKey(currentPos, frame));
       if (hit) { clearTimeout(frameTimer); hideStatus(); cachePut(frameKey(currentPos, frame), hit); showFrame(currentPos, hit); return; }
-      frameWanted = { pos: currentPos, t: frame }; pumpFrame();
+      frameWanted = { pos: currentPos, t: frame, c: channel }; pumpFrame();
     };
     if (debounce) frameDebounce = setTimeout(go, FRAME_DEBOUNCE_MS); else go();
   }
@@ -1851,6 +1898,26 @@ function render({ model, el }) {
   }
 
   // ---- controls ----
+  // display channel: the frame cache is keyed per channel, so switching back
+  // is instant; the gallery thumbnails are re-read for the new channel
+  const chSel = $(".sd-ch");
+  for (let c = 0; c < NCH; c++) {
+    const o = document.createElement("option"); o.value = c; o.textContent = chLabel(c);
+    chSel.appendChild(o);
+  }
+  chSel.value = channel;
+  function setChannel(c) {
+    c = ((+c % NCH) + NCH) % NCH;
+    if (c === channel) return;
+    channel = c; chSel.value = c;
+    model.set("channel", c); model.save_changes();
+    thumbQueue.length = 0;
+    Object.keys(pending).forEach((k) => { if (k[0] === "t") delete pending[k]; });
+    hidePreview(); buildGallery();
+    requestFrame();
+  }
+  chSel.addEventListener("change", (e) => setChannel(+e.target.value));
+  model.on("change:channel", () => setChannel(+model.get("channel") || 0));
   $(".sd-vs").addEventListener("input", (e) => {
     applyViewSize(+e.target.value); model.set("view_size", EH); model.save_changes();
   });
@@ -1929,6 +1996,10 @@ function render({ model, el }) {
     if ((ev.key === "ArrowLeft" || ev.key === "ArrowRight") && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
       ev.preventDefault();
       goFrame((ev.key === "ArrowLeft" ? -1 : 1) * (ev.shiftKey ? 10 : 1));
+      return;
+    }
+    if (ev.key.toLowerCase() === "c" && !ev.ctrlKey && !ev.metaKey && !ev.altKey && NCH > 1) {
+      ev.preventDefault(); setChannel(channel + (ev.shiftKey ? -1 : 1));
       return;
     }
     if (!activeId) return;
@@ -3060,6 +3131,10 @@ if _HAS_ANYWIDGET:
         view_size = traitlets.Int(430).tag(sync=True)
         auto_save = traitlets.Bool(True).tag(sync=True)
         preview_frame = traitlets.Int(0).tag(sync=True)
+        #: display channel (0-based); the configured default is the ``channel``
+        #: constructor argument, switched in the UI with the channel picker / ``c``
+        channel = traitlets.Int(0).tag(sync=True)
+        channel_names = traitlets.List().tag(sync=True)  # type: ignore[var-annotated]
 
         _esm = _SEQUENCE_DASHBOARD_ESM
         _css = _SEQUENCE_DASHBOARD_CSS
@@ -3071,6 +3146,7 @@ if _HAS_ANYWIDGET:
             roi_mode: str = "single",
             save_dir=None,
             preview_frame: int | None = None,
+            channel: int | str = 0,
             resume: bool = True,
             **kwargs,
         ) -> None:
@@ -3091,6 +3167,11 @@ if _HAS_ANYWIDGET:
                     Note this indexes the *source's* timepoints -- if a later
                     export step truncates the sequence, pick a frame inside
                     that range (see :attr:`~acia.selection.RoiSelection.anchor_frame`).
+                channel: The channel the dashboard opens on -- a 0-based index,
+                    or a channel name from the file (``"GFP"``; matched
+                    case-insensitively). Switch it in the UI with the channel
+                    picker or the ``c`` key; only the display changes, the
+                    export always writes every channel.
                 resume: If the save directory already holds a ``selection.json``
                     of *this* file, continue from it (default) -- re-running the
                     dashboard cell picks up where the curation left off. ``False``
@@ -3101,7 +3182,8 @@ if _HAS_ANYWIDGET:
 
             Raises:
                 traitlets.TraitError: If ``preview_frame`` is negative.
-                ValueError: If the save directory holds the ``selection.json`` of
+                ValueError: If ``channel`` names no channel of the file, or if
+                    the save directory holds the ``selection.json`` of
                     a *different* raw file -- auto-save would overwrite that
                     curation, so choose another ``save_dir``.
             """
@@ -3127,6 +3209,8 @@ if _HAS_ANYWIDGET:
                 {"index": p.index, "name": p.name, "has_roi": False}
                 for p in source.positions
             ]
+            channel_names = [str(n) for n in (meta.channels or [])]
+            channel_index = _resolve_channel(channel, channel_names)
             super().__init__(
                 # `path`/`format` alongside the metadata so the header can show
                 # which file is open -- same identity fields `make_source_block`
@@ -3141,6 +3225,8 @@ if _HAS_ANYWIDGET:
                 selections=[],
                 roi_mode=roi_mode,
                 preview_frame=preview_frame,
+                channel=channel_index,
+                channel_names=channel_names,
                 **kwargs,
             )
             self.on_msg(self._on_custom_msg)
@@ -3248,24 +3334,29 @@ if _HAS_ANYWIDGET:
                     # inserted once, so letting the editor's scrubber drive them
                     # would fire a blocking read per row per scrub and leave the
                     # gallery showing a mix of timepoints.
+                    channel = int(content.get("channel", self.channel))
                     png = self._file.thumbnail_png(
                         pos,
                         downscale=int(content.get("downscale", 8)),
                         frame=self.preview_frame,
+                        channel=channel,
                     )
                 except Exception as exc:  # noqa: BLE001 - report to the frontend
                     self.send(
                         {"type": "error", "kind": kind, "pos": pos, "message": str(exc)}
                     )
                     return
-                self.send({"type": "thumb", "pos": pos}, buffers=[png])
+                self.send(
+                    {"type": "thumb", "pos": pos, "channel": channel}, buffers=[png]
+                )
                 logging.debug(
                     "SequenceDashboard: thumb %d done in %.3fs", pos, time.time() - t0
                 )
             elif kind == "frame":
                 pos, t = int(content["pos"]), int(content.get("t", 0))
+                channel = int(content.get("channel", self.channel))
                 try:
-                    png = self._frame_png(pos, t)
+                    png, missing = self._frame_png(pos, t, channel)
                 except Exception as exc:  # noqa: BLE001 - report to the frontend
                     self.send(
                         {
@@ -3282,6 +3373,8 @@ if _HAS_ANYWIDGET:
                         "type": "frame",
                         "pos": pos,
                         "t": t,
+                        "channel": channel,
+                        "missing": missing,
                         "stage": self._frame_stage(pos, t),
                     },
                     buffers=[png],
@@ -3332,8 +3425,18 @@ if _HAS_ANYWIDGET:
                 return None
             return {"x": xyz[0], "y": xyz[1], "z": xyz[2]}
 
-        def _frame_png(self, pos: int, t: int) -> bytes:
-            """PNG bytes of one lazily-read frame (display channel, normalized)."""
+        def _frame_png(self, pos: int, t: int, channel: int = 0) -> tuple[bytes, bool]:
+            """PNG bytes of one lazily-read frame's ``channel`` (normalized).
+
+            Also returns whether that channel was *not* acquired at this frame
+            (a sparse fluorescence channel), which the editor flags -- the
+            frame then shows the reader's zero fill.
+
+            Raises:
+                ValueError: if ``channel`` is out of range for the frame.
+            """
+            from acia.base import channels_present
+
             source = self._file.position(pos)
             # a slip-corrected position may end a frame or two before the file
             # does (see acia.segm.acquisition_fixes): show its last frame there,
@@ -3342,11 +3445,21 @@ if _HAS_ANYWIDGET:
             if fixes and t < self._file.metadata.num_timepoints:
                 t = min(t, source.size_t - 1)
             raw = np.asarray(source.get_frame(t).raw)
-            plane = raw[..., 0] if raw.ndim == 3 else raw
+            n_channels = raw.shape[-1] if raw.ndim == 3 else 1
+            if not 0 <= channel < n_channels:
+                raise ValueError(
+                    f"channel must be in [0, {n_channels}); got {channel}."
+                )
+            plane = raw[..., channel] if raw.ndim == 3 else raw
             rgb = np.repeat(normalize_to_uint8(plane)[:, :, np.newaxis], 3, axis=-1)
             buffer = io.BytesIO()
             Image.fromarray(rgb).save(buffer, format="PNG")
-            return buffer.getvalue()
+            try:
+                present = channels_present(source, t)
+                missing = not present[channel] if channel < len(present) else False
+            except Exception:  # noqa: BLE001 - the flag is best-effort
+                missing = False
+            return buffer.getvalue(), missing
 
         @property
         def manifest(self):

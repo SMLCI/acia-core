@@ -371,28 +371,36 @@ class SequenceFile:
     # --- thumbnails ------------------------------------------------------------
 
     def thumbnail(
-        self, index: int, *, downscale: int = 8, frame: int = 0
+        self, index: int, *, downscale: int = 8, frame: int = 0, channel: int = 0
     ) -> np.ndarray:
         """A downscaled ``(h, w, 3)`` uint8 preview of one frame (lazy).
 
-        Reads exactly one frame of ``index``, takes the display channel (0),
+        Reads exactly one frame of ``index``, takes the display ``channel``,
         min-max normalizes, strides by ``downscale``, and returns an RGB preview.
+
+        Raises:
+            ValueError: if ``channel`` is out of range for the frame.
         """
         source = self.position(index)
         # a slip-corrected position may end a frame early: show its last frame
         if 0 <= frame < self.metadata.num_timepoints:
             frame = min(frame, source.size_t - 1)
         raw = source.get_frame(frame).raw  # (H, W, C) or (H, W)
-        plane = raw[..., 0] if raw.ndim == 3 else raw
+        n_channels = raw.shape[-1] if raw.ndim == 3 else 1
+        if not 0 <= channel < n_channels:
+            raise ValueError(f"channel must be in [0, {n_channels}); got {channel}.")
+        plane = raw[..., channel] if raw.ndim == 3 else raw
         small = plane[::downscale, ::downscale]
         u8 = normalize_to_uint8(small)
         return np.stack([u8, u8, u8], axis=-1)
 
-    def thumbnail_png(self, index: int, *, downscale: int = 8, frame: int = 0) -> bytes:
+    def thumbnail_png(
+        self, index: int, *, downscale: int = 8, frame: int = 0, channel: int = 0
+    ) -> bytes:
         """PNG-encoded bytes of :meth:`thumbnail` (for the widget's byte channel)."""
         from PIL import Image
 
-        rgb = self.thumbnail(index, downscale=downscale, frame=frame)
+        rgb = self.thumbnail(index, downscale=downscale, frame=frame, channel=channel)
         buf = io.BytesIO()
         Image.fromarray(rgb).save(buf, format="PNG")
         return buf.getvalue()

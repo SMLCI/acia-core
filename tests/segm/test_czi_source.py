@@ -391,3 +391,70 @@ class TestClose(_CZITestBase):
         src.close()
         src.close()
         self.assertEqual(self.record["closed"], 1)
+
+
+class TestSparseChannel(_CZITestBase):
+    """Channel 1 (fluorescence) imaged only at even T, as aicspylibczi sees it.
+
+    Unconstrained, ``read_image`` then returns only channel 0 at odd T; asking
+    for C=1 there raises, and its subblock metadata is empty.
+    """
+
+    dims = "STCYX"
+    sizes: dict[str, int] = {"S": 1, "T": 4, "C": 2, "Y": 8, "X": 10}
+
+    def setUp(self) -> None:
+        super().setUp()
+        cls = self.module.CziFile
+        full_read = cls.read_image
+        record = self.record
+
+        def absent(constraints):
+            return constraints.get("T", 0) % 2 == 1
+
+        def read_image(self, **constraints):
+            if absent(constraints):
+                if constraints.get("C") == 1:
+                    record["reads"].append(dict(constraints))
+                    raise RuntimeError("no subblock for these coordinates")
+                if "C" not in constraints:
+                    constraints = {**constraints, "C": 0}
+            return full_read(self, **constraints)
+
+        def read_subblock_metadata(self, **constraints):
+            if absent(constraints) and constraints.get("C") == 1:
+                return []
+            return [((0,), "<METADATA/>")]
+
+        cls.read_image = read_image
+        cls.read_subblock_metadata = read_subblock_metadata
+
+    def test_every_frame_holds_every_channel(self):
+        src = self.make_source()
+        for t in range(4):
+            raw = src.get_frame(t).raw
+            self.assertEqual(raw.shape, (8, 10, 2))
+            np.testing.assert_array_equal(raw[..., 0], self.base[0, t, 0])
+            expected = self.base[0, t, 1] if t % 2 == 0 else np.zeros((8, 10))
+            np.testing.assert_array_equal(raw[..., 1], expected)
+
+    def test_a_full_frame_is_still_one_read(self):
+        src = self.make_source()
+        src.get_frame(0)
+        self.assertEqual(len(self.record["reads"]), 1)
+
+    def test_channels_present_after_a_read_and_from_metadata(self):
+        src = self.make_source()
+        src.get_frame(1)
+        reads = len(self.record["reads"])
+        self.assertEqual(src.channels_present(1), [True, False])
+        self.assertEqual(len(self.record["reads"]), reads)  # answered from the read
+        self.assertEqual(src.channels_present(2), [True, True])  # metadata only
+        self.assertEqual(src.channels_present(3), [True, False])
+
+    def test_a_failing_read_of_an_acquired_channel_is_not_zero_filled(self):
+        src = self.make_source()
+        cls = self.module.CziFile
+        cls.read_subblock_metadata = lambda self, **c: [((0,), "<METADATA/>")]
+        with self.assertRaises(RuntimeError):
+            src.get_frame(1)

@@ -89,6 +89,9 @@ class CZISequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         self._dims: str = ""
         self._sizes: dict[str, int] | None = None
         self._scene_names: dict[int, str | None] = {}
+        # frame -> which channels it had, noted as frames are read, so
+        # channels_present() after a read costs no further file access
+        self._present: dict[int, list[bool]] = {}
 
     # --- lazy reader / metadata ------------------------------------------------
 
@@ -325,7 +328,88 @@ class CZISequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         constraints = self._build_constraints(frame)
         data, shape = self._reader.read_image(**constraints)
         plane = self._arrange_plane(np.asarray(data), shape)
+        if plane.shape[-1] != self.size_c:
+            # A channel imaged only every Nth frame (fluorescence next to
+            # phase contrast) has no subblock at the other timepoints, and
+            # read_image then returns only the channels that exist -- so the
+            # channel count would change from frame to frame. Every consumer
+            # relies on (H, W, size_c), so read per channel and fill the
+            # channels that were not acquired here with zeros.
+            plane, present = self._read_per_channel(frame, plane.dtype)
+        else:
+            present = [True] * plane.shape[-1]
+        self._present[frame] = present
         return LocalImage(plane, frame=frame)
+
+    def channels_present(self, frame: int) -> list[bool]:
+        """Which channels were actually acquired at ``frame``.
+
+        A channel that is imaged only every Nth frame has no data at the other
+        timepoints; :meth:`get_frame` returns zeros for it there. This tells the
+        two apart, from subblock metadata only (no pixels are read).
+        """
+        self._ensure_reader()
+        if not 0 <= frame < self.size_t:
+            raise IndexError(f"frame {frame} out of range for size_t={self.size_t}")
+        if "C" not in self._dims:
+            return [True]
+        if frame not in self._present:
+            self._present[frame] = [
+                self._has_subblock(frame, c) for c in range(self.size_c)
+            ]
+        return list(self._present[frame])
+
+    def _has_subblock(self, frame: int, channel: int) -> bool:
+        """Whether the file holds a subblock for ``(position, frame, channel)``."""
+        assert self._reader is not None
+        constraints = self._build_constraints(frame)
+        constraints["C"] = channel
+        try:
+            return bool(self._reader.read_subblock_metadata(**constraints))
+        except Exception:  # noqa: BLE001 - libCZI raises for absent coordinates
+            return False
+
+    def _read_per_channel(self, frame: int, dtype) -> tuple[np.ndarray, list[bool]]:
+        """Read ``frame`` one channel at a time; absent channels become zeros.
+
+        Returns the ``(H, W, size_c)`` plane and which channels had data.
+        """
+        assert self._reader is not None
+        planes: list[np.ndarray | None] = []
+        for c in range(self.size_c):
+            constraints = self._build_constraints(frame)
+            constraints["C"] = c
+            plane: np.ndarray | None
+            try:
+                data, shape = self._reader.read_image(**constraints)
+                plane = self._arrange_plane(np.asarray(data), shape)
+            except Exception:
+                # Only "this channel was not acquired here" may become zeros; a
+                # read that fails for any other reason (a dropped network share)
+                # must not silently turn into a black channel.
+                if self._has_subblock(frame, c):
+                    raise
+                plane = None
+            if plane is not None and plane.size == 0:
+                plane = None
+            if plane is not None and plane.shape[-1] != 1:
+                raise ValueError(
+                    f"CZI file {self.path!r}: reading channel {c} of frame {frame} "
+                    f"returned {plane.shape[-1]} channels, expected 1."
+                )
+            planes.append(None if plane is None else plane[..., 0])
+
+        if all(p is None for p in planes):
+            raise ValueError(
+                f"CZI file {self.path!r}: no channel has data at frame {frame} "
+                f"of position {self.position}."
+            )
+        h, w = self.size_h, self.size_w
+        stacked = np.stack(
+            [np.zeros((h, w), dtype=dtype) if p is None else p for p in planes],
+            axis=-1,
+        )
+        return stacked, [p is not None for p in planes]
 
     def stage_xy(self, frame: int) -> tuple[float, float] | None:
         """Recorded stage XY (µm) of the image at ``(scene=position, frame)``.

@@ -1132,6 +1132,21 @@ class RotatedCropSpec:
         )
 
 
+def channels_present(source, frame: int) -> list[bool]:
+    """Which of ``source``'s channels were actually acquired at ``frame``.
+
+    A channel imaged only every Nth frame (e.g. fluorescence next to phase
+    contrast) reads as zeros at the other frames; a source that can tell
+    (:meth:`~acia.segm.czi_source.CZISequenceSource.channels_present`) says so
+    here. Any other source -- or a view without the method -- is taken to have
+    every channel at every frame.
+    """
+    getter = getattr(source, "channels_present", None)
+    if callable(getter):
+        return [bool(v) for v in getter(frame)]
+    return [True] * int(source.size_c)
+
+
 def warp_rotated_crop(raw: np.ndarray, spec: RotatedCropSpec) -> np.ndarray:
     """Straighten one frame's rotated rectangle into an axis-aligned crop.
 
@@ -1420,6 +1435,10 @@ class RegisteredSequenceSource(ImageSequenceSource):
         corrected = apply_correction(np.asarray(image.raw), transform)
         return ArrayImage(corrected, frame=idx)
 
+    def channels_present(self, frame: int) -> list[bool]:
+        """The parent's :func:`channels_present` (a correction drops no channel)."""
+        return channels_present(self.parent, self._resolve_t_index(frame))
+
     @property
     def size_t(self) -> int:
         return self.parent.size_t
@@ -1613,6 +1632,16 @@ class SlicedSequenceSource(ImageSequenceSource, JupyterVisualizationMixin):
         if self.spatial:
             return ArrayImage(frame_obj.raw[self.spatial], frame=frame)
         return frame_obj
+
+    def channels_present(self, frame: int) -> list[bool]:
+        """The parent's :func:`channels_present`, mapped through this view."""
+        present = channels_present(self.parent, self.t_indices[frame])
+        if len(self.spatial) > 2:
+            # a channel key: pick the same channels out of the flags
+            return [
+                bool(v) for v in np.atleast_1d(np.asarray(present)[self.spatial[2]])
+            ]
+        return present
 
     @property
     def size_t(self) -> int:

@@ -203,3 +203,26 @@ class TestMultichannelReopen(unittest.TestCase):
         stack, frame, _ = self._roundtrip(imagej=False, ome=True)
         self.assertEqual(frame.shape, (30, 40, 2))
         np.testing.assert_array_equal(frame, stack[1])
+
+
+class TestMultiChannelStreaming(unittest.TestCase):
+    """A (T, H, W, C) source streams out as a TCYX stack, compressed or not."""
+
+    def _write(self, **kwargs):
+        from acia.segm.local import THWCSequenceSource
+        from acia.segm.tiff_export import save_tiff_stack
+
+        data = np.arange(3 * 4 * 5 * 3, dtype=np.uint16).reshape(3, 4, 5, 3)
+        with tempfile.TemporaryDirectory() as d:
+            path = save_tiff_stack(
+                THWCSequenceSource(data), str(Path(d) / "x.tif"), **kwargs
+            )
+            return data, tifffile.imread(path)
+
+    def test_imagej_compressed(self):
+        data, got = self._write(compression="zlib")
+        np.testing.assert_array_equal(got, np.moveaxis(data, -1, 1))
+
+    def test_ome_with_channel_names(self):
+        data, got = self._write(ome=True, channel_names=["a", "b", "c"])
+        np.testing.assert_array_equal(got, np.moveaxis(data, -1, 1))

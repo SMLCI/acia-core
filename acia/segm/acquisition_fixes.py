@@ -314,6 +314,13 @@ class CorrectedPositionSource(ImageSequenceSource):
         image = self._file.raw_position(p_raw).get_frame(t_raw)
         return LocalImage(image.raw, frame=frame)
 
+    def channels_present(self, frame: int) -> list[bool]:
+        """Which channels were acquired in the image behind true ``frame``."""
+        from acia.base import channels_present
+
+        t_raw, p_raw = self.raw_slot(frame)
+        return channels_present(self._file.raw_position(p_raw), t_raw)
+
     def stage_xy(self, frame: int) -> tuple[float, float] | None:
         """Recorded stage XY of the image behind true ``frame`` (µm), if known."""
         t_raw, p_raw = self.raw_slot(frame)

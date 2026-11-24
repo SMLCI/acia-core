@@ -880,3 +880,97 @@ class TestInterruptedExport(_Case):
         written = export_rois(manifest, self.out, source=self.seqfile, progress=False)
         self.assertEqual(len(written), 2)
         self.assertEqual(list(Path(self.out).glob("*.part.*")), [])
+
+
+class _Channels:
+    """Wrap a position source as ``n`` channels: channel ``c`` = base + c.
+
+    ``sparse`` lists channels that exist only at even frames (zero elsewhere,
+    as the CZI reader fills them); ``short_at`` makes the reader hand out one
+    channel too few at that frame -- the reader bug the export must name.
+    """
+
+    def __init__(self, base, n, *, sparse=(), short_at=None):
+        self.base, self.n, self.sparse, self.short_at = base, n, set(sparse), short_at
+
+    def present(self, t):
+        return [c not in self.sparse or t % 2 == 0 for c in range(self.n)]
+
+    def wrap(self, source, *, with_presence):
+        from acia.base import ImageSequenceSource
+        from acia.segm.local import LocalImage
+
+        outer = self
+
+        class _Source(ImageSequenceSource):
+            size_t = property(lambda self: source.size_t)
+            size_h = property(lambda self: source.size_h)
+            size_w = property(lambda self: source.size_w)
+            size_c = property(lambda self: outer.n)
+            num_channels = property(lambda self: outer.n)
+            pixel_size = property(lambda self: source.pixel_size)
+            timepoints = property(lambda self: source.timepoints)
+
+            def get_frame(self, t):
+                plane = np.asarray(source.get_frame(t).raw)
+                plane = plane[..., 0] if plane.ndim == 3 else plane
+                present = outer.present(t)
+                n = outer.n - 1 if t == outer.short_at else outer.n
+                stack = [
+                    (plane + c if present[c] else np.zeros_like(plane))
+                    for c in range(n)
+                ]
+                return LocalImage(np.stack(stack, axis=-1), frame=t)
+
+        if with_presence:
+            _Source.channels_present = lambda self, t: outer.present(t)
+        return _Source()
+
+
+class TestMultiChannelExport(_Case):
+    def _export(self, channels, *, with_presence=True, **kwargs):
+        real = self.seqfile.position
+        manifest = _manifest(self.seqfile, [(0, (20.0, 20.0), (8, 6), "a", 0)])
+        with unittest.mock.patch.object(
+            self.seqfile,
+            "position",
+            side_effect=lambda p: channels.wrap(real(p), with_presence=with_presence),
+        ):
+            return export_rois(
+                manifest, self.out, source=self.seqfile, progress=False, **kwargs
+            )
+
+    def _record(self):
+        return json.loads((Path(self.out) / "roi_export.json").read_text())["rois"][0]
+
+    def test_a_sparse_channel_is_exported_zero_filled_and_recorded(self):
+        with self.assertWarns(UserWarning):  # the tiff folder names only 1 channel
+            written = self._export(_Channels(None, 2, sparse=[1]))
+        stack = tifffile.imread(written[0])
+        self.assertEqual(stack.shape, (self.num_t, 2, 6, 8))  # TCYX hyperstack
+        for t in range(self.num_t):
+            self.assertTrue(np.all(stack[t, 0] == _encode(0, t)))
+            expected = _encode(0, t) + 1 if t % 2 == 0 else 0
+            self.assertTrue(np.all(stack[t, 1] == expected))
+        self.assertEqual(
+            self._record()["channels_acquired"],
+            [{"channel": 1, "name": None, "frames": [0, 2]}],
+        )
+
+    def test_five_channels_without_presence_info(self):
+        with self.assertWarns(UserWarning):
+            written = self._export(_Channels(None, 5), with_presence=False)
+        stack = tifffile.imread(written[0])
+        self.assertEqual(stack.shape, (self.num_t, 5, 6, 8))
+        for c in range(5):
+            self.assertTrue(np.all(stack[1, c] == _encode(0, 1) + c))
+        self.assertNotIn("channels_acquired", self._record())
+
+    def test_a_frame_missing_a_channel_fails_readably(self):
+        with (
+            self.assertWarns(UserWarning),
+            self.assertRaisesRegex(
+                ValueError, r"pos 1 frame 2: the reader returned 1 channel\(s\)"
+            ),
+        ):
+            self._export(_Channels(None, 2, short_at=2))

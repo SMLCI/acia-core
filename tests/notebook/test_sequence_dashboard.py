@@ -137,7 +137,7 @@ class TestMessages(unittest.TestCase):
             dash._on_custom_msg(dash, {"type": "thumb", "pos": 0}, None)
             self.assertEqual(len(rec.sent), 1)
             content, buffers = rec.sent[0]
-            self.assertEqual(content, {"type": "thumb", "pos": 0})
+            self.assertEqual(content, {"type": "thumb", "pos": 0, "channel": 0})
             self.assertTrue(buffers[0].startswith(b"\x89PNG"))
 
     def test_thumb_error_reported_not_raised(self):
@@ -485,3 +485,74 @@ class TestResumeByDefault(unittest.TestCase):
             (Path(d) / "selection.json.bak").unlink()
             fresh.save()
             self.assertFalse((Path(d) / "selection.json.bak").exists())
+
+
+def _tif2(d, t=3, h=8, w=10):
+    """A 2-channel TCYX stack; channel 1 = channel 0 inverted, so they differ."""
+    path = Path(d) / "stack2.tif"
+    ch0 = (np.arange(t * h * w).reshape(t, h, w) * 7 % 1000).astype(np.uint16)
+    data = np.stack([ch0, 1000 - ch0], axis=1)
+    tifffile.imwrite(path, data, imagej=True, metadata={"axes": "TCYX"})
+    return path
+
+
+class TestChannels(unittest.TestCase):
+    def test_resolve_channel_by_index_and_name(self):
+        from acia.notebook import _resolve_channel
+
+        names = ["Phase", "GFP"]
+        self.assertEqual(_resolve_channel(1, names), 1)
+        self.assertEqual(_resolve_channel("gfp", names), 1)
+        self.assertEqual(_resolve_channel(" Phase ", names), 0)
+        with self.assertRaisesRegex(ValueError, r"no channel named 'RFP'.*'GFP'"):
+            _resolve_channel("RFP", names)
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            _resolve_channel(2, names)
+
+    def test_default_channel_from_the_constructor(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = open_sequence(_tif2(d))
+            self.assertEqual(SequenceDashboard(src).channel, 0)
+            dash = SequenceDashboard(src, channel="ch1")
+            self.assertEqual(dash.channel, 1)
+            self.assertEqual(dash.channel_names, ["ch0", "ch1"])
+            with self.assertRaises(ValueError):
+                SequenceDashboard(src, channel=5)
+
+    def test_frame_and_thumb_follow_the_requested_channel(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = SequenceDashboard(open_sequence(_tif2(d)))
+            rec = _Recorder()
+            dash.send = rec
+            for c in (0, 1):
+                dash._on_custom_msg(
+                    dash, {"type": "frame", "pos": 0, "t": 1, "channel": c}, None
+                )
+            (m0, b0), (m1, b1) = rec.sent
+            self.assertEqual((m0["channel"], m1["channel"]), (0, 1))
+            self.assertFalse(m1["missing"])
+            self.assertNotEqual(b0[0], b1[0])
+            png, _ = dash._frame_png(0, 1, 1)
+            self.assertEqual(png, b1[0])
+
+            dash._on_custom_msg(dash, {"type": "thumb", "pos": 0, "channel": 1}, None)
+            content, buffers = rec.sent[-1]
+            self.assertEqual(content["channel"], 1)
+            self.assertEqual(
+                buffers[0],
+                dash._file.thumbnail_png(
+                    0, downscale=8, frame=dash.preview_frame, channel=1
+                ),
+            )
+
+    def test_out_of_range_channel_is_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            dash = SequenceDashboard(open_sequence(_tif2(d)))
+            rec = _Recorder()
+            dash.send = rec
+            dash._on_custom_msg(
+                dash, {"type": "frame", "pos": 0, "t": 0, "channel": 2}, None
+            )
+            content, _ = rec.sent[0]
+            self.assertEqual(content["type"], "error")
+            self.assertIn("channel must be in [0, 2)", content["message"])

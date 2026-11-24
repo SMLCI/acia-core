@@ -76,10 +76,24 @@ def save_tiff_stack(
     shape = (n, *first.shape)
     est_bytes = n * first.nbytes
 
+    def _check(frame, i):
+        if frame.shape != first.shape:
+            raise ValueError(
+                f"frame {i} has shape {frame.shape}, frame 0 {first.shape}: every "
+                "frame of a TIFF stack must have the same size and channels."
+            )
+        return frame
+
     def _frames():
-        yield first
-        for i in range(1, n):
-            yield _prepare_frame(source.get_frame(i).raw, dtype)
+        # tifffile consumes an iterator page by page, and a page is one 2D
+        # (Y, X) plane -- so a (C, H, W) frame goes out one channel at a time.
+        for i in range(n):
+            frame = first if i == 0 else _prepare_frame(source.get_frame(i).raw, dtype)
+            frame = _check(frame, i)
+            if frame.ndim == 2:
+                yield frame
+            else:
+                yield from frame
 
     if ome:
         metadata = {**_ome_calibration_tags(source, channel_names), "axes": axes}

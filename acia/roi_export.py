@@ -426,19 +426,22 @@ def export_rois(
                 channel_names=manifest.source.get("channels"),
                 progress=progress,
                 position=position,
-                on_written=lambda target, frames, position=position: _record_written(
-                    target,
-                    frames,
-                    position=position,
-                    settings=settings,
-                    written=written,
-                    exported=exported,
-                    output_dir=output_dir,
-                    manifest=manifest,
-                    experiment=experiment,
-                    naming_template=naming_template,
-                    registration_method_name=registration_method_name,
-                    max_frames=max_frames,
+                on_written=lambda target, frames, channels_acquired=None, position=position: (
+                    _record_written(
+                        target,
+                        frames,
+                        channels_acquired=channels_acquired,
+                        position=position,
+                        settings=settings,
+                        written=written,
+                        exported=exported,
+                        output_dir=output_dir,
+                        manifest=manifest,
+                        experiment=experiment,
+                        naming_template=naming_template,
+                        registration_method_name=registration_method_name,
+                        max_frames=max_frames,
+                    )
                 ),
             )
 
@@ -725,12 +728,17 @@ def _export_position(
     # None when nothing is being corrected: then a spec needs no mapping.
     registered = source if source is not raw_source else None
 
-    # Shape/dtype are invariant under the correction, so probe the cheaper
+    # The channel count comes from the source, not from one frame: a channel
+    # imaged only every Nth frame is absent from the others in the file, and
+    # sizing the buffers off frame 0 would then break on the first frame that
+    # has it. dtype is invariant under the correction, so probe the cheaper
     # (unregistered) source -- one frame, once per position.
+    n_channels = int(raw_source.size_c)
     probe = np.asarray(raw_source.get_frame(0).raw)
-    n_channels = 1 if probe.ndim == 2 else int(probe.shape[2])
+    _check_channels(probe, n_channels, position=position, frame=0)
     dtype = probe.dtype
     del probe
+    channel_names = _usable_channel_names(channel_names, n_channels)
 
     timepoints = source.timepoints
     pixel_size = source.pixel_size
@@ -772,7 +780,11 @@ def _export_position(
                         compression=compression,
                         channel_names=channel_names,
                     )
-                    on_written(group[0], size_t)
+                    on_written(
+                        group[0],
+                        size_t,
+                        _channels_acquired(raw_source, size_t, channel_names),
+                    )
                     bar.update(size_t)
                     continue
 
@@ -794,9 +806,14 @@ def _export_position(
                             if registered is None
                             else registered.spec_for(t, target.spec)
                         )
-                        buffer[t] = _as_hwc(warp_rotated_crop(raw, spec))
+                        crop = _as_hwc(warp_rotated_crop(raw, spec))
+                        _check_channels(crop, n_channels, position=position, frame=t)
+                        buffer[t] = crop
                     bar.update(1)
 
+                # after the pass, so a reader that notes channel presence as
+                # it reads (CZI) answers this without touching the file again
+                acquired = _channels_acquired(raw_source, size_t, channel_names)
                 for i, target in enumerate(group):
                     _write_roi(
                         THWCSequenceSource(
@@ -808,7 +825,7 @@ def _export_position(
                         channel_names=channel_names,
                     )
                     buffers[i] = None  # type: ignore[call-overload]
-                    on_written(target, size_t)
+                    on_written(target, size_t, acquired)
     finally:
         bar.close()
 
@@ -851,6 +868,67 @@ def _roi_groups(specs, size_t, n_channels, itemsize, budget) -> list[list[int]]:
 def _as_hwc(frame: np.ndarray) -> np.ndarray:
     """``(h, w)`` -> ``(h, w, 1)``; anything already channel-last passes through."""
     return frame[..., None] if frame.ndim == 2 else frame
+
+
+def _check_channels(image: np.ndarray, n_channels: int, *, position, frame) -> None:
+    """Fail readably when a frame's channel count differs from the source's.
+
+    The buffers are sized from the source's ``size_c``; a reader that hands out
+    fewer or more channels at some frame would otherwise surface as a bare numpy
+    broadcast error deep in the crop loop.
+    """
+    got = 1 if image.ndim == 2 else int(image.shape[-1])
+    if got != n_channels:
+        raise ValueError(
+            f"pos {position + 1} frame {frame}: the reader returned {got} "
+            f"channel(s), but the source has {n_channels}. Every frame must hold "
+            "every channel; this is a reader bug for this file format."
+        )
+
+
+def _usable_channel_names(channel_names, n_channels: int):
+    """``channel_names`` if it names every channel; otherwise ``None`` (warned)."""
+    if not channel_names:
+        return None
+    names = list(channel_names)
+    if len(names) != n_channels:
+        warnings.warn(
+            f"the source lists {len(names)} channel name(s) {names} for "
+            f"{n_channels} channel(s); writing the TIFFs without channel names",
+            stacklevel=3,
+        )
+        return None
+    return names
+
+
+def _channels_acquired(source, size_t: int, channel_names) -> list[dict] | None:
+    """Per channel imaged at only some frames: the frames that hold real data.
+
+    ``None`` when every channel has data at every frame (the usual case). A
+    channel imaged only every Nth frame is zero-filled at the others (see
+    :meth:`~acia.segm.czi_source.CZISequenceSource.get_frame`); this record is
+    how an analysis tells those zeros apart from a real measurement.
+    """
+    from acia.base import channels_present
+
+    if getattr(source, "channels_present", None) is None:
+        return None  # a source that cannot be sparse: skip the per-frame walk
+    n = int(source.size_c)
+    frames: list[list[int]] = [[] for _ in range(n)]
+    for t in range(size_t):
+        for c, present in enumerate(channels_present(source, t)):
+            if present and c < n:
+                frames[c].append(t)
+    sparse = [
+        {
+            "channel": c,
+            "name": channel_names[c] if channel_names else None,
+            "frames": frames[c],
+        }
+        for c in range(n)
+        if len(frames[c]) < size_t
+    ]
+    return sparse or None
 
 
 def _read_frames(source, size_t, depth):
@@ -946,6 +1024,7 @@ def _record_written(
     target,
     frames,
     *,
+    channels_acquired=None,
     position,
     settings,
     written,
@@ -962,22 +1041,27 @@ def _record_written(
     Per ROI rather than once at the end: the file is what a later run reads to
     decide what is already done, so a run that is interrupted has to leave
     behind an accurate record of everything it did finish.
+
+    ``channels_acquired`` (from :func:`_channels_acquired`) is recorded only when
+    a channel was not imaged at every frame -- the frames it lists hold real
+    data, every other frame of that channel is zero-filled.
     """
     written.append(target.path)
-    exported.append(
-        {
-            "file": os.path.basename(target.path),
-            "position": position + 1,
-            "position_index": position,
-            "roi_nb": target.roi_nb,
-            "label": target.sel.label,
-            "id": target.sel.id,
-            "anchor_frame": getattr(target.sel, "anchor_frame", 0),
-            "spec": target.sel.spec.to_dict(),
-            "frames": int(frames),
-            "settings": settings,
-        }
-    )
+    entry = {
+        "file": os.path.basename(target.path),
+        "position": position + 1,
+        "position_index": position,
+        "roi_nb": target.roi_nb,
+        "label": target.sel.label,
+        "id": target.sel.id,
+        "anchor_frame": getattr(target.sel, "anchor_frame", 0),
+        "spec": target.sel.spec.to_dict(),
+        "frames": int(frames),
+        "settings": settings,
+    }
+    if channels_acquired:
+        entry["channels_acquired"] = channels_acquired
+    exported.append(entry)
     _write_export_info(
         output_dir,
         manifest,
